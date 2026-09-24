@@ -52,3 +52,4 @@ All modified kernels and code are in [`kernels/`](kernels/), as patches against 
 - **Qwen3.8-27B:** dense, oQ8e (8-bit) with MTP, stock oMLX. Dense attention makes prefill slow with length; 768K and 1M are extrapolated from the measured curve.
 - Served through an OpenAI-compatible endpoint (llama-swap). Measured 2026-09-24.
 - RTX PRO 6000 pair figures are MiMo-V2.6-Flash on original weights.
+- Quants: DeepSeek, own 3-bit LSQ of [DeepSeek-V4.1-Flash](https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash) · [MiMo mxfp4](https://huggingface.co/mlx-community/MiMo-V2.6-Flash-RL-mxfp4-q8) · [Qwen3.8-Flash-Next oQ8e](https://huggingface.co/mlx-community/Qwen3.8-Flash-Next-oQ8e-mtp) · [Qwen3.8-27B oQ8e](https://huggingface.co/Jundot/Qwen3.8-27B-oQ8e-mtp)
