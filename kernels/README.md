@@ -51,6 +51,17 @@ upstream `LICENSE`.
   `routed_batch.py`, `scalar_batch.py`, `mlx_lm_mtp/`).
 - **Quantization:** LSQ 3-bit quantizer used to build the served checkpoint (`lsq_quant.py`).
 
+### `omlx/qwen38/`
+
+`qwen38_serve.py` runs `omlx serve` for Qwen3.8-Flash-Next at 1M tokens (prefill and decode stay under 225 GiB; stock oMLX passed 242 GiB). No
+kernel changes; output is unchanged:
+- The sparse-attention KV cache is allocated once for the whole prompt instead of doubling. Stock doubling holds the
+  old and new buffers of all 12 layers at once, about +24 GiB at the 512K to 1M step.
+- The MTP head's indexer keys and pooled block bank are evaluated after each prompt-priming chunk. Stock priming
+  never evaluates them, so every chunk pins a copy of the index buffer until the first draft token.
+
+Usage: `python qwen38_serve.py serve --model-dir … --base-path …` (same arguments as `omlx serve`).
+
 ## Applying
 
 ```bash
