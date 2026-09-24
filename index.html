@@ -49,6 +49,9 @@
   tr:last-child td { border-bottom: 0; }
   td span { display: block; color: var(--dim); font-size: 12.5px; }
   .foot { color: var(--dim); font-size: 12.5px; margin-top: 20px; }
+  ul.changes { margin: 0; padding-left: 18px; }
+  ul.changes li { margin: 4px 0; }
+  ul.changes li::marker { color: var(--dim); }
 </style>
 </head>
 <body>
@@ -74,6 +77,18 @@
   <h2>Decode</h2>
   <p class="sub">Output tokens per second, greedy, speculative decoding on (DeepSeek DSpark k=4, MiMo MTP).</p>
   <table id="dec"></table>
+  </section>
+  <section>
+  <h2>What made it faster</h2>
+  <p class="sub">DeepSeek-V4.1-Flash, same day. Every change keeps greedy output bit-identical.</p>
+  <ul class="changes">
+    <li>Engram table reads moved off the critical path: parallel native SSD reads, one chunk ahead of the GPU.</li>
+    <li>Sparse attention and indexer kernels rewritten: accelerator scoring, exact radix top-k, KV decoded once per query tile.</li>
+    <li>Buffer pool kept across layers; the next layer is built while the GPU runs the current one.</li>
+    <li>Decode: faster attention, Sinkhorn and KV-packing kernels; verify-step GEMVs share activations across rows.</li>
+    <li>No per-token kernel recompiles and no SSD page faults on fresh text.</li>
+    <li>Two requests batched exactly under speculative decoding.</li>
+  </ul>
   </section>
   <p class="foot">Measured 2026-09-24 on the served configurations. RTX PRO 6000 pair figures are MiMo-V2.6-Flash on original weights.</p>
 </main>

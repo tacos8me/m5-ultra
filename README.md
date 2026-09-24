@@ -25,6 +25,17 @@ Output tokens per second, greedy, speculative decoding on.
 | At 130K context | 61 | 82 | — |
 | At 523K context | 51 | 71 | 101 |
 
+## What made it faster
+
+DeepSeek-V4.1-Flash, same day. Every change keeps greedy output bit-identical.
+
+- Engram table reads moved off the critical path: parallel native SSD reads, one chunk ahead of the GPU.
+- Sparse attention and indexer kernels rewritten: accelerator scoring, exact radix top-k, KV decoded once per query tile.
+- Buffer pool kept across layers; the next layer is built while the GPU runs the current one.
+- Decode: faster attention, Sinkhorn and KV-packing kernels; verify-step GEMVs share activations across rows.
+- No per-token kernel recompiles and no SSD page faults on fresh text.
+- Two requests batched exactly under speculative decoding.
+
 ## Setup
 
 - **DeepSeek-V4.1-Flash:** 3-bit LSQ experts (group 128), 8-bit elsewhere, 223.5 GiB resident. oMLX with custom Metal kernels, encoder-only prefill in 8K chunks, DSpark speculative decoding (k=4).
