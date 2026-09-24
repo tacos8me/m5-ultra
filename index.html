@@ -133,6 +133,12 @@
   const e = curve(now, 'var(--accent)', 2);
   ds.add('circle', { cx: e[0], cy: e[1], r: 3.5, style: 'fill:var(--accent)' });
   label(ds, e[0], e[1], 'var(--accent)', `${fmt(N / now[now.length - 1].t)} tok/s`);
+  for (const n of [262144, 524288, 786432]) {
+    if (n >= N) continue;
+    const q = now[n / C - 1], px = ds.x(n), py = ds.y(n / q.t);
+    ds.add('circle', { cx: px, cy: py, r: 3, style: 'fill:var(--accent)' });
+    ds.add('text', { x: px, y: py - 10, 'text-anchor': 'middle', style: 'fill:var(--accent)' }, fmt(n / q.t));
+  }
 
   // MiMo
   const mi = frame('mimo');
