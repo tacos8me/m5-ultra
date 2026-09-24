@@ -6,7 +6,7 @@ Local LLM inference on a Mac Studio M5 Ultra (256 GB): DeepSeek-V4.1-Flash, MiMo
 
 ## Prefill at depth
 
-Prompt tokens ÷ time to first token. Measured in 8K chunks: DeepSeek up to 1M tokens, MiMo up to 512K; a needle planted at the start of a 1M-token prompt was recalled correctly. Qwen3.8 was measured through the server from 8K to 1M on stock oMLX. Past its native 262K window it runs without YaRN scaling (speed only); it still recalled a needle at 512K and 1M. The 1M point needs a small memory patch ([`kernels/omlx/qwen38/`](kernels/omlx/qwen38/)).
+Prompt tokens ÷ time to first token. Measured in 8K chunks: DeepSeek up to 1M tokens, MiMo up to 512K; a needle planted at the start of a 1M-token prompt was recalled correctly. Qwen3.8 was measured through the server from 8K to 1M on stock oMLX. Past its native 262K window it runs without YaRN scaling (speed only); it still recalled a needle at 512K, 768K (2,061 tok/s) and 1M. The 768K and 1M points need a small memory patch ([`kernels/omlx/qwen38/`](kernels/omlx/qwen38/)).
 
 | Prompt | DeepSeek-V4.1-Flash | MiMo-V2.6-Flash | Qwen3.8-Flash-Next | RTX PRO 6000 ×2 · MiMo |
 |---|---:|---:|---:|---:|
