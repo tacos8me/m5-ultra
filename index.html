@@ -38,6 +38,8 @@
   .meta a { color: var(--accent); text-decoration: none; }
   .meta a:hover, .meta a:focus-visible { text-decoration: underline; }
   h3 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
+  h3 a.mt { color: inherit; text-decoration: none; }
+  h3 a.mt:hover { text-decoration: underline; text-decoration-color: var(--ghost); }
   h3 .upd { float: right; color: var(--ghost); font-size: 12.5px; font-weight: 400; }
   section { margin-bottom: 56px; }
   td.na, .est { color: var(--ghost); }
@@ -83,17 +85,17 @@
   <section id="view-encode">
   <h2>Prefill at depth</h2>
   <p class="lead">Prompt tokens ÷ time to first token.</p>
-  <h3>DeepSeek-V4.1-Flash<span class="upd"></span></h3>
+  <h3><a class="mt" href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">DeepSeek-V4.1-Flash</a><span class="upd"></span></h3>
   <p class="sub" id="ds-sub">Measured in 8K chunks.</p>
   <div class="chart"><svg id="ds" viewBox="0 0 820 300" role="img" aria-label="DeepSeek-V4.1-Flash prefill rate by prompt length"></svg></div>
 
-  <h3>MiMo-V2.6-Flash</h3>
+  <h3><a class="mt" href="https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL">MiMo-V2.6-Flash</a></h3>
   <p class="sub" id="mimo-sub">Measured at 130K and 522K.</p>
   <div class="chart"><svg id="mimo" viewBox="0 0 820 300" role="img" aria-label="MiMo-V2.6-Flash prefill rate by prompt length"></svg></div>
-  <h3>Qwen3.8-Flash-Next</h3>
+  <h3><a class="mt" href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">Qwen3.8-Flash-Next</a></h3>
   <p class="sub" id="qwen-sub">Measured through the server at 8K to 1M tokens.</p>
   <div class="chart"><svg id="qwen" viewBox="0 0 820 300" role="img" aria-label="Qwen3.8-Flash-Next prefill rate by prompt length"></svg></div>
-  <h3>Qwen3.8-27B</h3>
+  <h3><a class="mt" href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen3.8-27B</a></h3>
   <p class="sub" id="qwen27-sub"></p>
   <div class="chart"><svg id="qwen27" viewBox="0 0 820 300" role="img" aria-label="Qwen3.8-27B prefill rate by prompt length"></svg></div>
 
@@ -103,13 +105,13 @@
   <section id="view-decode" hidden>
   <h2>Decode at depth</h2>
   <p class="lead">Output tokens per second by context depth. Greedy, speculative decoding on.</p>
-  <h3>DeepSeek-V4.1-Flash<span class="upd"></span></h3>
+  <h3><a class="mt" href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">DeepSeek-V4.1-Flash</a><span class="upd"></span></h3>
   <div class="chart"><svg id="ds-dec" viewBox="0 0 820 260" role="img" aria-label="DeepSeek-V4.1-Flash decode tokens per second by context depth"></svg></div>
-  <h3>MiMo-V2.6-Flash</h3>
+  <h3><a class="mt" href="https://huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL">MiMo-V2.6-Flash</a></h3>
   <div class="chart"><svg id="mimo-dec" viewBox="0 0 820 260" role="img" aria-label="MiMo-V2.6-Flash decode tokens per second by context depth"></svg></div>
-  <h3>Qwen3.8-Flash-Next</h3>
+  <h3><a class="mt" href="https://huggingface.co/Qwen/Qwen3.8-Flash-Next">Qwen3.8-Flash-Next</a></h3>
   <div class="chart"><svg id="qwen-dec" viewBox="0 0 820 260" role="img" aria-label="Qwen3.8-Flash-Next decode tokens per second by context depth"></svg></div>
-  <h3>Qwen3.8-27B</h3>
+  <h3><a class="mt" href="https://huggingface.co/Qwen/Qwen3.8-27B">Qwen3.8-27B</a></h3>
   <div class="chart"><svg id="qwen27-dec" viewBox="0 0 820 260" role="img" aria-label="Qwen3.8-27B decode tokens per second by context depth"></svg></div>
   <div class="tablewrap"><table id="dec"></table></div>
   </section>
