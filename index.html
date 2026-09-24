@@ -39,7 +39,7 @@
   .meta a:hover, .meta a:focus-visible { text-decoration: underline; }
   h3 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
   section { margin-bottom: 56px; }
-  td.na { color: var(--ghost); }
+  td.na, .est { color: var(--ghost); }
   th.ref, td.ref, td.ref span { color: var(--ghost); }
   th.ref, td.ref { border-left: 1px solid var(--rule); padding-left: 20px; }
   th:nth-last-child(2), td:nth-last-child(2) { padding-right: 20px; }
@@ -52,11 +52,13 @@
   table { width: 100%; min-width: 620px; border-collapse: collapse; }
   th, td { padding: 9px 0 9px 16px; text-align: right; border-bottom: 1px solid var(--rule); }
   th:first-child, td:first-child { padding-left: 0; }
-  th { white-space: nowrap; }
+  th, td:first-child { white-space: nowrap; }
   th:first-child, td:first-child { text-align: left; }
   th { font-weight: 500; color: var(--dim); font-size: 13px; }
   tr:last-child td { border-bottom: 0; }
   td span { display: block; color: var(--dim); font-size: 12.5px; }
+  td span.est { display: inline; color: var(--ghost); font-size: inherit; }
+  th.ref { white-space: normal; }
   .foot { color: var(--dim); font-size: 12.5px; margin-top: 20px; }
   .toggle { display: inline-flex; gap: 2px; padding: 2px; border: 1px solid var(--rule); border-radius: 8px; margin: 0 0 36px; }
   .toggle button { font: inherit; font-size: 13px; color: var(--dim); background: transparent; border: 0; border-radius: 6px; padding: 5px 14px; cursor: pointer; }
@@ -70,7 +72,7 @@
 <body>
 <main>
   <h1>M5 Ultra</h1>
-  <p class="meta">DeepSeek-V4.1-Flash, MiMo-V2.6-Flash and Qwen3.8-Flash-Next on a Mac Studio M5 Ultra, 256 GB.<br><a href="https://github.com/tacos8me/m5-ultra/tree/main/kernels">Kernels and patches on GitHub</a></p>
+  <p class="meta">DeepSeek-V4.1-Flash, MiMo-V2.6-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B on a Mac Studio M5 Ultra, 256 GB.<br><a href="https://github.com/tacos8me/m5-ultra/tree/main/kernels">Kernels and patches on GitHub</a></p>
   <div class="toggle" role="tablist" aria-label="View">
     <button type="button" role="tab" id="tab-encode" aria-selected="true">Encode</button>
     <button type="button" role="tab" id="tab-decode" aria-selected="false">Decode</button>
@@ -89,6 +91,9 @@
   <h3>Qwen3.8-Flash-Next</h3>
   <p class="sub" id="qwen-sub">Measured through the server at 8K to 1M tokens.</p>
   <div class="chart"><svg id="qwen" viewBox="0 0 820 300" role="img" aria-label="Qwen3.8-Flash-Next prefill rate by prompt length"></svg></div>
+  <h3>Qwen3.8-27B</h3>
+  <p class="sub" id="qwen27-sub"></p>
+  <div class="chart"><svg id="qwen27" viewBox="0 0 820 300" role="img" aria-label="Qwen3.8-27B prefill rate by prompt length"></svg></div>
 
   <div class="tablewrap"><table id="t"></table></div>
   </section>
@@ -102,6 +107,8 @@
   <div class="chart"><svg id="mimo-dec" viewBox="0 0 820 260" role="img" aria-label="MiMo-V2.6-Flash decode tokens per second by context depth"></svg></div>
   <h3>Qwen3.8-Flash-Next</h3>
   <div class="chart"><svg id="qwen-dec" viewBox="0 0 820 260" role="img" aria-label="Qwen3.8-Flash-Next decode tokens per second by context depth"></svg></div>
+  <h3>Qwen3.8-27B</h3>
+  <div class="chart"><svg id="qwen27-dec" viewBox="0 0 820 260" role="img" aria-label="Qwen3.8-27B decode tokens per second by context depth"></svg></div>
   <div class="tablewrap"><table id="dec"></table></div>
   </section>
   <section>
@@ -118,7 +125,7 @@
   </section>
   <p class="foot">Measured 2026-09-24 on the served configurations. RTX PRO 6000 pair figures are MiMo-V2.6-Flash on original weights.</p>
 </main>
-<script type="application/json" id="data">{"chunk": 8192, "max_tokens": 1048576, "peak_gib": 232.43, "date": "2026-09-24", "builds": [{"key": "morning", "chunks": [4.703, 6.803, 6.901, 7.248, 13.903, 20.75, 11.532, 12.479, 10.513, 13.493, 15.788, 21.976, 8.85, 9.488, 8.843, 8.699]}, {"key": "now", "chunks": [3.9013, 3.1423, 3.1697, 3.2123, 3.1779, 3.2201, 3.241, 3.2817, 3.2788, 3.2761, 3.3325, 3.3039, 3.3637, 3.3354, 3.3772, 3.3867, 3.4258, 3.5759, 3.611, 3.6235, 3.6475, 3.6355, 3.6884, 3.6725, 3.735, 3.7333, 3.7327, 3.7488, 3.7756, 3.7826, 3.7946, 3.8256, 3.8256, 3.869, 3.8573, 3.8822, 3.9151, 3.9202, 3.9549, 3.9353, 3.9914, 3.9073, 3.9851, 3.9851, 4.017, 4.0429, 3.9949, 4.0532, 4.0269, 4.099, 4.1212, 4.0849, 4.149, 4.147, 4.2117, 4.1799, 4.1939, 4.176, 4.2453, 4.2596, 4.2696, 4.2489, 4.2904, 4.2479, 4.3193, 4.2954, 4.331, 4.3641, 4.4282, 4.4071, 4.3959, 4.4725, 4.4229, 4.4715, 4.4864, 4.5419, 4.53, 4.5196, 4.5977, 4.4783, 4.5419, 4.5988, 4.6524, 4.6613, 4.6616, 4.6644, 4.6757, 4.6573, 4.6972, 4.7063, 4.7665, 4.7609, 4.7856, 4.8326, 4.8055, 4.8113, 4.8634, 4.9349, 4.948, 4.9478, 4.9386, 4.8793, 5.0491, 5.0135, 4.9851, 4.9837, 5.1187, 5.1217, 5.0428, 5.0686, 5.1566, 5.0807, 5.1153, 5.1973, 5.1307, 5.2689, 5.1597, 5.1846, 5.306, 5.1809, 5.3112, 5.1933, 5.3489, 5.2629, 5.385, 5.2432, 5.4537, 5.2669]}], "mimo": [{"tokens": 130000, "seconds": 203.125, "ghost": true}, {"tokens": 130000, "seconds": 64.5}, {"tokens": 522000, "seconds": 660.7594936708861}], "decode": [{"label": "1 request", "ds": 79, "mimo": 117, "rtx": 160, "qwen": 109}, {"label": "2 requests, total", "ds": 79, "mimo": null, "rtx": null}, {"label": "8 requests, total", "ds": null, "mimo": 194, "rtx": 627}, {"label": "At 130K context", "ds": 61, "mimo": 82, "rtx": null, "qwen": 73}, {"label": "At 523K context", "ds": 51, "mimo": 71, "rtx": 101, "qwen": 62}, {"label": "At 1M context", "ds": "24.5 tok/s \u00b7 no DSpark", "mimo": null, "rtx": null, "qwen": 44}], "mimo_curve": [2.4287, 2.6136, 2.8019, 2.996, 3.1877, 3.3807, 3.5839, 3.7718, 3.9653, 4.1612, 4.36, 4.5588, 4.7527, 4.9588, 5.1623, 5.3698, 5.5735, 5.7625, 5.9736, 6.1783, 6.3969, 6.6004, 6.8393, 7.0563, 7.2988, 7.5189, 7.7517, 8.0704, 8.2508, 8.5244, 8.7852, 9.0015, 9.2683, 9.5723, 9.7966, 10.0713, 10.3564, 10.6301, 10.8548, 11.0931, 11.3238, 11.5937, 11.812, 12.0729, 12.3151, 12.5859, 12.8229, 13.0921, 13.3098, 13.5899, 13.8175, 14.084, 14.3781, 14.6142, 14.83, 15.0622, 15.309, 15.6563, 15.8238, 16.0538, 16.3695, 16.5663, 16.8919, 17.0621], "qwen": {"prefill": [{"tokens": 8240, "seconds": 3.41}, {"tokens": 32816, "seconds": 13.33}, {"tokens": 65583, "seconds": 26.85}, {"tokens": 131120, "seconds": 54.94}, {"tokens": 250048, "seconds": 108.34}, {"tokens": 524352, "seconds": 241.31}, {"tokens": 786496, "seconds": 381.7}, {"tokens": 1040064, "seconds": 535.1}], "note": "oMLX, no custom kernels; a small memory patch lets it reach 1M. Past its native 262K window there\u2019s no YaRN, so those points are speed only, though a code placed at the start was recalled at 512K, 768K and 1M."}, "decode_depth": {"ds": [{"tokens": 8192, "tok_s": 79}, {"tokens": 131072, "tok_s": 60.7}, {"tokens": 523026, "tok_s": 50.7}, {"tokens": 1048576, "tok_s": 24.5, "ghost": true, "note": "no DSpark"}], "mimo": [{"tokens": 8192, "tok_s": 117}, {"tokens": 131072, "tok_s": 82}, {"tokens": 522000, "tok_s": 71}], "qwen": [{"tokens": 8192, "tok_s": 109}, {"tokens": 131120, "tok_s": 73.0}, {"tokens": 250048, "tok_s": 63.6}, {"tokens": 524352, "tok_s": 62.1}, {"tokens": 786496, "tok_s": 50.0}, {"tokens": 1040064, "tok_s": 44.4}]}}</script>
+<script type="application/json" id="data">{"chunk": 8192, "max_tokens": 1048576, "peak_gib": 232.43, "date": "2026-09-24", "builds": [{"key": "morning", "chunks": [4.703, 6.803, 6.901, 7.248, 13.903, 20.75, 11.532, 12.479, 10.513, 13.493, 15.788, 21.976, 8.85, 9.488, 8.843, 8.699]}, {"key": "now", "chunks": [3.9013, 3.1423, 3.1697, 3.2123, 3.1779, 3.2201, 3.241, 3.2817, 3.2788, 3.2761, 3.3325, 3.3039, 3.3637, 3.3354, 3.3772, 3.3867, 3.4258, 3.5759, 3.611, 3.6235, 3.6475, 3.6355, 3.6884, 3.6725, 3.735, 3.7333, 3.7327, 3.7488, 3.7756, 3.7826, 3.7946, 3.8256, 3.8256, 3.869, 3.8573, 3.8822, 3.9151, 3.9202, 3.9549, 3.9353, 3.9914, 3.9073, 3.9851, 3.9851, 4.017, 4.0429, 3.9949, 4.0532, 4.0269, 4.099, 4.1212, 4.0849, 4.149, 4.147, 4.2117, 4.1799, 4.1939, 4.176, 4.2453, 4.2596, 4.2696, 4.2489, 4.2904, 4.2479, 4.3193, 4.2954, 4.331, 4.3641, 4.4282, 4.4071, 4.3959, 4.4725, 4.4229, 4.4715, 4.4864, 4.5419, 4.53, 4.5196, 4.5977, 4.4783, 4.5419, 4.5988, 4.6524, 4.6613, 4.6616, 4.6644, 4.6757, 4.6573, 4.6972, 4.7063, 4.7665, 4.7609, 4.7856, 4.8326, 4.8055, 4.8113, 4.8634, 4.9349, 4.948, 4.9478, 4.9386, 4.8793, 5.0491, 5.0135, 4.9851, 4.9837, 5.1187, 5.1217, 5.0428, 5.0686, 5.1566, 5.0807, 5.1153, 5.1973, 5.1307, 5.2689, 5.1597, 5.1846, 5.306, 5.1809, 5.3112, 5.1933, 5.3489, 5.2629, 5.385, 5.2432, 5.4537, 5.2669]}], "mimo": [{"tokens": 130000, "seconds": 203.125, "ghost": true}, {"tokens": 130000, "seconds": 64.5}, {"tokens": 522000, "seconds": 660.7594936708861}], "decode": [{"label": "1 request", "ds": 79, "mimo": 117, "rtx": 160, "qwen": 109, "qwen27": 77}, {"label": "2 requests, total", "ds": 79, "mimo": null, "rtx": null}, {"label": "8 requests, total", "ds": null, "mimo": 194, "rtx": 627}, {"label": "At 130K context", "ds": 61, "mimo": 82, "rtx": null, "qwen": 73, "qwen27": 39}, {"label": "At 523K context", "ds": 51, "mimo": 71, "rtx": 101, "qwen": 62, "qwen27": 22}, {"label": "At 1M context", "ds": "24.5 tok/s<span>no DSpark</span>", "mimo": null, "rtx": null, "qwen": 44, "qwen27": "<span class=\"est\">~14 tok/s</span><span>est.</span>"}], "mimo_curve": [2.4287, 2.6136, 2.8019, 2.996, 3.1877, 3.3807, 3.5839, 3.7718, 3.9653, 4.1612, 4.36, 4.5588, 4.7527, 4.9588, 5.1623, 5.3698, 5.5735, 5.7625, 5.9736, 6.1783, 6.3969, 6.6004, 6.8393, 7.0563, 7.2988, 7.5189, 7.7517, 8.0704, 8.2508, 8.5244, 8.7852, 9.0015, 9.2683, 9.5723, 9.7966, 10.0713, 10.3564, 10.6301, 10.8548, 11.0931, 11.3238, 11.5937, 11.812, 12.0729, 12.3151, 12.5859, 12.8229, 13.0921, 13.3098, 13.5899, 13.8175, 14.084, 14.3781, 14.6142, 14.83, 15.0622, 15.309, 15.6563, 15.8238, 16.0538, 16.3695, 16.5663, 16.8919, 17.0621], "qwen": {"prefill": [{"tokens": 8240, "seconds": 3.41}, {"tokens": 32816, "seconds": 13.33}, {"tokens": 65583, "seconds": 26.85}, {"tokens": 131120, "seconds": 54.94}, {"tokens": 250048, "seconds": 108.34}, {"tokens": 524352, "seconds": 241.31}, {"tokens": 786496, "seconds": 381.7}, {"tokens": 1040064, "seconds": 535.1}], "note": "oMLX, no custom kernels; a small memory patch lets it reach 1M. Past its native 262K window there\u2019s no YaRN, so those points are speed only, though a code placed at the start was recalled at 512K, 768K and 1M."}, "qwen27": {"prefill": [{"tokens": 8240, "seconds": 5.11}, {"tokens": 32816, "seconds": 21.38}, {"tokens": 65583, "seconds": 47.93}, {"tokens": 131120, "seconds": 117.51}, {"tokens": 250048, "seconds": 301.78}, {"tokens": 524352, "seconds": 1030.37}, {"tokens": 786432, "seconds": 2109.1, "est": true}, {"tokens": 1048576, "seconds": 3564.6, "est": true}], "note": "oMLX, no custom kernels. Dense attention, so prefill slows with length; 768K and 1M are extrapolated (gray)."}, "decode_depth": {"ds": [{"tokens": 8192, "tok_s": 79}, {"tokens": 131072, "tok_s": 60.7}, {"tokens": 523026, "tok_s": 50.7}, {"tokens": 1048576, "tok_s": 24.5, "ghost": true, "note": "no DSpark"}], "mimo": [{"tokens": 8192, "tok_s": 117}, {"tokens": 131072, "tok_s": 82}, {"tokens": 522000, "tok_s": 71}], "qwen": [{"tokens": 8192, "tok_s": 109}, {"tokens": 131120, "tok_s": 73.0}, {"tokens": 250048, "tok_s": 63.6}, {"tokens": 524352, "tok_s": 62.1}, {"tokens": 786496, "tok_s": 50.0}, {"tokens": 1040064, "tok_s": 44.4}], "qwen27": [{"tokens": 8192, "tok_s": 77}, {"tokens": 131120, "tok_s": 39.2}, {"tokens": 250048, "tok_s": 29.7}, {"tokens": 524352, "tok_s": 22.0}, {"tokens": 786432, "tok_s": 17.0, "est": true}, {"tokens": 1048576, "tok_s": 13.9, "est": true}]}}</script>
 <script>
 (() => {
   const D = JSON.parse(document.getElementById('data').textContent);
@@ -193,22 +200,27 @@
     label(mi, px, py, color, p.ghost ? `initial · ${fmt(p.tokens / p.seconds)} tok/s` : `${fmt(p.tokens / p.seconds)} tok/s`);
   });
 
-  // Qwen: measured points (time to first token through the server)
-  if (D.qwen) {
-    const qg = frame('qwen');
-    const qp = D.qwen.prefill.map(p => [qg.x(p.tokens), qg.y(p.tokens / p.seconds), p]);
-    qg.add('path', { d: qp.map((q, i) => (i ? 'L' : 'M') + q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(''),
-                     fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, 'stroke-linejoin': 'round' });
-    qp.forEach(([px, py, p], i) => {
-      qg.add('circle', { cx: px, cy: py, r: 3, style: 'fill:var(--accent)' });
-      const last = i === qp.length - 1;
+  // Qwen: measured points through the server; estimates (est) continue as a dashed gray line
+  const path = pts => pts.map((q, i) => (i ? 'L' : 'M') + q[0].toFixed(1) + ',' + q[1].toFixed(1)).join('');
+  const pointChart = (id, m) => {
+    if (!m) return;
+    const g = frame(id);
+    const all = m.prefill.map(p => [g.x(p.tokens), g.y(p.tokens / p.seconds), p]);
+    const meas = all.filter(q => !q[2].est), est = all.filter(q => q[2].est);
+    g.add('path', { d: path(meas), fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, 'stroke-linejoin': 'round' });
+    if (est.length)
+      g.add('path', { d: path([meas[meas.length - 1], ...est]), fill: 'none', stroke: 'var(--ghost)', 'stroke-width': 1.5, 'stroke-dasharray': '4 4' });
+    all.forEach(([px, py, p], i) => {
+      const color = p.est ? 'var(--ghost)' : 'var(--accent)', last = i === all.length - 1, r = fmt(p.tokens / p.seconds);
+      g.add('circle', { cx: px, cy: py, r: 3, style: 'fill:' + color });
       if (p.tokens >= 131000 || last)
-        qg.add('text', last ? { x: px + 10, y: py + 4, style: 'fill:var(--accent)' }
-                            : { x: px + 7, y: py - 8, 'text-anchor': 'start', style: 'fill:var(--accent)' },
-               last ? `${fmt(p.tokens / p.seconds)} tok/s` : fmt(p.tokens / p.seconds));
+        g.add('text', last ? { x: px + 10, y: py + 4, style: 'fill:' + color } : { x: px + 7, y: py - 8, 'text-anchor': 'start', style: 'fill:' + color },
+              p.est ? `~${r}${last ? ' est.' : ''}` : last ? `${r} tok/s` : r);
     });
-    if (D.qwen.note) document.getElementById('qwen-sub').textContent = D.qwen.note;
-  }
+    if (m.note) document.getElementById(id + '-sub').textContent = m.note;
+  };
+  pointChart('qwen', D.qwen);
+  pointChart('qwen27', D.qwen27);
   document.getElementById('ds-sub').textContent = `Measured in 8K chunks up to ${N >= 1048576 ? '1M' : '512K'} tokens.`;
   const ds130 = now[131072 / C - 1], ds512 = now[524288 / C - 1], dsEnd = now[now.length - 1];
   const mm = mimoCurve
@@ -216,34 +228,39 @@
     : D.mimo.filter(p => !p.ghost);
   const cell = (tokens, seconds) => `${fmt(tokens / seconds)} tok/s<span>${fmt(seconds, seconds < 100 ? 1 : 0)} s</span>`;
   const near = (arr, n) => arr && arr.find(p => Math.abs(p.tokens - n) / n < 0.05);
-  const qc = n => { const p = near(D.qwen && D.qwen.prefill, n); return p ? `<td>${cell(p.tokens, p.seconds)}</td>` : '<td class="na">—</td>'; };
+  const qc = (m, n) => { const p = near(m && m.prefill, n); return !p ? '<td class="na">—</td>'
+    : p.est ? `<td class="na">~${fmt(p.tokens / p.seconds)} tok/s<span>est.</span></td>` : `<td>${cell(p.tokens, p.seconds)}</td>`; };
   document.getElementById('t').innerHTML =
-    '<thead><tr><th></th><th>DeepSeek-V4.1-Flash</th><th>MiMo-V2.6-Flash</th><th>Qwen3.8-Flash-Next</th><th class="ref">RTX PRO 6000 ×2 · MiMo</th></tr></thead><tbody>' +
-    `<tr><td>~130K</td><td>${cell(131072, ds130.t)}</td><td>${cell(mm[0].tokens, mm[0].seconds)}</td>${qc(131072)}<td class="ref">${cell(130000, 130000 / 9724)}</td></tr>` +
-    `<tr><td>~520K</td><td>${cell(524288, ds512.t)}</td><td>${cell(mm[1].tokens, mm[1].seconds)}</td>${qc(524288)}<td class="ref">${cell(522000, 107)}</td></tr>` +
-    (N >= 1048576 ? `<tr><td>1M</td><td>${cell(N, dsEnd.t)}</td><td class="na">—</td>${qc(1048576)}<td class="na ref">—</td></tr>` : '') +
+    '<thead><tr><th></th><th>DeepSeek-V4.1-Flash</th><th>MiMo-V2.6-Flash</th><th>Qwen3.8-Flash-Next</th><th>Qwen3.8-27B</th><th class="ref">RTX PRO 6000 ×2 · MiMo</th></tr></thead><tbody>' +
+    `<tr><td>~130K</td><td>${cell(131072, ds130.t)}</td><td>${cell(mm[0].tokens, mm[0].seconds)}</td>${qc(D.qwen, 131072)}${qc(D.qwen27, 131072)}<td class="ref">${cell(130000, 130000 / 9724)}</td></tr>` +
+    `<tr><td>~520K</td><td>${cell(524288, ds512.t)}</td><td>${cell(mm[1].tokens, mm[1].seconds)}</td>${qc(D.qwen, 524288)}${qc(D.qwen27, 524288)}<td class="ref">${cell(522000, 107)}</td></tr>` +
+    (N >= 1048576 ? `<tr><td>1M</td><td>${cell(N, dsEnd.t)}</td><td class="na">—</td>${qc(D.qwen, 1048576)}${qc(D.qwen27, 1048576)}<td class="na ref">—</td></tr>` : '') +
     '</tbody>';
 
   const v = (x, ref) => x == null ? `<td class="na${ref ? ' ref' : ''}">—</td>` : `<td${ref ? ' class="ref"' : ''}>${x}${typeof x === 'number' ? ' tok/s' : ''}</td>`;
   document.getElementById('dec').innerHTML =
-    '<thead><tr><th></th><th>DeepSeek-V4.1-Flash</th><th>MiMo-V2.6-Flash</th><th>Qwen3.8-Flash-Next</th><th class="ref">RTX PRO 6000 ×2 · MiMo</th></tr></thead><tbody>' +
-    D.decode.map(r => `<tr><td>${r.label}</td>${v(r.ds)}${v(r.mimo)}${v(r.qwen)}${v(r.rtx, true)}</tr>`).join('') + '</tbody>';
+    '<thead><tr><th></th><th>DeepSeek-V4.1-Flash</th><th>MiMo-V2.6-Flash</th><th>Qwen3.8-Flash-Next</th><th>Qwen3.8-27B</th><th class="ref">RTX PRO 6000 ×2 · MiMo</th></tr></thead><tbody>' +
+    D.decode.map(r => `<tr><td>${r.label}</td>${v(r.ds)}${v(r.mimo)}${v(r.qwen)}${v(r.qwen27)}${v(r.rtx, true)}</tr>`).join('') + '</tbody>';
 
   // Decode charts
   const decChart = (id, pts) => {
     const g = frame(id, 150, [0, 50, 100, 150], 260);
-    const main = pts.filter(p => !p.ghost).map(p => [g.x(p.tokens), g.y(p.tok_s), p]);
-    g.add('path', { d: main.map((q, i) => (i ? 'L' : 'M') + q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(''),
-                    fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, 'stroke-linejoin': 'round' });
+    const main = pts.filter(p => !p.ghost && !p.est).map(p => [g.x(p.tokens), g.y(p.tok_s), p]);
+    const est = pts.filter(p => p.est).map(p => [g.x(p.tokens), g.y(p.tok_s), p]);
+    g.add('path', { d: path(main), fill: 'none', stroke: 'var(--accent)', 'stroke-width': 2, 'stroke-linejoin': 'round' });
+    if (est.length)
+      g.add('path', { d: path([main[main.length - 1], ...est]), fill: 'none', stroke: 'var(--ghost)', 'stroke-width': 1.5, 'stroke-dasharray': '4 4' });
     pts.forEach(p => {
-      const px = g.x(p.tokens), py = g.y(p.tok_s), color = p.ghost ? 'var(--ghost)' : 'var(--accent)';
+      const px = g.x(p.tokens), py = g.y(p.tok_s), color = p.ghost || p.est ? 'var(--ghost)' : 'var(--accent)';
       g.add('circle', { cx: px, cy: py, r: 3.5, style: 'fill:' + color });
-      g.add('text', { x: px, y: py - 10, 'text-anchor': 'middle', style: 'fill:' + color }, p.ghost ? `${fmt(p.tok_s, p.tok_s % 1 ? 1 : 0)} · ${p.note}` : fmt(p.tok_s, p.tok_s % 1 && p.tok_s < 30 ? 1 : 0));
+      g.add('text', { x: px, y: py - 10, 'text-anchor': 'middle', style: 'fill:' + color },
+            p.ghost ? `${fmt(p.tok_s, p.tok_s % 1 ? 1 : 0)} · ${p.note}` : p.est ? `~${fmt(p.tok_s)}` : fmt(p.tok_s, p.tok_s % 1 && p.tok_s < 30 ? 1 : 0));
     });
   };
   decChart('ds-dec', D.decode_depth.ds);
   decChart('mimo-dec', D.decode_depth.mimo);
   if (D.decode_depth.qwen) decChart('qwen-dec', D.decode_depth.qwen);
+  if (D.decode_depth.qwen27) decChart('qwen27-dec', D.decode_depth.qwen27);
 
   // Encode / decode toggle (kept in the URL hash so either view can be linked)
   const views = { encode: document.getElementById('view-encode'), decode: document.getElementById('view-decode') };
