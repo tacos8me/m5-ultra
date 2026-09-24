@@ -1,6 +1,6 @@
 # M5 Ultra
 
-Local LLM inference on a Mac Studio M5 Ultra (256 GB): DeepSeek-V4.1-Flash, MiMo-V2.6-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B.
+Local LLM inference on a Mac Studio M5 Ultra (36-core CPU, 80-core GPU, 256 GB): DeepSeek-V4.1-Flash, MiMo-V2.6-Flash, Qwen3.8-Flash-Next and Qwen3.8-27B.
 
 **Results page: https://tacos8me.github.io/m5-ultra/**
 
