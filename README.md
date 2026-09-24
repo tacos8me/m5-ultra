@@ -20,11 +20,11 @@ Output tokens per second, greedy, speculative decoding on.
 
 | | DeepSeek-V4.1-Flash | MiMo-V2.6-Flash | Qwen3.8-Flash-Next | Qwen3.8-27B | RTX PRO 6000 ×2 · MiMo |
 |---|---:|---:|---:|---:|---:|
-| 1 request | 80 | 117 | 109 | 77 | 160 |
+| 1 request | 77 | 117 | 109 | 77 | 160 |
 | 2 requests, total | 77 | — | 133 | 96 | — |
 | 4 requests, total | — | — | 162 | 126 | — |
 | 8 requests, total | — | 194 | — | — | 627 |
-| At 130K context | 64 | 82 | 73 | 39 | — |
+| At 130K context | 67 | 82 | 73 | 39 | — |
 | At 523K context | 61 | 71 | 62 | 22 | 101 |
 | At 1M context | 56 | — | 44 | ~14 (est.) | — |
 
