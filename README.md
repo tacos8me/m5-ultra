@@ -6,13 +6,13 @@ Local LLM inference on a Mac Studio M5 Ultra (256 GB): DeepSeek-V4.1-Flash, MiMo
 
 ## Prefill at depth
 
-Prompt tokens ÷ time to first token. Measured in 8K chunks: DeepSeek up to 1M tokens, MiMo up to 512K; a needle planted at the start of a 1M-token prompt was recalled correctly. Qwen3.8 was measured through the server from 8K to 1M on stock oMLX. Past its native 262K window it runs without YaRN scaling (speed only); it still recalled a needle at 512K, 768K (2,061 tok/s) and 1M. The 768K and 1M points need a small memory patch ([`kernels/omlx/qwen38/`](kernels/omlx/qwen38/)).
+Prompt tokens ÷ time to first token. DeepSeek measured through the server from 128K to 1M tokens, MiMo in 8K chunks up to 512K; a needle planted at the start of a 1M-token prompt was recalled correctly. Qwen3.8 was measured through the server from 8K to 1M on stock oMLX. Past its native 262K window it runs without YaRN scaling (speed only); it still recalled a needle at 512K, 768K (2,061 tok/s) and 1M. The 768K and 1M points need a small memory patch ([`kernels/omlx/qwen38/`](kernels/omlx/qwen38/)).
 
 | Prompt | DeepSeek-V4.1-Flash | MiMo-V2.6-Flash | Qwen3.8-Flash-Next | Qwen3.8-27B | RTX PRO 6000 ×2 · MiMo |
 |---|---:|---:|---:|---:|---:|
-| ~130K | 2,473 tok/s · 53.0 s | 2,112 tok/s · 62.1 s | 2,387 tok/s · 54.9 s | 1,116 tok/s · 118 s | 9,724 tok/s · 13.4 s |
-| ~520K | 2,166 tok/s · 242 s | 873 tok/s · 600 s | 2,173 tok/s · 241 s | 509 tok/s · 1,030 s | ~4,880 tok/s · 107 s |
-| 1M | 1,898 tok/s · 553 s | — | 1,944 tok/s · 535 s | ~294 tok/s (est.) | — |
+| ~130K | 2,469 tok/s · 52.7 s | 2,112 tok/s · 62.1 s | 2,387 tok/s · 54.9 s | 1,116 tok/s · 118 s | 9,724 tok/s · 13.4 s |
+| ~520K | 2,114 tok/s · 248 s | 873 tok/s · 600 s | 2,173 tok/s · 241 s | 509 tok/s · 1,030 s | ~4,880 tok/s · 107 s |
+| 1M | 1,947 tok/s · 534 s | — | 1,944 tok/s · 535 s | ~294 tok/s (est.) | — |
 
 ## Decode
 
