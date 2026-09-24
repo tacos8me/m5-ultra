@@ -173,8 +173,10 @@
                      fill: 'none', stroke: color, 'stroke-width': width, 'stroke-linejoin': 'round' });
     return p[p.length - 1];
   };
-  const i0 = curve(initial, 'var(--ghost)', 1.25);
-  label(ds, i0[0], i0[1], 'var(--ghost)', `initial · ${fmt(initial[initial.length - 1].n / initial[initial.length - 1].t)} tok/s`);
+  if (!D.ds_served) {
+    const i0 = curve(initial, 'var(--ghost)', 1.25);
+    label(ds, i0[0], i0[1], 'var(--ghost)', `initial · ${fmt(initial[initial.length - 1].n / initial[initial.length - 1].t)} tok/s`);
+  }
   if (D.ds_served) {
     const sp = D.ds_served.map(q => [ds.x(q.tokens), ds.y(q.tokens / q.seconds), q]);
     ds.add('path', { d: sp.map((q, i) => (i ? 'L' : 'M') + q[0].toFixed(1) + ',' + q[1].toFixed(1)).join(''),
