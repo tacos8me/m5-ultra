@@ -20,12 +20,13 @@ Output tokens per second, greedy, speculative decoding on.
 
 | | DeepSeek-V4.1-Flash | MiMo-V2.6-Flash | Qwen3.8-Flash-Next | Qwen3.8-27B | RTX PRO 6000 ×2 · MiMo |
 |---|---:|---:|---:|---:|---:|
-| 1 request | 79 | 117 | 109 | 77 | 160 |
-| 2 requests, total | 79 | — | — | — | — |
+| 1 request | 80 | 117 | 109 | 77 | 160 |
+| 2 requests, total | 77 | — | 133 | 96 | — |
+| 4 requests, total | — | — | 162 | 126 | — |
 | 8 requests, total | — | 194 | — | — | 627 |
-| At 130K context | 61 | 82 | 73 | 39 | — |
-| At 523K context | 51 | 71 | 62 | 22 | 101 |
-| At 1M context | 39 | — | 44 | ~14 (est.) | — |
+| At 130K context | 64 | 82 | 73 | 39 | — |
+| At 523K context | 61 | 71 | 62 | 22 | 101 |
+| At 1M context | 56 | — | 44 | ~14 (est.) | — |
 
 ## What made it faster
 
@@ -37,7 +38,7 @@ DeepSeek-V4.1-Flash, same day. Every change keeps greedy output bit-identical.
 - Decode: faster attention, Sinkhorn and KV-packing kernels; verify-step GEMVs share activations across rows.
 - No per-token kernel recompiles and no SSD page faults on fresh text.
 - Two requests batched exactly under speculative decoding.
-- Prefix cache: resuming a long conversation reuses its prefill (128K: 53 s → 1.0 s, 512K: 241 s → 2.3 s).
+- Prefix cache: resuming a long conversation reuses its prefill (128K: 53 s → 0.8 s, 512K: 241 s → 2.3 s).
 - Decode at depth: the KV cache grows in place and index keys are scored once for all draft rows.
 
 ## Kernels
