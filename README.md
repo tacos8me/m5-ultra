@@ -25,7 +25,7 @@ Output tokens per second, greedy, speculative decoding on.
 | 8 requests, total | — | 194 | — | — | 627 |
 | At 130K context | 61 | 82 | 73 | 39 | — |
 | At 523K context | 51 | 71 | 62 | 22 | 101 |
-| At 1M context | 25 (no DSpark) | — | 44 | ~14 (est.) | — |
+| At 1M context | 39 | — | 44 | ~14 (est.) | — |
 
 ## What made it faster
 
