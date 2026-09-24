@@ -6,12 +6,13 @@ Local LLM inference on a Mac Studio M5 Ultra (256 GB): DeepSeek-V4.1-Flash and M
 
 ## Prefill at depth
 
-Prompt tokens ÷ time to first token.
+Prompt tokens ÷ time to first token. DeepSeek measured in 8K chunks up to 1M tokens; a needle planted at the start of a 1M-token prompt was recalled correctly.
 
 | Prompt | DeepSeek-V4.1-Flash | MiMo-V2.6-Flash | RTX PRO 6000 ×2 · MiMo |
 |---|---:|---:|---:|
-| ~130K | 2,498 tok/s · 52.5 s | 2,015 tok/s · 64.5 s | 9,724 tok/s · 13.4 s |
-| ~520K | 2,184 tok/s · 240 s | 790 tok/s · 661 s | ~4,880 tok/s · 107 s |
+| ~130K | 2,473 tok/s · 53.0 s | 2,015 tok/s · 64.5 s | 9,724 tok/s · 13.4 s |
+| ~520K | 2,166 tok/s · 242 s | 790 tok/s · 661 s | ~4,880 tok/s · 107 s |
+| 1M | 1,898 tok/s · 553 s | — | — |
 
 ## Decode
 
@@ -24,6 +25,7 @@ Output tokens per second, greedy, speculative decoding on.
 | 8 requests, total | — | 194 | 627 |
 | At 130K context | 61 | 82 | — |
 | At 523K context | 51 | 71 | 101 |
+| At 1M context, plain decode | 25 | — | — |
 
 ## What made it faster
 

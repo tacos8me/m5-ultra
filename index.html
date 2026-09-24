@@ -63,7 +63,7 @@
   <h2>Prefill at depth</h2>
   <p class="sub">Prompt tokens ÷ time to first token.</p>
   <h3>DeepSeek-V4.1-Flash</h3>
-  <p class="sub">Measured in 8K chunks up to 512K tokens.</p>
+  <p class="sub" id="ds-sub">Measured in 8K chunks.</p>
   <div class="chart"><svg id="ds" viewBox="0 0 820 300" role="img" aria-label="DeepSeek-V4.1-Flash prefill rate by prompt length"></svg></div>
 
   <h3>MiMo-V2.6-Flash</h3>
@@ -92,7 +92,7 @@
   </section>
   <p class="foot">Measured 2026-09-24 on the served configurations. RTX PRO 6000 pair figures are MiMo-V2.6-Flash on original weights.</p>
 </main>
-<script type="application/json" id="data">{"chunk": 8192, "max_tokens": 524288, "peak_gib": 232.83, "date": "2026-09-24", "builds": [{"key": "morning", "chunks": [4.703, 6.803, 6.901, 7.248, 13.903, 20.75, 11.532, 12.479, 10.513, 13.493, 15.788, 21.976, 8.85, 9.488, 8.843, 8.699]}, {"key": "now", "chunks": [3.8675, 3.0833, 3.1586, 3.1704, 3.1613, 3.2133, 3.1981, 3.2315, 3.2589, 3.235, 3.2669, 3.2898, 3.3252, 3.3218, 3.3165, 3.3648, 3.4191, 3.571, 3.5827, 3.6006, 3.616, 3.6477, 3.6529, 3.6658, 3.7012, 3.683, 3.6973, 3.7297, 3.7593, 3.7754, 3.7706, 3.7814, 3.8289, 3.8312, 3.8329, 3.8235, 3.8765, 3.9271, 3.8905, 3.8843, 3.9122, 3.9113, 3.9389, 3.9461, 3.9649, 3.9673, 3.9811, 3.9925, 4.041, 4.0193, 4.0946, 4.074, 4.1196, 4.1171, 4.1767, 4.1254, 4.1837, 4.1493, 4.1902, 4.1978, 4.2115, 4.2318, 4.2724, 4.1886]}], "mimo": [{"tokens": 130000, "seconds": 203.125, "ghost": true}, {"tokens": 130000, "seconds": 64.5}, {"tokens": 522000, "seconds": 660.7594936708861}], "decode": [{"label": "1 request", "ds": 79, "mimo": 117, "rtx": 160}, {"label": "2 requests, total", "ds": 79, "mimo": null, "rtx": null}, {"label": "8 requests, total", "ds": null, "mimo": 194, "rtx": 627}, {"label": "At 130K context", "ds": 61, "mimo": 82, "rtx": null}, {"label": "At 523K context", "ds": 51, "mimo": 71, "rtx": 101}]}</script>
+<script type="application/json" id="data">{"chunk": 8192, "max_tokens": 1048576, "peak_gib": 232.43, "date": "2026-09-24", "builds": [{"key": "morning", "chunks": [4.703, 6.803, 6.901, 7.248, 13.903, 20.75, 11.532, 12.479, 10.513, 13.493, 15.788, 21.976, 8.85, 9.488, 8.843, 8.699]}, {"key": "now", "chunks": [3.9013, 3.1423, 3.1697, 3.2123, 3.1779, 3.2201, 3.241, 3.2817, 3.2788, 3.2761, 3.3325, 3.3039, 3.3637, 3.3354, 3.3772, 3.3867, 3.4258, 3.5759, 3.611, 3.6235, 3.6475, 3.6355, 3.6884, 3.6725, 3.735, 3.7333, 3.7327, 3.7488, 3.7756, 3.7826, 3.7946, 3.8256, 3.8256, 3.869, 3.8573, 3.8822, 3.9151, 3.9202, 3.9549, 3.9353, 3.9914, 3.9073, 3.9851, 3.9851, 4.017, 4.0429, 3.9949, 4.0532, 4.0269, 4.099, 4.1212, 4.0849, 4.149, 4.147, 4.2117, 4.1799, 4.1939, 4.176, 4.2453, 4.2596, 4.2696, 4.2489, 4.2904, 4.2479, 4.3193, 4.2954, 4.331, 4.3641, 4.4282, 4.4071, 4.3959, 4.4725, 4.4229, 4.4715, 4.4864, 4.5419, 4.53, 4.5196, 4.5977, 4.4783, 4.5419, 4.5988, 4.6524, 4.6613, 4.6616, 4.6644, 4.6757, 4.6573, 4.6972, 4.7063, 4.7665, 4.7609, 4.7856, 4.8326, 4.8055, 4.8113, 4.8634, 4.9349, 4.948, 4.9478, 4.9386, 4.8793, 5.0491, 5.0135, 4.9851, 4.9837, 5.1187, 5.1217, 5.0428, 5.0686, 5.1566, 5.0807, 5.1153, 5.1973, 5.1307, 5.2689, 5.1597, 5.1846, 5.306, 5.1809, 5.3112, 5.1933, 5.3489, 5.2629, 5.385, 5.2432, 5.4537, 5.2669]}], "mimo": [{"tokens": 130000, "seconds": 203.125, "ghost": true}, {"tokens": 130000, "seconds": 64.5}, {"tokens": 522000, "seconds": 660.7594936708861}], "decode": [{"label": "1 request", "ds": 79, "mimo": 117, "rtx": 160}, {"label": "2 requests, total", "ds": 79, "mimo": null, "rtx": null}, {"label": "8 requests, total", "ds": null, "mimo": 194, "rtx": 627}, {"label": "At 130K context", "ds": 61, "mimo": 82, "rtx": null}, {"label": "At 523K context", "ds": 51, "mimo": 71, "rtx": 101}, {"label": "At 1M context, plain decode", "ds": 24, "mimo": null, "rtx": null}]}</script>
 <script>
 (() => {
   const D = JSON.parse(document.getElementById('data').textContent);
@@ -113,8 +113,9 @@
       add('line', { x1: L, x2: W - R, y1: y(v), y2: y(v), stroke: 'var(--rule)' });
       add('text', { x: L - 10, y: y(v) + 4, 'text-anchor': 'end' }, v ? fmt(v) : '0');
     }
-    for (const v of [0, 131072, 262144, 393216, 524288])
-      add('text', { x: x(v), y: H - 8, 'text-anchor': 'middle' }, v ? `${v / 1024}K` : '0');
+    const ticks = N > 600000 ? [0, 262144, 524288, 786432, 1048576] : [0, 131072, 262144, 393216, 524288];
+    for (const v of ticks)
+      add('text', { x: x(v), y: H - 8, 'text-anchor': 'middle' }, v >= 1048576 ? '1M' : v ? `${v / 1024}K` : '0');
     return { add, x, y };
   };
   const label = (g, px, py, color, text) => g.add('text', { x: px + 10, y: py + 4, style: 'fill:' + color }, text);
@@ -141,13 +142,15 @@
     label(mi, px, py, color, p.ghost ? `initial · ${fmt(p.tokens / p.seconds)} tok/s` : `${fmt(p.tokens / p.seconds)} tok/s`);
   });
 
-  const ds130 = now[131072 / C - 1], ds512 = now[now.length - 1];
+  document.getElementById('ds-sub').textContent = `Measured in 8K chunks up to ${N >= 1048576 ? '1M' : '512K'} tokens.`;
+  const ds130 = now[131072 / C - 1], ds512 = now[524288 / C - 1], dsEnd = now[now.length - 1];
   const mm = D.mimo.filter(p => !p.ghost);
   const cell = (tokens, seconds) => `${fmt(tokens / seconds)} tok/s<span>${fmt(seconds, seconds < 100 ? 1 : 0)} s</span>`;
   document.getElementById('t').innerHTML =
     '<thead><tr><th></th><th>DeepSeek-V4.1-Flash</th><th>MiMo-V2.6-Flash</th><th>RTX PRO 6000 ×2 · MiMo</th></tr></thead><tbody>' +
     `<tr><td>~130K</td><td>${cell(131072, ds130.t)}</td><td>${cell(mm[0].tokens, mm[0].seconds)}</td><td>${cell(130000, 130000 / 9724)}</td></tr>` +
-    `<tr><td>~520K</td><td>${cell(N, ds512.t)}</td><td>${cell(mm[1].tokens, mm[1].seconds)}</td><td>${cell(522000, 107)}</td></tr>` +
+    `<tr><td>~520K</td><td>${cell(524288, ds512.t)}</td><td>${cell(mm[1].tokens, mm[1].seconds)}</td><td>${cell(522000, 107)}</td></tr>` +
+    (N >= 1048576 ? `<tr><td>1M</td><td>${cell(N, dsEnd.t)}</td><td class="na">—</td><td class="na">—</td></tr>` : '') +
     '</tbody>';
 
   const v = x => x == null ? '<td class="na">—</td>' : `<td>${x}${typeof x === 'number' ? ' tok/s' : ''}</td>`;
