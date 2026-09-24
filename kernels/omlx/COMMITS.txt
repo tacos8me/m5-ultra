@@ -1,0 +1,28 @@
+560ee7e0 Add V4.1 mixed quant export and packed integer index scoring
+c74be02e Integrate gated DeepSeek decode fusion and packed cache growth
+2406acdd Validate the q3 tile stack and bound isolated serving memory
+570dc6ce Use packed native attention for short DeepSeek verification blocks
+74a4d0a4 Minimize affine3 export error with bounded groupwise least-squares search
+395bdaaf Keep DSpark short verification on the measured faster split attention path
+5f29fe37 Accelerate resident prefill index scans with NAX scoring and radix selection
+3e4aa767 perf: single-pass bit-exact partial RoPE for DeepSeek V4.1
+0c6966ed perf: overlap DeepSeek V4.1 Engram SSD reads with prefill via lookahead
+c0257327 perf: cap the MLX pool during DS41 prefill instead of clearing it per layer
+f5d16005 perf: reuse Engram lookahead rows when the scheduler shrinks a chunk
+dac6a09c perf: share DeepSeek V4.1 rope cos/sin tables across a chunk's layers
+28aeff00 perf: build the next DeepSeek V4.1 prefill layer while the GPU runs one
+12ca12ea Read sparse prefill query fragments directly into registers
+60f06356 perf: cut DeepSeek V4.1 decode GPU time with bitwise-identical kernels
+84885ba2 perf: exact two-read radix top-k for DeepSeek V4.1 prefill index selection
+35e1243e Reuse decoded KV rows across sparse prefill queries
+5b704994 perf: pack DeepSeek V4.1 decode window KV in one bitwise-identical kernel
+05fc6dbc perf: reuse DeepSeek V4.1 verify activations across two MXFP8 GEMV rows
+c22415a2 fix: stop DeepSeek V4.1 decode recompiling index top-k kernels per token
+a46b1031 Batch DeepSeek plain decode across requests and preserve CED prefill geometry
+b19ada7b perf: read DeepSeek V4.1 decode Engram rows with the native pool
+a3c88689 perf: overlap DeepSeek V4.1 decode graph build with the GPU; M=1 GEMV replica
+d1852d84 Reuse DeepSeek prefill Metal pipelines across prompt lengths
+3ca2de88 perf: exact two-row GEMV for DeepSeek V4.1 decode wo_a projection
+8df48d24 Batch DeepSeek router and shared experts with scalar GEMV arithmetic
+ca21cb03 perf: fetch DeepSeek V4.1 decode Engram weight and scale rows concurrently
+ef88391e Preserve per-request DSpark state and batch exact ragged verification

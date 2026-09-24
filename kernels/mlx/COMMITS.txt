@@ -1,0 +1,13 @@
+8bbae7a fix: strip address space from cooperative tensor types for macOS 27 MPP headers
+811b61a feat: fused NAX SDPA for Q/K 192 with V 128, sliding window, GQA-16 decode
+0351d8c feat: expert-aligned tiles and vectorized MXFP4 dequant for sorted gather_qmm
+f40fc1c feat: split-KV NAX decode attention for Q/K 192, V 128, up to 8 queries
+87fee13 perf: faster causal NAX attention for bf16 Q/K 192, V 128 prefill
+754be7e perf(metal): use the sorted gather_qmm kernel from one row per expert on NAX
+3727cf6 perf: use a K block of 128 for expert-aligned MXFP4 gather_qmm tiles
+785fcea perf: read gathered x rows inside the sorted MXFP4 gather_qmm kernel
+c7dd17f perf: give the query heads of one KV head consecutive attention threadgroups
+4603976 perf(metal): NAX split-KV decode for masked batched decode attention
+f5e5cef Port expert-aligned NAX gather to affine2 group128
+82d96a9 Document affine2 gather validation and benchmark harness
+b80ffce Extend expert-aligned affine gather tiles to 3-bit group-128 weights

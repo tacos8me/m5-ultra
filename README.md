@@ -38,6 +38,10 @@ DeepSeek-V4.1-Flash, same day. Every change keeps greedy output bit-identical.
 - No per-token kernel recompiles and no SSD page faults on fresh text.
 - Two requests batched exactly under speculative decoding.
 
+## Kernels
+
+All modified kernels and code are in [`kernels/`](kernels/), as patches against upstream MLX, mlx-lm and oMLX plus the changed source files.
+
 ## Setup
 
 - **DeepSeek-V4.1-Flash:** 3-bit LSQ experts (group 128), 8-bit elsewhere, 223.5 GiB resident. oMLX with custom Metal kernels, encoder-only prefill in 8K chunks, DSpark speculative decoding (k=4).

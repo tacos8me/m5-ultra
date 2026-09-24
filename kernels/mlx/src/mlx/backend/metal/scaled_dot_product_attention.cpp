@@ -1,0 +1,1247 @@
+// Copyright © 2024 Apple Inc.
+#include <sstream>
+
+#include "mlx/backend/common/compiled.h"
+#include "mlx/backend/gpu/copy.h"
+#include "mlx/backend/metal/device.h"
+#include "mlx/backend/metal/kernels.h"
+#include "mlx/backend/metal/kernels/defines.h"
+#include "mlx/backend/metal/kernels/steel/attn/params.h"
+#include "mlx/backend/metal/utils.h"
+#include "mlx/fast_primitives.h"
+#include "mlx/utils.h"
+
+namespace mlx::core::fast {
+
+namespace {
+
+bool use_nax_full_attention(const array& q, const array& v) {
+  int D = q.shape(-1);
+  int V = v.shape(-1);
+  bool dims = (D == V && (D == 64 || D == 96 || D == 128 || D == 256)) ||
+      (D == 192 && V == 128);
+  return metal::is_nax_available() && dims &&
+      (env::enable_tf32() || q.dtype() != float32);
+}
+
+void sdpa_full_self_attention_nax(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    const float scale,
+    array& o,
+    bool do_causal_,
+    const std::optional<array>& mask,
+    const std::optional<array>& sinks,
+    int window_size) {
+  using namespace mlx::steel;
+
+  int bd = q.shape(-1);
+  int bdv = v.shape(-1);
+  int bq = 64;
+  int bk = 32;
+
+  bool split_d = bd == 256;
+  int wm = 4;
+  int wn = split_d ? 2 : 1;
+
+  int B = q.shape(0);
+  int H = q.shape(1);
+  int D = q.shape(3);
+  int gqa_factor = q.shape(1) / k.shape(1);
+
+  int qL = q.shape(2);
+  int kL = k.shape(2);
+
+  // The causal offset describes the true diagonal even if kL is widened
+  // below.
+  int qL_off = kL - qL;
+
+  // Check if K/V are from chunked KV cache, and assume aligned K/V if so.
+  auto has_backing_rows = [](const array& kv, int rows) {
+    auto& st = kv.strides();
+    if ((st[0] < 0) || (st[1] <= 0) || (st[2] <= 0) || (st[1] % st[2] != 0)) {
+      return false;
+    }
+    int64_t itemsize = kv.itemsize();
+    // The rows must stay inside the head's row pitch (so they belong to the
+    // cache the slice was taken from) ...
+    int64_t pitch = st[1] / st[2];
+    int64_t row0 = ((kv.offset() / itemsize) % st[1]) / st[2];
+    if (row0 + rows > pitch) {
+      return false;
+    }
+    // ... and inside the buffer.
+    int64_t end = (kv.shape(0) - 1) * st[0] + (kv.shape(1) - 1) * st[1] +
+        (rows - 1) * st[2] + kv.shape(3);
+    return kv.offset() + end * itemsize <= int64_t(kv.buffer_size());
+  };
+  if (split_d && do_causal_ && !mask.has_value() && (kL % bk)) {
+    int kLp = bk * ((kL + bk - 1) / bk);
+    if (has_backing_rows(k, kLp) && has_backing_rows(v, kLp)) {
+      kL = kLp;
+    }
+  }
+
+  const bool align_Q = (qL % bq) == 0;
+  const bool align_K = (kL % bk) == 0;
+  const bool has_mask = mask.has_value();
+  const bool do_causal = do_causal_;
+  const bool has_sinks = sinks.has_value();
+  const bool has_window = window_size > 0;
+  // Row strides equal the head dims, so the kernel can use constant strides.
+  const bool row_packed = bd == 192 && bdv == 128 && q.strides(2) == bd &&
+      k.strides(2) == bd && v.strides(2) == bdv && o.strides(2) == bdv;
+
+  metal::MTLFCList func_consts = {
+      {&align_Q, MTL::DataType::DataTypeBool, 200},
+      {&align_K, MTL::DataType::DataTypeBool, 201},
+      {&has_mask, MTL::DataType::DataTypeBool, 300},
+      {&do_causal, MTL::DataType::DataTypeBool, 301},
+      {&has_sinks, MTL::DataType::DataTypeBool, 302},
+      {&has_window, MTL::DataType::DataTypeBool, 303},
+      {&row_packed, MTL::DataType::DataTypeBool, 304}};
+
+  std::string base_name;
+  concatenate(
+      base_name,
+      split_d ? "steel_attention_dsplit_" : "steel_attention_",
+      type_to_name(q),
+      "_bq",
+      bq,
+      "_bk",
+      bk,
+      "_bd",
+      bd,
+      bdv != bd ? "_bdv" + std::to_string(bdv) : "",
+      "_wm",
+      wm,
+      "_wn",
+      wn,
+      "_mask",
+      type_to_name(has_mask ? *mask : q));
+
+  std::string hash_name;
+  concatenate(
+      hash_name,
+      base_name,
+      "_align_Q_",
+      (align_Q ? 't' : 'n'),
+      "_align_K_",
+      (align_K ? 't' : 'n'),
+      "_has_mask_",
+      (has_mask ? 't' : 'n'),
+      "_do_causal_",
+      (do_causal ? 't' : 'n'),
+      "_has_sinks_",
+      (has_sinks ? 't' : 'n'),
+      "_has_window_",
+      (has_window ? 't' : 'n'),
+      "_row_packed_",
+      (row_packed ? 't' : 'n'));
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+
+  auto kernel = get_steel_attention_nax_kernel(
+      d,
+      base_name,
+      hash_name,
+      func_consts,
+      q,
+      bq,
+      bk,
+      bd,
+      bdv,
+      wm,
+      wn,
+      (has_mask ? *mask : q),
+      split_d);
+
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  const int NQ = (qL + bq - 1) / bq;
+  const int NK = (kL + bk - 1) / bk;
+
+  const int NQ_aligned = qL / bq;
+  const int NK_aligned = kL / bk;
+
+  AttnParams params{
+      /* int B = */ B,
+      /* int H = */ H,
+      /* int D = */ D,
+
+      /* int qL = */ qL,
+      /* int kL = */ kL,
+
+      /* int gqa_factor = */ gqa_factor,
+      /* float scale = */ scale,
+
+      /* int NQ = */ NQ,
+      /* int NK = */ NK,
+
+      /* int NQ_aligned = */ NQ_aligned,
+      /* int NK_aligned = */ NK_aligned,
+
+      /* int qL_rem = */ (qL - NQ_aligned * bq),
+      /* int kL_rem = */ (kL - NK_aligned * bk),
+      /* int qL_off = */ qL_off,
+
+      /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
+      /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
+      /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
+      /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)},
+      /* int window = */ window_size};
+
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(v, 2);
+  compute_encoder.set_output_array(o, 3);
+  compute_encoder.set_bytes(params, 4);
+
+  if (has_mask) {
+    auto& m = *mask;
+
+    AttnMaskParams mask_params{/* int64_t M_strides[3] = */ {
+        m.strides(0), m.strides(1), m.strides(2)}};
+
+    compute_encoder.set_bytes(mask_params, 5);
+    compute_encoder.set_input_array(m, 6);
+  }
+  if (has_sinks) {
+    compute_encoder.set_input_array(*sinks, 7);
+  }
+
+  MTL::Size grid_dims = MTL::Size(NQ, H, B);
+  MTL::Size group_dims = MTL::Size(32, wm, wn);
+
+  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void sdpa_full_self_attention_metal(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    const float scale,
+    array& o,
+    bool do_causal_,
+    const std::optional<array>& mask,
+    const std::optional<array>& sinks,
+    int window_size) {
+  int B = q.shape(0);
+  int H = q.shape(1);
+  int D = q.shape(3);
+  int gqa_factor = q.shape(1) / k.shape(1);
+
+  int qL = q.shape(2);
+  int kL = k.shape(2);
+
+  if (use_nax_full_attention(q, v)) {
+    return sdpa_full_self_attention_nax(
+        /* const Stream& s = */ s,
+        /* metal::Device& d = */ d,
+        /* const array& q = */ q,
+        /* const array& k = */ k,
+        /* const array& v = */ v,
+        /* const float scale = */ scale,
+        /* array& o = */ o,
+        /* bool do_causal_ = */ do_causal_,
+        /* const std::optional<array>& mask = */ mask,
+        /* const std::optional<array>& sinks = */ sinks,
+        /* int window_size = */ window_size);
+  }
+
+  // Pad head dims 72 and 80 to 96 to reach the NAX kernel. The added lanes
+  // are zero and the caller's scale is retained. Enable by default only for
+  // long, unmasked half-precision attention, where the attention work can
+  // amortize the padding and output copy. The override is read per call.
+  bool pad_default = qL >= 512 && kL >= 512 && !do_causal_ && !mask && !sinks;
+  if ((D == 72 || D == 80) && metal::is_nax_available() &&
+      (q.dtype() == float16 || q.dtype() == bfloat16) &&
+      env::get_var("MLX_SDPA_PAD_HEAD_DIM", pad_default ? 1 : 0) == 1) {
+    constexpr int pad_to = 96;
+    auto& enc = metal::get_command_encoder(s);
+    array zero = array(0, q.dtype());
+
+    auto pad_head_dim = [&](const array& x) {
+      Shape padded_shape = x.shape();
+      padded_shape.back() = pad_to;
+      array xp(std::move(padded_shape), x.dtype(), nullptr, {});
+      fill_gpu(zero, xp, s);
+      // Explicit output strides: a [.., D] view over xp would be
+      // non-contiguous with span > size, so it cannot carry xp's flags.
+      copy_gpu_inplace(
+          /* const array& in = */ x,
+          /* array& out = */ xp,
+          /* const Shape& data_shape = */ x.shape(),
+          /* const Strides& i_strides = */ x.strides(),
+          /* const Strides& o_strides = */ xp.strides(),
+          /* int64_t i_offset = */ 0,
+          /* int64_t o_offset = */ 0,
+          /* CopyType ctype = */ CopyType::GeneralGeneral,
+          /* const Stream& s = */ s);
+      enc.add_temporary(xp);
+      return xp;
+    };
+
+    array qp = pad_head_dim(q);
+    array kp = pad_head_dim(k);
+    array vp = pad_head_dim(v);
+
+    Shape padded_out = o.shape();
+    padded_out.back() = pad_to;
+    array op(std::move(padded_out), o.dtype(), nullptr, {});
+    op.set_data(allocator::malloc(op.nbytes()));
+
+    sdpa_full_self_attention_nax(
+        /* const Stream& s = */ s,
+        /* metal::Device& d = */ d,
+        /* const array& q = */ qp,
+        /* const array& k = */ kp,
+        /* const array& v = */ vp,
+        /* const float scale = */ scale,
+        /* array& o = */ op,
+        /* bool do_causal_ = */ do_causal_,
+        /* const std::optional<array>& mask = */ mask,
+        /* const std::optional<array>& sinks = */ sinks,
+        /* int window_size = */ window_size);
+
+    // Slice the padded lanes back out into o's caller-chosen strides.
+    copy_gpu_inplace(
+        /* const array& in = */ op,
+        /* array& out = */ o,
+        /* const Shape& data_shape = */ o.shape(),
+        /* const Strides& i_strides = */ op.strides(),
+        /* const Strides& o_strides = */ o.strides(),
+        /* int64_t i_offset = */ 0,
+        /* int64_t o_offset = */ 0,
+        /* CopyType ctype = */ CopyType::GeneralGeneral,
+        /* const Stream& s = */ s);
+    enc.add_temporary(op);
+    enc.add_temporary(zero);
+    return;
+  }
+
+  using namespace mlx::steel;
+
+  int wm = 4;
+  int wn = 1;
+
+  int bd = q.shape(-1);
+  int bq = 32;
+  int bk = bd < 128 ? 32 : 16;
+
+  const bool align_Q = (qL % bq) == 0;
+  const bool align_K = (kL % bk) == 0;
+  const bool has_mask = mask.has_value();
+  const bool do_causal = do_causal_;
+  const bool has_sinks = sinks.has_value();
+
+  metal::MTLFCList func_consts = {
+      {&align_Q, MTL::DataType::DataTypeBool, 200},
+      {&align_K, MTL::DataType::DataTypeBool, 201},
+      {&has_mask, MTL::DataType::DataTypeBool, 300},
+      {&do_causal, MTL::DataType::DataTypeBool, 301},
+      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
+
+  std::string base_name;
+  concatenate(
+      base_name,
+      "steel_attention_",
+      type_to_name(q),
+      "_bq",
+      bq,
+      "_bk",
+      bk,
+      "_bd",
+      bd,
+      "_wm",
+      wm,
+      "_wn",
+      wn,
+      "_mask",
+      type_to_name(has_mask ? *mask : q));
+
+  std::string hash_name;
+  concatenate(
+      hash_name,
+      base_name,
+      "_align_Q_",
+      (align_Q ? 't' : 'n'),
+      "_align_K_",
+      (align_K ? 't' : 'n'),
+      "_has_mask_",
+      (has_mask ? 't' : 'n'),
+      "_do_causal_",
+      (do_causal ? 't' : 'n'),
+      "_has_sinks_",
+      (has_sinks ? 't' : 'n'));
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+
+  auto kernel = get_steel_attention_kernel(
+      d,
+      base_name,
+      hash_name,
+      func_consts,
+      q,
+      bq,
+      bk,
+      bd,
+      wm,
+      wn,
+      (has_mask ? *mask : q));
+
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  const int NQ = (qL + bq - 1) / bq;
+  const int NK = (kL + bk - 1) / bk;
+
+  const int NQ_aligned = qL / bq;
+  const int NK_aligned = kL / bk;
+
+  AttnParams params{
+      /* int B = */ B,
+      /* int H = */ H,
+      /* int D = */ D,
+
+      /* int qL = */ qL,
+      /* int kL = */ kL,
+
+      /* int gqa_factor = */ gqa_factor,
+      /* float scale = */ scale,
+
+      /* int NQ = */ NQ,
+      /* int NK = */ NK,
+
+      /* int NQ_aligned = */ NQ_aligned,
+      /* int NK_aligned = */ NK_aligned,
+
+      /* int qL_rem = */ (qL - NQ_aligned * bq),
+      /* int kL_rem = */ (kL - NK_aligned * bk),
+      /* int qL_off = */ (kL - qL),
+
+      /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
+      /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
+      /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
+      /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
+
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(v, 2);
+  compute_encoder.set_output_array(o, 3);
+  compute_encoder.set_bytes(params, 4);
+
+  if (has_mask) {
+    auto& m = *mask;
+
+    AttnMaskParams mask_params{/* int64_t M_strides[3] = */ {
+        m.strides(0), m.strides(1), m.strides(2)}};
+
+    compute_encoder.set_bytes(mask_params, 5);
+    compute_encoder.set_input_array(m, 6);
+  }
+  if (has_sinks) {
+    compute_encoder.set_input_array(*sinks, 7);
+  }
+
+  MTL::Size grid_dims = MTL::Size(NQ, H, B);
+  MTL::Size group_dims = MTL::Size(32, wm, wn);
+
+  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void sdpa_vector(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    array& out,
+    float scale,
+    bool do_causal,
+    const std::optional<array>& mask,
+    const std::optional<array>& sinks) {
+  // Set the kernel name
+  std::string kname;
+  kname.reserve(64);
+  kname += "sdpa_vector_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+  kname += "_";
+  kname += std::to_string(v.shape(-1));
+
+  // Compute the necessary sizes
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int N = k.shape(2);
+  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t k_seq_stride = k.strides()[2];
+  size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
+  size_t v_seq_stride = v.strides()[2];
+
+  MTL::Size group_dims(1024, 1, 1);
+  MTL::Size grid_dims(q.shape(0) * q.shape(1), q.shape(2), 1);
+
+  bool has_mask = mask.has_value();
+  bool bool_mask = has_mask && (*mask).dtype() == bool_;
+  bool float_mask = has_mask && !bool_mask;
+  bool query_transposed = !q.flags().row_contiguous;
+  bool has_sinks = sinks.has_value();
+  metal::MTLFCList func_consts = {
+      {&has_mask, MTL::DataType::DataTypeBool, 20},
+      {&query_transposed, MTL::DataType::DataTypeBool, 21},
+      {&do_causal, MTL::DataType::DataTypeBool, 22},
+      {&bool_mask, MTL::DataType::DataTypeBool, 23},
+      {&float_mask, MTL::DataType::DataTypeBool, 24},
+      {&has_sinks, MTL::DataType::DataTypeBool, 25},
+  };
+  std::string hash_name = kname;
+  hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
+  hash_name += query_transposed ? "_qt" : "_qnt";
+  hash_name += do_causal ? "_c" : "_nc";
+  hash_name += has_sinks ? "_sinks" : "_nosinks";
+
+  // Get the kernel
+  auto& compute_encoder = metal::get_command_encoder(s);
+  auto kernel = d.get_kernel(kname, hash_name, func_consts);
+  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set its arguments
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(v, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(gqa_factor, 4);
+  compute_encoder.set_bytes(N, 5);
+  compute_encoder.set_bytes(k_head_stride, 6);
+  compute_encoder.set_bytes(k_seq_stride, 7);
+  compute_encoder.set_bytes(v_head_stride, 8);
+  compute_encoder.set_bytes(v_seq_stride, 9);
+
+  compute_encoder.set_bytes(scale, 10);
+  if (has_mask) {
+    auto& m = *mask;
+    compute_encoder.set_input_array(m, 11 + float_mask);
+    int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+    int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+    int32_t head_stride =
+        m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+    compute_encoder.set_bytes(kv_seq_stride, 13);
+    compute_encoder.set_bytes(q_seq_stride, 14);
+    compute_encoder.set_bytes(head_stride, 15);
+  }
+  if (has_sinks) {
+    compute_encoder.set_input_array(*sinks, 16);
+    compute_encoder.set_bytes(q.shape(1), 17);
+  }
+
+  // Launch
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+// Split-KV decode on the neural accelerators for up to 8 queries per head,
+// with the query heads of each KV head as the rows of one 16-row tile. A
+// boolean mask shared by the heads (left-padded batch caches) is supported.
+bool nax_decode_supported(
+    const array& q,
+    const array& k,
+    const array& v,
+    const std::optional<array>& mask) {
+  int qL = q.shape(2);
+  int gqa_factor = q.shape(1) / k.shape(1);
+  bool mask_ok = !mask ||
+      (mask->ndim() == 4 && mask->dtype() == bool_ &&
+       (mask->shape(1) == 1 || mask->strides(1) == 0));
+  return metal::is_nax_available() && mask_ok && qL <= 8 &&
+      (q.dtype() == float16 || q.dtype() == bfloat16) && gqa_factor > 1 &&
+      gqa_factor <= 16 && q.shape(-1) == 192 && v.shape(-1) == 128;
+}
+
+bool use_nax_decode(
+    const array& q,
+    const array& k,
+    const array& v,
+    const std::optional<array>& mask) {
+  if (!nax_decode_supported(q, k, v, mask)) {
+    return false;
+  }
+  // Measured on M5 Ultra (GQA 16, masked): batched decode from 512 keys, e.g.
+  // 8 x 1152 keys 107 -> 55 us. Short keys (sliding window) stay faster on
+  // the vector kernels.
+  int qL = q.shape(2);
+  int gqa_factor = q.shape(1) / k.shape(1);
+  return k.shape(2) >= 4096 || qL * gqa_factor > 32 ||
+      (q.shape(0) >= 2 && k.shape(2) >= 512);
+}
+
+bool use_nax_decode(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_arr_mask) {
+  return !has_arr_mask && use_nax_decode(q, k, v, std::nullopt);
+}
+
+void sdpa_nax_decode_pass1(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    float scale,
+    bool do_causal,
+    const std::optional<array>& mask,
+    const std::optional<array>& sinks,
+    int blocks,
+    array& intermediate,
+    array& sums,
+    array& maxs) {
+  using namespace mlx::steel;
+  constexpr int bk = 32;
+  int bd = q.shape(-1);
+  int bdv = v.shape(-1);
+  int kL = k.shape(2);
+  int chunk = (kL + blocks - 1) / blocks;
+  chunk = ((chunk + bk - 1) / bk) * bk;
+
+  std::string kname;
+  concatenate(
+      kname,
+      "steel_attention_decode_",
+      type_to_name(q),
+      "_bk",
+      bk,
+      "_bd",
+      bd,
+      "_bdv",
+      bdv);
+  const bool has_sinks = sinks.has_value();
+  const bool has_mask = mask.has_value();
+  metal::MTLFCList func_consts = {
+      {&has_mask, MTL::DataType::DataTypeBool, 300},
+      {&do_causal, MTL::DataType::DataTypeBool, 301},
+      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
+  std::string hash_name = kname + (has_sinks ? "_sinks" : "_nosinks") +
+      (do_causal ? "_causal" : "") + (has_mask ? "_mask" : "");
+  auto kernel = get_steel_attention_nax_decode_kernel(
+      d, kname, hash_name, func_consts, q, bk, bd, bdv);
+
+  AttnDecodeParams params{
+      /* int kL = */ kL,
+      /* int qL = */ int(q.shape(2)),
+      /* int gqa_factor = */ int(q.shape(1) / k.shape(1)),
+      /* float scale = */ scale,
+      /* int chunk = */ chunk,
+      /* int blocks = */ blocks,
+      /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
+      /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
+      /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
+      /* int64_t M_strides[3] = */ {0, 0, 0}};
+  if (has_mask) {
+    auto& m = *mask;
+    params.M_strides[0] = m.shape(0) > 1 ? m.strides(0) : 0;
+    params.M_strides[1] = m.shape(2) > 1 ? m.strides(2) : 0;
+    params.M_strides[2] = m.shape(3) > 1 ? m.strides(3) : 0;
+  }
+
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.set_compute_pipeline_state(kernel);
+  compute_encoder.set_input_array(q, 0);
+  compute_encoder.set_input_array(k, 1);
+  compute_encoder.set_input_array(v, 2);
+  compute_encoder.set_output_array(intermediate, 3);
+  compute_encoder.set_output_array(sums, 4);
+  compute_encoder.set_output_array(maxs, 5);
+  compute_encoder.set_bytes(params, 6);
+  if (has_sinks) {
+    compute_encoder.set_input_array(*sinks, 7);
+  }
+  if (has_mask) {
+    compute_encoder.set_input_array(*mask, 8);
+  }
+  MTL::Size grid_dims(blocks, k.shape(1), q.shape(0));
+  MTL::Size group_dims(32 * q.shape(2), 1, 1);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+void sdpa_vector_2pass(
+    const Stream& s,
+    metal::Device& d,
+    const array& q,
+    const array& k,
+    const array& v,
+    array& out,
+    float scale,
+    bool do_causal,
+    const std::optional<array>& mask,
+    const std::optional<array>& sinks) {
+  const bool nax_decode = use_nax_decode(q, k, v, mask);
+
+  // Set the kernel name
+  std::string kname;
+  kname.reserve(64);
+  kname += "sdpa_vector_2pass_1";
+  int gqa_factor = q.shape(1) / k.shape(1);
+  int qk_dim = q.shape(-1);
+  int v_dim = v.shape(-1);
+  bool gqa_dims =
+      (qk_dim == v_dim &&
+       ((gqa_factor == 8 && (qk_dim == 64 || qk_dim == 128)) ||
+        ((gqa_factor == 12 || gqa_factor == 16) && qk_dim == 128))) ||
+      (gqa_factor == 16 && qk_dim == 192 && v_dim == 128);
+  if (!mask && !sinks && q.shape(2) == 1 &&
+      q.shape(1) == gqa_factor * k.shape(1) && gqa_dims && k.shape(2) >= 8192) {
+    kname += "_gqa_";
+    kname += std::to_string(gqa_factor);
+  }
+  kname += "_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(q.shape(-1));
+  kname += "_";
+  kname += std::to_string(v.shape(-1));
+
+  // Compute the necessary sizes
+  int n_simds = gqa_factor * q.shape(2);
+
+  char devc = d.get_architecture().back();
+  int N = k.shape(2);
+  int blocks;
+  if (devc == 's') {
+    blocks = 64;
+    if (N > 1024 && n_simds > 4) {
+      if (N <= 8192) {
+        blocks = 128;
+      } else if (N <= 32768) {
+        blocks = 256;
+      } else if (N <= 65536) {
+        blocks = 512;
+      } else {
+        blocks = 1024;
+      }
+    }
+  } else if (devc == 'd') {
+    blocks = 128;
+    if (n_simds <= 2 && N > 8192) {
+      blocks = 256;
+    } else if (n_simds >= 6) {
+      if (N >= 16384 && N < 65536) {
+        blocks = 512;
+      } else if (N >= 65536) {
+        blocks = 1024;
+      }
+    }
+  } else {
+    if (n_simds >= 4) {
+      blocks = 64;
+    } else {
+      blocks = 32;
+    }
+  }
+  if (nax_decode) {
+    // Measured on M5 Ultra: long chunks per threadgroup stream the keys best.
+    blocks = N < 8192 ? 32 : (N < 65536 ? 256 : 64);
+  }
+  if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
+    // The 2-pass reduction consumes the partials in simd-width (32) chunks
+    // and silently drops the tail otherwise, so round up to a multiple of 32.
+    blocks = ((blocks_env + 31) / 32) * 32;
+  }
+  size_t k_head_stride = k.shape(1) == 1 ? k.strides(0) : k.strides(1);
+  size_t k_seq_stride = k.strides()[2];
+  size_t v_head_stride = v.shape(1) == 1 ? v.strides(0) : v.strides(1);
+  size_t v_seq_stride = v.strides()[2];
+  MTL::Size group_dims(32, gqa_factor, q.shape(2));
+  MTL::Size grid_dims(k.shape(1), q.shape(0), blocks);
+
+  // Allocate the intermediates
+  Shape intermediate_shape;
+  intermediate_shape.reserve(out.ndim() + 1);
+  intermediate_shape.insert(
+      intermediate_shape.end(), out.shape().begin(), out.shape().end() - 1);
+  intermediate_shape.push_back(blocks);
+  intermediate_shape.push_back(out.shape().back());
+  array intermediate(intermediate_shape, q.dtype(), nullptr, {});
+  intermediate_shape.pop_back();
+  array sums(intermediate_shape, float32, nullptr, {});
+  array maxs(std::move(intermediate_shape), float32, nullptr, {});
+  intermediate.set_data(allocator::malloc(intermediate.nbytes()));
+  sums.set_data(allocator::malloc(sums.nbytes()));
+  maxs.set_data(allocator::malloc(maxs.nbytes()));
+  auto& compute_encoder = metal::get_command_encoder(s);
+  compute_encoder.add_temporary(intermediate);
+  compute_encoder.add_temporary(sums);
+  compute_encoder.add_temporary(maxs);
+
+  if (nax_decode) {
+    sdpa_nax_decode_pass1(
+        s,
+        d,
+        q,
+        k,
+        v,
+        scale,
+        do_causal,
+        mask,
+        sinks,
+        blocks,
+        intermediate,
+        sums,
+        maxs);
+  } else {
+    bool has_mask = mask.has_value();
+    bool bool_mask = has_mask && (*mask).dtype() == bool_;
+    bool float_mask = has_mask && !bool_mask;
+    bool query_transposed = !q.flags().row_contiguous;
+    bool has_sinks = sinks.has_value();
+    metal::MTLFCList func_consts = {
+        {&has_mask, MTL::DataType::DataTypeBool, 20},
+        {&query_transposed, MTL::DataType::DataTypeBool, 21},
+        {&do_causal, MTL::DataType::DataTypeBool, 22},
+        {&bool_mask, MTL::DataType::DataTypeBool, 23},
+        {&float_mask, MTL::DataType::DataTypeBool, 24},
+        {&has_sinks, MTL::DataType::DataTypeBool, 25},
+        {&blocks, MTL::DataType::DataTypeInt, 26},
+    };
+    std::string hash_name = kname;
+    hash_name +=
+        has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
+    hash_name += query_transposed ? "_qt" : "_qnt";
+    hash_name += do_causal ? "_c" : "_nc";
+    hash_name += has_sinks ? "_sinks_" : "_nosinks_";
+    hash_name += std::to_string(blocks);
+
+    // Get the kernel
+    auto kernel = d.get_kernel(kname, hash_name, func_consts);
+    check_kernel_threadgroup_size(kernel, group_dims, hash_name);
+
+    compute_encoder.set_compute_pipeline_state(kernel);
+
+    // Set its arguments
+    compute_encoder.set_input_array(q, 0);
+    compute_encoder.set_input_array(k, 1);
+    compute_encoder.set_input_array(v, 2);
+    compute_encoder.set_output_array(intermediate, 3);
+    compute_encoder.set_output_array(sums, 4);
+    compute_encoder.set_output_array(maxs, 5);
+    compute_encoder.set_bytes(N, 7);
+    compute_encoder.set_bytes(k_head_stride, 8);
+    compute_encoder.set_bytes(k_seq_stride, 9);
+    compute_encoder.set_bytes(v_head_stride, 10);
+    compute_encoder.set_bytes(v_seq_stride, 11);
+    compute_encoder.set_bytes(scale, 12);
+    if (has_mask) {
+      auto& m = *mask;
+      compute_encoder.set_input_array(m, 13 + float_mask);
+      int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+      int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+      int32_t head_stride =
+          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+      compute_encoder.set_bytes(kv_seq_stride, 15);
+      compute_encoder.set_bytes(q_seq_stride, 16);
+      compute_encoder.set_bytes(head_stride, 17);
+    }
+    if (has_sinks) {
+      compute_encoder.set_input_array(*sinks, 18);
+    }
+
+    // Launch
+    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+  }
+
+  // Final pass
+  kname.clear();
+  kname = "sdpa_vector_2pass_2_";
+  kname += get_type_string(q.dtype());
+  kname += "_";
+  kname += std::to_string(v.shape(-1));
+
+  // Get the kernel
+  auto kernel = d.get_kernel(kname);
+  compute_encoder.set_compute_pipeline_state(kernel);
+
+  // Set its arguments
+  compute_encoder.set_input_array(intermediate, 0);
+  compute_encoder.set_input_array(sums, 1);
+  compute_encoder.set_input_array(maxs, 2);
+  compute_encoder.set_output_array(out, 3);
+  compute_encoder.set_bytes(blocks, 4);
+
+  // Launch
+  group_dims = MTL::Size(1024, 1, 1);
+  grid_dims = MTL::Size(q.shape(0) * q.shape(1), q.shape(2), 1);
+  check_kernel_threadgroup_size(kernel, group_dims, kname);
+  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+std::tuple<bool, std::string> has_fused_kernel(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal,
+    bool output_logsumexp,
+    int window_size,
+    Stream s) {
+  if (s.device != Device::gpu) {
+    return {false, "the fused kernels require a GPU (Metal) stream."};
+  }
+  if (output_logsumexp) {
+    return {
+        false,
+        "the fused forward does not produce the logsumexp required for "
+        "the fused VJP; use default routing when training."};
+  }
+
+  const int value_head_dim = v.shape(-1);
+  const int query_head_dim = q.shape(-1);
+  const int query_sequence_length = q.shape(2);
+  const int key_sequence_length = k.shape(2);
+  const int num_query_heads = q.shape(1);
+  const int num_kv_heads = k.shape(1);
+  const int gqa_factor = num_query_heads / num_kv_heads;
+
+  std::ostringstream msg;
+  if (query_sequence_length > 8) {
+    const bool use_nax = use_nax_full_attention(q, v);
+    const bool supported_head_dim = use_nax ||
+        (query_head_dim == value_head_dim &&
+         (query_head_dim == 64 || query_head_dim == 72 ||
+          query_head_dim == 80 || query_head_dim == 96 ||
+          query_head_dim == 128 || query_head_dim == 192 ||
+          query_head_dim == 256));
+    if (!supported_head_dim) {
+      msg << "the full attention kernel supports head dims "
+          << "{64, 72, 80, 96, 128, 192, 256} with matching query/value head "
+          << "dims, or query head dim 192 with value head dim 128 on NAX; got "
+          << "query head dim " << query_head_dim << " and value head dim "
+          << value_head_dim << ".";
+      return {false, msg.str()};
+    }
+    if (window_size > 0 && !use_nax) {
+      msg << "the full attention kernel supports a sliding window only on "
+          << "NAX devices with head dims {64, 96, 128, 256} or 192/128.";
+      return {false, msg.str()};
+    }
+    if (has_mask && !has_arr_mask &&
+        !(query_sequence_length <= key_sequence_length && do_causal)) {
+      msg << "the full attention kernel with a causal mask requires the "
+          << "query sequence to be no longer than the key sequence; got "
+          << "query length " << query_sequence_length << " and key length "
+          << key_sequence_length << ".";
+      return {false, msg.str()};
+    }
+  } else {
+    if (window_size > 0 &&
+        key_sequence_length - query_sequence_length + 1 > window_size) {
+      msg << "the vector attention kernel does not support a sliding window "
+          << "shorter than the keys; got window " << window_size
+          << " and key length " << key_sequence_length << ".";
+      return {false, msg.str()};
+    }
+    const bool supported_head_dim =
+        (query_head_dim == value_head_dim &&
+         (query_head_dim == 64 || query_head_dim == 96 ||
+          query_head_dim == 128 || query_head_dim == 192 ||
+          query_head_dim == 256 || query_head_dim == 512)) ||
+        (query_head_dim == 192 && value_head_dim == 128);
+    if (!supported_head_dim) {
+      msg << "the vector attention kernel supports head dims "
+          << "{64, 96, 128, 192, 256, 512} with matching query/value head "
+          << "dims, or query head dim 192 with value head dim 128; got "
+          << "query head dim " << query_head_dim << " and value head dim "
+          << value_head_dim << ".";
+      return {false, msg.str()};
+    }
+    if (query_sequence_length > key_sequence_length) {
+      msg << "the vector attention kernel requires the query sequence to be "
+          << "no longer than the key sequence; got query length "
+          << query_sequence_length << " and key length " << key_sequence_length
+          << ".";
+      return {false, msg.str()};
+    }
+    if (query_sequence_length * gqa_factor > 32 &&
+        !use_nax_decode(q, k, v, has_arr_mask)) {
+      msg << "the vector attention kernel requires the query length times "
+          << "the GQA factor to be at most 32; got query length "
+          << query_sequence_length << " and GQA factor " << gqa_factor << ".";
+      return {false, msg.str()};
+    }
+    // Head dim 512 uses the generic vector kernel, reading K/V is its main
+    // cost. By default, use it only for one query, GQA factor 8, and no array
+    // mask.
+    if (query_head_dim == 512) {
+      int min_key_sequence_length = env::get_var("MLX_SDPA_D512_MIN_KL", 1024);
+      bool always = (min_key_sequence_length == 0);
+      if (!always && query_sequence_length != 1) {
+        msg << "the vector attention kernel for head dim 512 defaults to "
+               "single-token queries; got query length "
+            << query_sequence_length << ".";
+        return {false, msg.str()};
+      }
+      if (!always && gqa_factor != 8) {
+        msg << "the vector attention kernel for head dim 512 defaults to "
+               "GQA factor 8; got GQA factor "
+            << gqa_factor << ".";
+        return {false, msg.str()};
+      }
+      if (!always && has_arr_mask) {
+        msg << "the vector attention kernel for head dim 512 defaults to "
+               "calls without array masks.";
+        return {false, msg.str()};
+      }
+      if (key_sequence_length < min_key_sequence_length) {
+        msg << "the vector attention kernel for head dim 512 requires at "
+            << "least " << min_key_sequence_length << " keys; got key length "
+            << key_sequence_length << ".";
+        return {false, msg.str()};
+      }
+    }
+  }
+  return {true, ""};
+}
+
+} // namespace
+
+bool ScaledDotProductAttention::use_fallback(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal,
+    bool is_training,
+    bool output_logsumexp,
+    bool force_fused,
+    int window_size,
+    Stream s) {
+  auto [has_fused, reason] = has_fused_kernel(
+      q,
+      k,
+      v,
+      has_mask,
+      has_arr_mask,
+      do_causal,
+      output_logsumexp,
+      window_size,
+      s);
+  if (force_fused) {
+    if (!has_fused) {
+      std::ostringstream msg;
+      msg << "[scaled_dot_product_attention] force_fused=True but no fused "
+             "kernel is available: "
+          << reason;
+      throw std::invalid_argument(msg.str());
+    }
+    return false;
+  }
+
+  if (is_training) {
+    // It's faster for training on Metal to use the unfused SDPA for both
+    // forward and backward.
+    return true;
+  }
+  if (!has_fused) {
+    return true;
+  }
+
+  const int query_sequence_length = q.shape(2);
+  const int query_head_dim = q.shape(-1);
+  const int value_head_dim = v.shape(-1);
+
+  // Use headdim-split kernel when NAX is enabled and there are enough query
+  // blocks to fill the machine.
+  if (metal::is_nax_available() &&
+      (env::enable_tf32() || q.dtype() != float32) &&
+      query_sequence_length >= 1024 && query_head_dim == 256 &&
+      (do_causal || has_arr_mask)) {
+    return false;
+  }
+
+  // Unfused path is faster for following shapes.
+  if (query_sequence_length > 8) {
+    if (query_head_dim == 192 && value_head_dim == 128) {
+      return false;
+    }
+    return query_head_dim == 192 || query_head_dim == 256;
+  } else {
+    return query_head_dim == value_head_dim && query_head_dim == 192;
+  }
+}
+
+bool ScaledDotProductAttention::supports_bool_mask() {
+  return true;
+}
+
+void ScaledDotProductAttention::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  auto& s = stream();
+  auto& d = metal::device(s.device);
+
+  auto& q_pre = inputs[0];
+  auto& k_pre = inputs[1];
+  auto& v_pre = inputs[2];
+  auto& o = outputs[0];
+
+  std::vector<array> copies;
+
+  // Define some copy functions to ensure the layout of the inputs is as
+  // expected.
+  copies.reserve(inputs.size());
+  auto copy_unless = [&copies, &s](
+                         auto predicate, const array& arr) -> const array& {
+    if (!predicate(arr)) {
+      array arr_copy = contiguous_copy_gpu(arr, s);
+      copies.push_back(std::move(arr_copy));
+      return copies.back();
+    } else {
+      return arr;
+    }
+  };
+
+  // Checks that the headdim dimension has stride 1.
+  auto is_matrix_contiguous = [](const array& arr) {
+    return arr.strides(-1) == 1;
+  };
+
+  std::optional<array> sinks = std::nullopt;
+  if (has_sinks_) {
+    sinks = copy_unless(is_matrix_contiguous, inputs.back());
+  }
+  bool has_arr_mask = inputs.size() > (3 + has_sinks_);
+
+  // We are in vector mode ie single query
+  if (q_pre.shape(2) <= 8) {
+    auto q_copy_unless = [](const array& arr) {
+      if (arr.flags().row_contiguous) {
+        return true;
+      }
+      auto& strides = arr.strides();
+      auto& shape = arr.shape();
+      if (shape[0] == 1 || shape[1] == 1) {
+        // If either the batch or head dimension is a singleton, the other can
+        // be transposed with the sequence dimension
+        auto bidx = shape[0] == 1 ? 1 : 0;
+        return (strides[3] == 1) && (strides[2] == shape[3] * shape[bidx]) &&
+            (strides[bidx] == shape[3]);
+      }
+      return false;
+    };
+
+    auto kv_copy_unless = [](const array& arr) {
+      // keys and values should be copied if:
+      // - the last dimension is not contiguous
+      // - the batch and head dim are not contiguous
+      auto& strides = arr.strides();
+      auto& shape = arr.shape();
+      if (strides.back() != 1) {
+        return false;
+      }
+      if (shape[0] == 1 || shape[1] == 1) {
+        return true;
+      }
+      return (strides[0] == strides[1] * shape[1]);
+    };
+
+    bool q_copied = !q_copy_unless(q_pre);
+    array q = (q_copied) ? contiguous_copy_gpu(q_pre, s) : q_pre;
+    const auto& k = copy_unless(kv_copy_unless, k_pre);
+    const auto& v = copy_unless(kv_copy_unless, v_pre);
+
+    // Donate the query if possible
+    if (q.is_donatable() && q.flags().row_contiguous && q.size() == o.size()) {
+      o.copy_shared_buffer(q);
+    } else {
+      if (q_copied) {
+        copies.push_back(q);
+      }
+      o.set_data(allocator::malloc(o.nbytes()));
+    }
+
+    auto mask_copy_unless = [&q](const array& arr) {
+      auto& strides = arr.strides();
+      auto& shape = arr.shape();
+      return arr.flags().row_contiguous || q.shape(0) == 1 || q.shape(1) == 1 ||
+          (strides[0] == strides[1] * shape[1]);
+    };
+
+    // The NAX decode kernel reads a head-broadcast mask as it is.
+    const bool nax_decode = use_nax_decode(
+        q,
+        k,
+        v,
+        has_arr_mask ? std::optional<array>{inputs[3]} : std::nullopt);
+    auto mask = has_arr_mask
+        ? std::optional<array>{nax_decode
+                                   ? inputs[3]
+                                   : copy_unless(mask_copy_unless, inputs[3])}
+        : std::nullopt;
+
+    // We route to the 2 pass fused attention if
+    // - The device is large and the sequence length long
+    // - The sequence length is even longer and we have gqa
+    bool do_causal = do_causal_ && q.shape(2) > 1;
+    char devc = d.get_architecture().back();
+    if (((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
+        (k.shape(1) < q.shape(1) && k.shape(2) >= 4096) || nax_decode) {
+      sdpa_vector_2pass(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
+    } else {
+      sdpa_vector(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
+    }
+  }
+
+  // Full attention mode
+  else {
+    const auto& q = copy_unless(is_matrix_contiguous, q_pre);
+    const auto& k = copy_unless(is_matrix_contiguous, k_pre);
+    const auto& v = copy_unless(is_matrix_contiguous, v_pre);
+
+    int64_t str_oD = 1;
+    int64_t str_oH = o.shape(3);
+    int64_t str_oL = o.shape(1) * str_oH;
+    int64_t str_oB = o.shape(2) * str_oL;
+    size_t data_size = o.shape(0) * str_oB;
+
+    array::Flags flags{
+        /* bool contiguous = */ 1,
+        /* bool row_contiguous = */ 0,
+        /* bool col_contiguous = */ 0,
+    };
+
+    o.set_data(
+        allocator::malloc(o.nbytes()),
+        data_size,
+        {str_oB, str_oH, str_oL, str_oD},
+        flags);
+
+    auto mask = has_arr_mask
+        ? std::optional<array>{copy_unless(is_matrix_contiguous, inputs[3])}
+        : std::nullopt;
+
+    sdpa_full_self_attention_metal(
+        s, d, q, k, v, scale_, o, do_causal_, mask, sinks, window_size_);
+  }
+
+  metal::get_command_encoder(s).add_temporaries(std::move(copies));
+}
+
+bool ScaledDotProductAttentionVJP::use_fallback(const array& q, Stream s) {
+  return true;
+}
+
+void ScaledDotProductAttentionVJP::eval_gpu(
+    const std::vector<array>& inputs,
+    std::vector<array>& outputs) {
+  throw std::runtime_error("NYI");
+}
+
+} // namespace mlx::core::fast

@@ -1,0 +1,2 @@
+upstream: https://github.com/ml-explore/mlx-lm + PR #1219 (kernelpool/add-mimo-v2 @ e6552fdeae02cfeafcccec915d5a4f54dd13f082)
+head: 605c5fe9ce09b1129f0541a0458d58b1e3e614d5

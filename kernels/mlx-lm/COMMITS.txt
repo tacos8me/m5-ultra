@@ -1,0 +1,22 @@
+1ba6029 fix: roll back rejected draft tokens in wrapped rotating caches
+3be1273 feat: MTP draft model for MiMo-V2
+4357824 feat(server): batch concurrent requests when a draft model is loaded
+e4acf8c perf(mimo_v2): run verify-size causal attention one query at a time
+71724c4 feat: use fused sliding-window SDPA for MiMo-V2 prefill
+2ab79b9 fix(server): use the draft model when a request finds an idle batch
+48ac803 fix(mimo_v2): align a new MTP cache with a reused model cache
+eb3c231 feat: fused router top-k and MXFP4 MoE decode kernels for MiMo-V2
+d4f5c55 feat: fuse MoE unsort and weighted combine for MiMo-V2 prefill
+a90eaa4 fix(server): raise HTTP listen backlog so concurrent bursts are not reset
+d8f7583 perf(mimo_v2): use fused multi-query SDPA for speculative verify
+b3c5ea2 feat(generate): speculative sampling for temp > 0
+785299a perf(server): read the token logprob only when the client asks for it
+dea1ac8 perf(mimo_v2): grouped MXFP4 MoE decode kernels for 2-40 tokens
+07ed6ca perf(mimo_v2): dequantize attention projections for long prefill chunks
+4169ae4 perf(switch_layers): gather MoE input rows in the gate/up matmul kernel
+e6ae861 perf(mimo_v2): run the passes of busy experts in parallel, 4 tokens each
+9880037 perf(mimo_v2): grouped MoE decode up to 48 tokens
+54608f2 perf(mimo_v2): catch the MTP draft up on the attention window only
+05b2d0b fix(server): never reuse a draft cache from the prompt cache
+261970b perf(cache): grow KV buffers geometrically instead of by 256 tokens
+0521591 perf(server): move a drafting request into the batch when others arrive

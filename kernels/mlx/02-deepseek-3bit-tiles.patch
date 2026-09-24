@@ -1,0 +1,250 @@
+diff --git a/mlx/backend/metal/kernels/quantized_nax.h b/mlx/backend/metal/kernels/quantized_nax.h
+index 54a3748..6c58c1b 100644
+--- a/mlx/backend/metal/kernels/quantized_nax.h
++++ b/mlx/backend/metal/kernels/quantized_nax.h
+@@ -9,6 +9,8 @@ using namespace mlx::steel;
+ constant bool align_M [[function_constant(200)]];
+ constant bool align_N [[function_constant(201)]];
+ constant bool align_K [[function_constant(202)]];
++constant bool use_tiles [[function_constant(203)]];
++constant bool gather_x [[function_constant(204)]];
+ 
+ using namespace metal;
+ 
+@@ -1453,7 +1455,7 @@ template <
+ template <
+     typename T,
+     int group_size,
+-    int bits,
++    const int bits,
+     int BM,
+     int BN,
+     int BK,
+@@ -1461,18 +1463,25 @@ template <
+     int WN,
+     bool transpose>
+ [[kernel]] void affine_gather_qmm_rhs_nax(
+-    const device T* x [[buffer(0)]],
+-    const device uint32_t* w [[buffer(1)]],
+-    const device T* scales [[buffer(2)]],
+-    const device T* biases [[buffer(3)]],
+-    const device uint32_t* indices [[buffer(4)]],
+-    device T* y [[buffer(5)]],
+-    const constant int& M [[buffer(6)]],
+-    const constant int& N [[buffer(7)]],
+-    const constant int& K [[buffer(8)]],
++    const device T* x,
++    const device uint32_t* w,
++    const device T* scales,
++    const device T* biases,
++    const device uint32_t* indices,
++    device T* y,
++    const constant int& M,
++    const constant int& N,
++    const constant int& K,
++    const device int2* tiles [[buffer(9), function_constant(use_tiles)]],
++    const device uint32_t* x_rows [[buffer(10), function_constant(gather_x)]],
+     uint3 tid [[threadgroup_position_in_grid]],
+     uint simd_group_id [[simdgroup_index_in_threadgroup]],
+     uint simd_lane_id [[thread_index_in_simdgroup]]) {
++  // With tiles, each threadgroup owns rows [x, y) of one expert.
++  int2 tile = use_tiles ? tiles[tid.y] : int2(tid.y * BM, M);
++  if (use_tiles && tile.x >= tile.y) {
++    return;
++  }
+   constexpr int pack_factor = get_pack_factor<bits, 8>();
+   constexpr int bytes_per_pack = get_bytes_per_pack<bits>();
+   constexpr int BK_padded = (BK + 16 / sizeof(T));
+@@ -1498,13 +1507,14 @@ template <
+   const int K_it = K / BK;
+   const size_t stride_w = transpose ? N * K_w : K * N_w;
+   const size_t stride_s = transpose ? N * K_g : K * N_g;
+-  const int y_row = tid.y * BM;
++  const int y_row = tile.x;
++  const int m_end = tile.y;
+   const int y_col = tid.x * BN;
+   const size_t y_row_long = size_t(y_row);
+   const size_t y_col_long = size_t(y_col);
+ 
+   // Prepare threadgroup bounds
+-  const short tgp_bm = align_M ? BM : short(min(BM, M - y_row));
++  const short tgp_bm = align_M ? BM : short(min(BM, m_end - y_row));
+   const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
+ 
+   // Calculate the final tiles in the case that K is not aligned
+@@ -1512,9 +1522,12 @@ template <
+   const short2 tile_w =
+       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
+ 
+-  // Move x and output to the correct block
++  // Move x and output to the correct block. With gather_x, row r of the
++  // product reads row x_rows[r] of x.
+   auto wl = (const device uint8_t*)w;
+-  x += y_row_long * K;
++  if (!gather_x) {
++    x += y_row_long * K;
++  }
+   y += y_row_long * N + y_col_long;
+   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
+   scales += transpose ? y_col_long * K_g : y_col / group_size;
+@@ -1531,9 +1544,9 @@ template <
+   const short tm = SM * (simd_group_id / WN);
+   const short tn = SN * (simd_group_id % WN);
+ 
+-  const short sgp_sm = align_M ? SM : min(int(SM), max(0, M - (y_row + tm)));
+-  const short sgp_sn =
+-      align_N ? SN : min(SN, short(max(0, (N - (y_col + tn)))));
++  const short sgp_sm =
++      align_M ? SM : min(int(SM), max(0, (m_end - (y_row + tm))));
++  const short sgp_sn = align_N ? SN : min(int(SN), max(0, (N - (y_col + tn))));
+ 
+   const bool is_unaligned_sm = align_M ? false : (sgp_sm != SM);
+   const bool is_unaligned_bn = align_N ? false : (tgp_bn != BN);
+@@ -1563,6 +1576,7 @@ template <
+     }
+     threadgroup_barrier(mem_flags::mem_none);
+ 
++    // Prepare threadgroup mma operation
+     const short m_lo_lim = min(int(sgp_sm), max(0, offset - tm));
+     const short m_hi_lim = min(int(sgp_sm), max(0, offset_next - tm));
+     const bool sg_active = m_hi_lim > m_lo_lim;
+@@ -1572,6 +1586,21 @@ template <
+ 
+     const device T* xn = x + tm * K;
+ 
++    // With gather_x, the two rows of each A fragment that this thread loads.
++    // Rows past the tile repeat its last row; their results are not stored.
++    const device T* xr[TM][2];
++    if (gather_x) {
++      const short2 sc = BaseNAXFrag::get_coord();
++      STEEL_PRAGMA_UNROLL
++      for (short i = 0; i < TM; i++) {
++        STEEL_PRAGMA_UNROLL
++        for (short r = 0; r < 2; r++) {
++          const int row = min(y_row + tm + i * 16 + sc.y + r * 8, m_end - 1);
++          xr[i][r] = x + size_t(x_rows[row]) * K + sc.x;
++        }
++      }
++    }
++
+     // Prepare threadgroup loading operations
+     thread loader_w_t loader_w(
+         wl + index * stride_w,
+@@ -1603,16 +1632,33 @@ template <
+ 
+               volatile int compiler_barrier;
+ 
+-              if constexpr (kAlignedM.value) {
++              if (gather_x) {
++                STEEL_PRAGMA_UNROLL
++                for (short i = 0; i < TM; i++) {
++                  STEEL_PRAGMA_UNROLL
++                  for (short tk = 0; tk < TK; tk++) {
++                    thread auto& fr = Atile.frag_at(i, tk);
++                    STEEL_PRAGMA_UNROLL
++                    for (short r = 0; r < 2; r++) {
++                      STEEL_PRAGMA_UNROLL
++                      for (short j = 0; j < 4; j++) {
++                        fr[r * 4 + j] = xr[i][r][kk1 + tk * 16 + j];
++                      }
++                    }
++                  }
++                }
++              } else if constexpr (kAlignedM.value) {
+                 Atile.load(xn + kk1, K);
+               } else {
+                 Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+               }
+ 
+               if constexpr (transpose) {
+-                Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
++                Btile.template load<T, BK_padded, 1>(
++                    Ws + tn * BK_padded + kk1);
+               } else {
+-                Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
++                Btile.template load<T, BN_padded, 1>(
++                    Ws + tn + kk1 * BN_padded);
+               }
+ 
+               tile_matmad_nax(
+@@ -1627,6 +1673,13 @@ template <
+           }
+ 
+           xn += BK;
++          if (gather_x) {
++            STEEL_PRAGMA_UNROLL
++            for (short i = 0; i < TM; i++) {
++              xr[i][0] += BK;
++              xr[i][1] += BK;
++            }
++          }
+           loader_w.next();
+         }
+ 
+@@ -1647,9 +1700,11 @@ template <
+               Atile.load_safe(xn + kk1, K, short2(psk, sgp_sm));
+ 
+               if constexpr (transpose) {
+-                Btile.template load<T, BK_padded, 1>(Ws + tn * BK_padded + kk1);
++                Btile.template load<T, BK_padded, 1>(
++                    Ws + tn * BK_padded + kk1);
+               } else {
+-                Btile.template load<T, BN_padded, 1>(Ws + tn + kk1 * BN_padded);
++                Btile.template load<T, BN_padded, 1>(
++                    Ws + tn + kk1 * BN_padded);
+               }
+ 
+               tile_matmad_nax(
+@@ -1685,3 +1740,7 @@ template <
+     });
+   }
+ }
++
++// Split sorted expert indices into row tiles of at most BM rows that never
++// cross an expert boundary. Writes (row_start, row_end) per tile and empty
++// tiles up to max_tiles. Run with one threadgroup.
+\ No newline at end of file
+diff --git a/mlx/backend/metal/kernels/quantized_nax.metal b/mlx/backend/metal/kernels/quantized_nax.metal
+index 9557fd8..99f1107 100644
+--- a/mlx/backend/metal/kernels/quantized_nax.metal
++++ b/mlx/backend/metal/kernels/quantized_nax.metal
+@@ -110,3 +110,15 @@
+   instantiate_quantized_groups(8)
+ 
+ instantiate_quantized_all() // clang-format on
++
++// Expert-aligned affine2 tiles on M5.
++instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, float16_t, 128, 2, 64, 64, 64, 4, 1, true)
++instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, float16_t, 128, 2, 64, 64, 128, 4, 1, true)
++instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, bfloat16_t, 128, 2, 64, 64, 64, 4, 1, true)
++instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, bfloat16_t, 128, 2, 64, 64, 128, 4, 1, true)
++
++// DS41 affine3/group128 expert-aligned and gathered-row tiles.
++instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, float16_t, 128, 3, 64, 64, 64, 4, 1, true)
++instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, float16_t, 128, 3, 64, 64, 128, 4, 1, true)
++instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, bfloat16_t, 128, 3, 64, 64, 64, 4, 1, true)
++instantiate_gather_qmm_rhs(affine_gather_qmm_rhs_nax, affine_gather_qmm_rhs_nax_nt, bfloat16_t, 128, 3, 64, 64, 128, 4, 1, true)
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index e68670d..3855cb6 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1572,7 +1572,8 @@ void gather_qmm_rhs_nax(
+   // only, so no weight tile is dequantized for a partial expert segment. Four
+   // simdgroups of 16 rows keep the partial last tile of an expert cheap.
+   // A K block of 128 halves the threadgroup barriers per K.
+-  const bool use_tiles = transpose && mode != "affine";
++  const bool use_tiles = transpose &&
++      (mode != "affine" || ((bits == 2 || bits == 3) && group_size == 128));
+   if (use_tiles) {
+     bm = 64;
+     bk = (K % 128 == 0) ? 128 : 64;
+@@ -2041,7 +2042,8 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+   // The expert-aligned NAX kernel reads the x rows directly.
+   if (left_sorted_ && right_sorted_) {
+     if (M == 1 && B >= 16 && B / E >= min_rows_per_expert && transpose_ &&
+-        metal::is_nax_available() && mode_ != QuantizationMode::Affine &&
++        metal::is_nax_available() &&
++        (mode_ != QuantizationMode::Affine || ((bits_ == 2 || bits_ == 3) && group_size_ == 128)) &&
+         K % 64 == 0 && x.dtype() != float32) {
+       gather_qmm_rhs_nax(
+           x,

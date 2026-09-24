@@ -1,0 +1,2433 @@
+diff --git a/mlx/backend/cuda/scaled_dot_product_attention.cpp b/mlx/backend/cuda/scaled_dot_product_attention.cpp
+index 286d500..2d8d26a 100644
+--- a/mlx/backend/cuda/scaled_dot_product_attention.cpp
++++ b/mlx/backend/cuda/scaled_dot_product_attention.cpp
+@@ -586,9 +586,14 @@ bool ScaledDotProductAttention::use_fallback(
+     bool is_training,
+     bool output_logsumexp,
+     bool force_fused,
++    int window_size,
+     Stream s) {
+   auto [has_fused, reason] =
+       has_fused_kernel(q, k, v, has_arr_mask, do_causal, output_logsumexp, s);
++  if (window_size > 0) {
++    has_fused = false;
++    reason = "the fused kernels do not support a sliding window.";
++  }
+   if (force_fused) {
+     if (!has_fused) {
+       std::ostringstream msg;
+diff --git a/mlx/backend/metal/jit_kernels.cpp b/mlx/backend/metal/jit_kernels.cpp
+index 1c052e6..3c9fda1 100644
+--- a/mlx/backend/metal/jit_kernels.cpp
++++ b/mlx/backend/metal/jit_kernels.cpp
+@@ -1363,11 +1363,71 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
+     int bq,
+     int bk,
+     int bd,
++    int bdv,
+     int wm,
+     int wn,
+     const array& m,
+     bool split_d) {
+   const auto& lib_name = kernel_name;
++  auto lib = d.get_library(lib_name, [&]() {
++    auto tdef = split_d ? get_template_definition(
++                              lib_name,
++                              "attention_nax_dsplit",
++                              get_type_string(q.dtype()),
++                              bq,
++                              bk,
++                              bd,
++                              wm,
++                              wn,
++                              get_type_string(m.dtype()))
++                        : get_template_definition(
++                              lib_name,
++                              "attention_nax",
++                              get_type_string(q.dtype()),
++                              bq,
++                              bk,
++                              bd,
++                              wm,
++                              wn,
++                              get_type_string(m.dtype()),
++                              "float",
++                              bdv);
++    std::string kernel_source;
++    concatenate(
++        kernel_source, metal::utils(), metal::steel_attention_nax(), tdef);
++    return kernel_source;
++  });
++  return d.get_kernel(kernel_name, lib, hash_name, func_consts);
++}
++
++MTL::ComputePipelineState* get_gather_rhs_tiles_kernel(
++    metal::Device& d,
++    const std::string& kernel_name,
++    int bm) {
++  auto lib = d.get_library(kernel_name, [&]() {
++    std::string kernel_source;
++    concatenate(
++        kernel_source,
++        metal::utils(),
++        metal::gemm_nax(),
++        metal::quantized_utils(),
++        metal::fp_quantized_nax(),
++        get_template_definition(kernel_name, "gather_rhs_tiles", bm));
++    return kernel_source;
++  });
++  return d.get_kernel(kernel_name, lib);
++}
++
++MTL::ComputePipelineState* get_steel_attention_nax_decode_kernel(
++    metal::Device& d,
++    const std::string& kernel_name,
++    const std::string& hash_name,
++    const metal::MTLFCList& func_consts,
++    const array& q,
++    int bk,
++    int bd,
++    int bdv) {
++  const auto& lib_name = kernel_name;
+   auto lib = d.get_library(lib_name, [&]() {
+     std::string kernel_source;
+     concatenate(
+@@ -1376,14 +1436,12 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
+         metal::steel_attention_nax(),
+         get_template_definition(
+             lib_name,
+-            split_d ? "attention_nax_dsplit" : "attention_nax",
++            "attention_nax_decode",
+             get_type_string(q.dtype()),
+-            bq,
+             bk,
+             bd,
+-            wm,
+-            wn,
+-            get_type_string(m.dtype())));
++            bdv,
++            "float"));
+     return kernel_source;
+   });
+   return d.get_kernel(kernel_name, lib, hash_name, func_consts);
+diff --git a/mlx/backend/metal/kernels.h b/mlx/backend/metal/kernels.h
+index 28ac3ba..5864b2d 100644
+--- a/mlx/backend/metal/kernels.h
++++ b/mlx/backend/metal/kernels.h
+@@ -426,11 +426,27 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
+     int bq,
+     int bk,
+     int bd,
++    int bdv,
+     int wm,
+     int wn,
+     const array& m,
+     bool split_d);
+ 
++MTL::ComputePipelineState* get_gather_rhs_tiles_kernel(
++    metal::Device& d,
++    const std::string& kernel_name,
++    int bm);
++
++MTL::ComputePipelineState* get_steel_attention_nax_decode_kernel(
++    metal::Device& d,
++    const std::string& kernel_name,
++    const std::string& hash_name,
++    const metal::MTLFCList& func_consts,
++    const array& q,
++    int bk,
++    int bd,
++    int bdv);
++
+ MTL::ComputePipelineState* get_gated_delta_kernel(
+     metal::Device& d,
+     const std::string& kernel_name,
+diff --git a/mlx/backend/metal/kernels/fp_quantized_nax.h b/mlx/backend/metal/kernels/fp_quantized_nax.h
+index b934d91..9f41510 100644
+--- a/mlx/backend/metal/kernels/fp_quantized_nax.h
++++ b/mlx/backend/metal/kernels/fp_quantized_nax.h
+@@ -9,6 +9,8 @@
+ constant bool align_M [[function_constant(200)]];
+ constant bool align_N [[function_constant(201)]];
+ constant bool align_K [[function_constant(202)]];
++constant bool use_tiles [[function_constant(203)]];
++constant bool gather_x [[function_constant(204)]];
+ 
+ using namespace metal;
+ 
+@@ -141,6 +143,33 @@ struct QuantizedBlockLoader {
+       return;
+     }
+ 
++    if constexpr (
++        bits == 4 && reduction_dim == 1 && !has_global_scale &&
++        n_reads_per_scale % 4 == 0) {
++      // 8 values per 32-bit word. A nibble n maps to the half with bits
++      // ((n & 7) << 9) | ((n & 8) << 12), which is its e2m1 value * 2^-14.
++      int k = 0;
++      for (int i = 0; i < n_steps_per_read; i++) {
++        float scale =
++            float(dequantize_scale<T, group_size>(scales[i])) * 16384.0f;
++        for (int j = 0; j < n_reads_per_scale; j += 4) {
++          uint32_t u = *(const device uint32_t*)(src + k);
++          metal::vec<T, 8> v;
++          STEEL_PRAGMA_UNROLL
++          for (int p = 0; p < 4; p++) {
++            uint32_t t = (u >> (4 * p)) & 0x000F000Fu;
++            uint32_t hb = ((t & 0x00070007u) << 9) | ((t & 0x00080008u) << 12);
++            float2 f = float2(as_type<half2>(hb)) * scale;
++            v[p] = static_cast<T>(f.x);
++            v[p + 4] = static_cast<T>(f.y);
++          }
++          *(threadgroup metal::vec<T, 8>*)(dst + k * pack_factor) = v;
++          k += 4;
++        }
++      }
++      return;
++    }
++
+     int k = 0;
+     for (int i = 0; i < n_steps_per_read; i++) {
+       float scale =
+@@ -851,9 +880,16 @@ template <
+     const constant int& M,
+     const constant int& N,
+     const constant int& K,
++    const device int2* tiles [[buffer(9), function_constant(use_tiles)]],
++    const device uint32_t* x_rows [[buffer(10), function_constant(gather_x)]],
+     uint3 tid [[threadgroup_position_in_grid]],
+     uint simd_group_id [[simdgroup_index_in_threadgroup]],
+     uint simd_lane_id [[thread_index_in_simdgroup]]) {
++  // With tiles, each threadgroup owns rows [x, y) of one expert.
++  int2 tile = use_tiles ? tiles[tid.y] : int2(tid.y * BM, M);
++  if (use_tiles && tile.x >= tile.y) {
++    return;
++  }
+   constexpr int pack_factor = get_pack_factor<8, bits>();
+   constexpr int bytes_per_pack = get_bytes_per_pack();
+   constexpr int BK_padded = (BK + 16 / sizeof(Wtype));
+@@ -880,13 +916,14 @@ template <
+   const int K_it = K / BK;
+   const size_t stride_w = transpose ? N * K_w : K * N_w;
+   const size_t stride_s = transpose ? N * K_g : K * N_g;
+-  const int y_row = tid.y * BM;
++  const int y_row = tile.x;
++  const int m_end = tile.y;
+   const int y_col = tid.x * BN;
+   const size_t y_row_long = size_t(y_row);
+   const size_t y_col_long = size_t(y_col);
+ 
+   // Prepare threadgroup bounds
+-  const short tgp_bm = align_M ? BM : short(min(BM, M - y_row));
++  const short tgp_bm = align_M ? BM : short(min(BM, m_end - y_row));
+   const short tgp_bn = align_N ? BN : short(min(BN, N - y_col));
+ 
+   // Calculate the final tiles in the case that K is not aligned
+@@ -894,9 +931,12 @@ template <
+   const short2 tile_w =
+       transpose ? short2(k_remain, tgp_bn) : short2(tgp_bn, k_remain);
+ 
+-  // Move x and output to the correct block
++  // Move x and output to the correct block. With gather_x, row r of the
++  // product reads row x_rows[r] of x.
+   auto wl = (const device uint8_t*)w;
+-  x += y_row_long * K;
++  if (!gather_x) {
++    x += y_row_long * K;
++  }
+   y += y_row_long * N + y_col_long;
+   wl += transpose ? y_col_long * K_w : y_col * bytes_per_pack / pack_factor;
+   scales += transpose ? y_col_long * K_g : y_col / group_size;
+@@ -912,7 +952,8 @@ template <
+   const short tm = SM * (simd_group_id / WN);
+   const short tn = SN * (simd_group_id % WN);
+ 
+-  const short sgp_sm = align_M ? SM : min(int(SM), max(0, (M - (y_row + tm))));
++  const short sgp_sm =
++      align_M ? SM : min(int(SM), max(0, (m_end - (y_row + tm))));
+   const short sgp_sn = align_N ? SN : min(int(SN), max(0, (N - (y_col + tn))));
+ 
+   const bool is_unaligned_sm = align_M ? false : (sgp_sm != SM);
+@@ -953,6 +994,21 @@ template <
+ 
+     const device T* xn = x + tm * K;
+ 
++    // With gather_x, the two rows of each A fragment that this thread loads.
++    // Rows past the tile repeat its last row; their results are not stored.
++    const device T* xr[TM][2];
++    if (gather_x) {
++      const short2 sc = BaseNAXFrag::get_coord();
++      STEEL_PRAGMA_UNROLL
++      for (short i = 0; i < TM; i++) {
++        STEEL_PRAGMA_UNROLL
++        for (short r = 0; r < 2; r++) {
++          const int row = min(y_row + tm + i * 16 + sc.y + r * 8, m_end - 1);
++          xr[i][r] = x + size_t(x_rows[row]) * K + sc.x;
++        }
++      }
++    }
++
+     // Prepare threadgroup loading operations
+     thread loader_w_t loader_w(
+         wl + index * stride_w,
+@@ -984,7 +1040,22 @@ template <
+ 
+               volatile int compiler_barrier;
+ 
+-              if constexpr (kAlignedM.value) {
++              if (gather_x) {
++                STEEL_PRAGMA_UNROLL
++                for (short i = 0; i < TM; i++) {
++                  STEEL_PRAGMA_UNROLL
++                  for (short tk = 0; tk < TK; tk++) {
++                    thread auto& fr = Atile.frag_at(i, tk);
++                    STEEL_PRAGMA_UNROLL
++                    for (short r = 0; r < 2; r++) {
++                      STEEL_PRAGMA_UNROLL
++                      for (short j = 0; j < 4; j++) {
++                        fr[r * 4 + j] = xr[i][r][kk1 + tk * 16 + j];
++                      }
++                    }
++                  }
++                }
++              } else if constexpr (kAlignedM.value) {
+                 Atile.load(xn + kk1, K);
+               } else {
+                 Atile.load_safe(xn + kk1, K, short2(SK, sgp_sm));
+@@ -1010,6 +1081,13 @@ template <
+           }
+ 
+           xn += BK;
++          if (gather_x) {
++            STEEL_PRAGMA_UNROLL
++            for (short i = 0; i < TM; i++) {
++              xr[i][0] += BK;
++              xr[i][1] += BK;
++            }
++          }
+           loader_w.next();
+         }
+ 
+@@ -1070,3 +1148,72 @@ template <
+     });
+   }
+ }
++
++// Split sorted expert indices into row tiles of at most BM rows that never
++// cross an expert boundary. Writes (row_start, row_end) per tile and empty
++// tiles up to max_tiles. Run with one threadgroup.
++template <int BM>
++[[kernel]] void gather_rhs_tiles(
++    const device uint32_t* indices [[buffer(0)]],
++    device int2* tiles [[buffer(1)]],
++    const constant int& M [[buffer(2)]],
++    const constant int& max_tiles [[buffer(3)]],
++    uint tid [[thread_position_in_threadgroup]],
++    uint tsize [[threads_per_threadgroup]],
++    uint simd_lane_id [[thread_index_in_simdgroup]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]]) {
++  threadgroup int sg_sums[32];
++  threadgroup int total;
++
++  const int per = (M + int(tsize) - 1) / int(tsize);
++  const int r0 = min(M, int(tid) * per);
++  const int r1 = min(M, r0 + per);
++
++  auto segment_end = [&](int i) {
++    int j = i + 1;
++    while (j < M && indices[j] == indices[i]) {
++      j++;
++    }
++    return j;
++  };
++
++  int count = 0;
++  for (int i = r0; i < r1; i++) {
++    if (i == 0 || indices[i] != indices[i - 1]) {
++      count += (segment_end(i) - i + BM - 1) / BM;
++    }
++  }
++
++  // Exclusive prefix sum of the counts over the threadgroup
++  if (simd_group_id == 0) {
++    sg_sums[simd_lane_id] = 0;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  int incl = simd_prefix_inclusive_sum(count);
++  if (simd_lane_id == 31) {
++    sg_sums[simd_group_id] = incl;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (simd_group_id == 0) {
++    int v = sg_sums[simd_lane_id];
++    int v_incl = simd_prefix_inclusive_sum(v);
++    sg_sums[simd_lane_id] = v_incl - v;
++    if (simd_lane_id == 31) {
++      total = v_incl;
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++
++  int offset = sg_sums[simd_group_id] + incl - count;
++  for (int i = r0; i < r1; i++) {
++    if (i == 0 || indices[i] != indices[i - 1]) {
++      int end = segment_end(i);
++      for (int s = i; s < end; s += BM) {
++        tiles[offset++] = int2(s, min(s + BM, end));
++      }
++    }
++  }
++  for (int t = total + int(tid); t < max_tiles; t += int(tsize)) {
++    tiles[t] = int2(0, 0);
++  }
++}
+diff --git a/mlx/backend/metal/kernels/fp_quantized_nax.metal b/mlx/backend/metal/kernels/fp_quantized_nax.metal
+index b6cc781..da0b882 100644
+--- a/mlx/backend/metal/kernels/fp_quantized_nax.metal
++++ b/mlx/backend/metal/kernels/fp_quantized_nax.metal
+@@ -104,6 +104,8 @@
+   instantiate_gather_qmm_rhs(fp_gather_qmm_rhs_nax, gather_qmm_rhs_nax_nt, type, 64, 64, 64, 2, 2, true, mode, group_size, bits) \
+   instantiate_gather_qmm_rhs(fp_gather_qmm_rhs_nax, gather_qmm_rhs_nax_nn, type, 64, 64, 64, 2, 2, false, mode, group_size, bits) \
+   instantiate_gather_qmm_rhs(fp_gather_qmm_rhs_nax, gather_qmm_rhs_nax_nt, type, 32, 64, 64, 2, 2, true, mode, group_size, bits) \
++  instantiate_gather_qmm_rhs(fp_gather_qmm_rhs_nax, gather_qmm_rhs_nax_nt, type, 64, 64, 64, 4, 1, true, mode, group_size, bits) \
++  instantiate_gather_qmm_rhs(fp_gather_qmm_rhs_nax, gather_qmm_rhs_nax_nt, type, 64, 64, 128, 4, 1, true, mode, group_size, bits) \
+   instantiate_gather_qmm_rhs(fp_gather_qmm_rhs_nax, gather_qmm_rhs_nax_nn, type, 32, 64, 64, 2, 2, false, mode, group_size, bits)
+ 
+ #define instantiate_quantized_modes(type, mode, group_size, bits) \
+@@ -119,4 +121,6 @@ instantiate_quantized_types(float)
+ instantiate_quantized_types(bfloat16_t)
+ instantiate_quantized_types(float16_t)
+ instantiate_quantized_qmm_hgs(bfloat16_t)
++
++instantiate_kernel("gather_rhs_tiles_bm_64", gather_rhs_tiles, 64)
+     // clang-format on
+diff --git a/mlx/backend/metal/kernels/gated_delta_update_nax.h b/mlx/backend/metal/kernels/gated_delta_update_nax.h
+index f4ae518..682309e 100644
+--- a/mlx/backend/metal/kernels/gated_delta_update_nax.h
++++ b/mlx/backend/metal/kernels/gated_delta_update_nax.h
+@@ -127,8 +127,8 @@ METAL_FUNC static constexpr void mma(
+       gemm_op
+           .template get_right_input_cooperative_tensor<AType, BType, CType>();
+   auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+-      decltype(ct_a),
+-      decltype(ct_b),
++      metal::remove_addrspace_t<decltype(ct_a)>,
++      metal::remove_addrspace_t<decltype(ct_b)>,
+       CType>();
+ 
+   STEEL_PRAGMA_UNROLL
+@@ -173,8 +173,8 @@ METAL_FUNC static constexpr void mma(
+       gemm_op
+           .template get_right_input_cooperative_tensor<AType, BType, CType>();
+   auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+-      decltype(ct_a),
+-      decltype(ct_b),
++      metal::remove_addrspace_t<decltype(ct_a)>,
++      metal::remove_addrspace_t<decltype(ct_b)>,
+       CType>();
+ 
+   STEEL_PRAGMA_UNROLL
+@@ -226,8 +226,8 @@ METAL_FUNC static constexpr void mman(
+ 
+   // Create matmul output in register
+   auto ct_c = gemm_op.template get_destination_cooperative_tensor<
+-      decltype(ct_a),
+-      decltype(ct_b),
++      metal::remove_addrspace_t<decltype(ct_a)>,
++      metal::remove_addrspace_t<decltype(ct_b)>,
+       CType>();
+ 
+   // Load A in to left operand registers
+diff --git a/mlx/backend/metal/kernels/scaled_dot_product_attention.metal b/mlx/backend/metal/kernels/scaled_dot_product_attention.metal
+index 68e2a6c..9787432 100644
+--- a/mlx/backend/metal/kernels/scaled_dot_product_attention.metal
++++ b/mlx/backend/metal/kernels/scaled_dot_product_attention.metal
+@@ -50,6 +50,7 @@ using namespace metal;
+   instantiate_sdpa_vector_gqa(type, 128, 128, 8, 4)   \
+   instantiate_sdpa_vector_gqa(type, 128, 128, 12, 4)  \
+   instantiate_sdpa_vector_gqa(type, 128, 128, 16, 2)  \
++  instantiate_sdpa_vector_gqa(type, 192, 128, 16, 2)  \
+   instantiate_sdpa_vector_aggregation(type, 64)  \
+   instantiate_sdpa_vector_aggregation(type, 96)  \
+   instantiate_sdpa_vector_aggregation(type, 128) \
+diff --git a/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h b/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
+index 4a5a971..99508bc 100644
+--- a/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
++++ b/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.h
+@@ -17,6 +17,8 @@ constant bool align_K [[function_constant(201)]];
+ constant bool has_mask [[function_constant(300)]];
+ constant bool do_causal [[function_constant(301)]];
+ constant bool has_sinks [[function_constant(302)]];
++constant bool has_window [[function_constant(303)]];
++constant bool row_packed [[function_constant(304)]];
+ 
+ template <typename T>
+ struct TransformScale {
+@@ -79,7 +81,8 @@ template <
+     int WM,
+     int WN,
+     typename MaskType = float,
+-    typename AccumType = float>
++    typename AccumType = float,
++    int BDV = BD>
+ [[kernel, max_total_threads_per_threadgroup(WM * WN * 32)]] void attention_nax(
+     const device T* Q [[buffer(0)]],
+     const device T* K [[buffer(1)]],
+@@ -98,14 +101,34 @@ template <
+   (void)lid;
+   (void)simd_lane_id;
+ 
++  // Without a window, run causal Q blocks in reverse order, so the longest
++  // blocks start first, and give the query heads of one KV head consecutive
++  // threadgroups, so that they read the same keys at the same time.
++  const bool causal_order = do_causal && !has_window;
++  int qx = int(tid.x);
++  int head = int(tid.y);
++  if (causal_order) {
++    const int g = params->gqa_factor;
++    const int id = int(tid.x) + int(params->NQ) * int(tid.y);
++    qx = (id / g) % int(params->NQ);
++    head = (id / g / int(params->NQ)) * g + id % g;
++  }
++  const int qb = causal_order ? int(params->NQ) - 1 - qx : qx;
++
++  // With packed rows the row strides are compile-time constants.
++  const int q_ld = row_packed ? BD : int(params->Q_strides[2]);
++  const int k_ld = row_packed ? BD : int(params->K_strides[2]);
++  const int v_ld = row_packed ? BDV : int(params->V_strides[2]);
++  const int o_ld = row_packed ? BDV : int(params->O_strides[2]);
++
+   // Move to correct block
+-  ulong3 tidl{tid.x, tid.y, tid.z};
++  ulong3 tidl{ulong(qb), ulong(head), tid.z};
+ 
+   Q += tidl.z * params->Q_strides[0] + // Batch
+       tidl.y * params->Q_strides[1] + // Head
+-      tidl.x * BQ * params->Q_strides[2]; // Sequence
++      tidl.x * BQ * q_ld; // Sequence
+ 
+-  ulong kv_head_idx = int(tid.y) / params->gqa_factor;
++  ulong kv_head_idx = head / params->gqa_factor;
+   K += tidl.z * params->K_strides[0] + // Batch
+       kv_head_idx * params->K_strides[1]; // Head
+ 
+@@ -114,7 +137,7 @@ template <
+ 
+   O += tidl.z * params->O_strides[0] + // Batch
+       tidl.y * params->O_strides[1] + // Head
+-      tidl.x * BQ * params->O_strides[2]; // Sequence
++      tidl.x * BQ * o_ld; // Sequence
+ 
+   if (has_mask) {
+     mask += tidl.z * mask_params->M_strides[0] + // Batch
+@@ -136,18 +159,21 @@ template <
+   constexpr int TQ = BQ / (kNWarps * kU);
+   // HeadDim frags (all warps load the same frags)
+   constexpr int TD = BD / kU;
++  // Value head dim frags
++  constexpr int TDV = BDV / kU;
+   // KV seq frags per warp
+   constexpr short TK = BK / kU;
+ 
+   static_assert(TQ == 1, "Check TQ");
+-  using otile_t = NAXTile<AccumType, TQ, TD>;
++  static_assert(TDV % 2 == 0, "P@V accumulates output fragments in pairs");
++  using otile_t = NAXTile<AccumType, TQ, TDV>;
+   otile_t Otile;
+ 
+   Otile.clear();
+ 
+   // Prepare mma tile offsets
+   const short tm = kU * TQ * simd_group_id;
+-  Q += tm * int(params->Q_strides[2]);
++  Q += tm * q_ld;
+ 
+   const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
+   const short sm = simd_coord.y;
+@@ -177,24 +203,51 @@ template <
+   int kb_min_causal = params->NK;
+ 
+   if (do_causal) {
+-    int q_max = (tid.x + 1) * BQ + params->qL_off;
++    int q_max = (qb + 1) * BQ + params->qL_off;
+     kb_lim = (q_max + BK - 1) / BK;
+     kb_lim = min(params->NK, kb_lim);
+ 
+-    int q_min = tid.x * BQ + params->qL_off;
++    int q_min = qb * BQ + params->qL_off;
+     q_min = max(0, q_min);
+     kb_min_causal = (q_min / BK);
+   }
+ 
+-  const bool is_last_bq = int(tid.x) == (params->NQ_aligned);
++  // Sliding window: row r sees keys c with r - c < window. Skip blocks
++  // below the window of the first row, mask blocks below the last row.
++  int kb_start = 0;
++  int kb_lim_window = 0;
++  if (has_window) {
++    int q_min = qb * BQ + params->qL_off;
++    int q_max = q_min + BQ - 1;
++    kb_start = max(0, q_min - params->window + 1) / BK;
++    kb_start = min(kb_start, kb_lim);
++    kb_lim_window = (max(0, q_max - params->window + 1) + BK - 1) / BK;
++    K += kb_start * BK * k_ld;
++    V += kb_start * BK * v_ld;
++  }
++
++  const bool is_last_bq = qb == (params->NQ_aligned);
+   // const bool is_last_tq = int(simd_group_id) >= (params->qL_rem / UQ);
+   const bool is_last_q = is_last_bq;
+ 
+   const short lim_rows_q = params->qL_rem - tm;
+   const short lim_rows_k = params->kL_rem;
+ 
++  // For bfloat16 with head dim 192 and no window, keep Q in registers and
++  // rescale O only when a row max grows by more than 2^8. Together they are
++  // faster than either alone. With float16 the late rescale adds error.
++  const bool q_in_regs = (BD == 192) && is_same_v<T, bfloat> && !has_window;
++  NAXTile<T, TQ, TD> Qreg;
++  if (q_in_regs) {
++    if (!align_Q && is_last_q) {
++      Qreg.load_rows(Q, q_ld, lim_rows_q);
++    } else {
++      Qreg.load(Q, q_ld);
++    }
++  }
++
+   // Loop over KV seq length
+-  for (int kb = 0; kb < kb_lim; kb++) {
++  for (int kb = kb_start; kb < kb_lim; kb++) {
+     const int is_last_k = (kb == (params->NK_aligned));
+ 
+     // Do S = Q @ K.T
+@@ -216,31 +269,33 @@ template <
+           NAXTile<T, 1, 1> Qtile;
+           NAXTile<T, 2, 1> Ktile;
+ 
+-          const int Q_load_off = iq * kU * int(params->Q_strides[2]) + id * kU;
+-          const int K_load_off = ik * kU * int(params->K_strides[2]) + id * kU;
++          const int Q_load_off = iq * kU * q_ld + id * kU;
++          const int K_load_off = ik * kU * k_ld + id * kU;
+ 
+-          if (!align_Q && is_last_q) {
+-            Qtile.load_rows(
+-                Q + Q_load_off,
+-                int(params->Q_strides[2]),
+-                lim_rows_q - iq * kU);
+-          } else {
+-            Qtile.load(Q + Q_load_off, int(params->Q_strides[2]));
++          if (!q_in_regs) {
++            if (!align_Q && is_last_q) {
++              Qtile.load_rows(
++                  Q + Q_load_off,
++                  q_ld,
++                  lim_rows_q - iq * kU);
++            } else {
++              Qtile.load(Q + Q_load_off, q_ld);
++            }
+           }
+ 
+           if (!align_K && is_last_k) {
+             Ktile.load_rows(
+                 K + K_load_off,
+-                int(params->K_strides[2]),
++                k_ld,
+                 lim_rows_k - ik * kU);
+           } else {
+-            Ktile.load(K + K_load_off, int(params->K_strides[2]));
++            Ktile.load(K + K_load_off, k_ld);
+           }
+ 
+           stile_t::NAXFrag_t::mma(
+               Stile.frag_at(iq, ik),
+               Stile.frag_at(iq, ik + 1),
+-              Qtile.frag_at(0, 0),
++              q_in_regs ? Qreg.frag_at(iq, id) : Qtile.frag_at(0, 0),
+               metal::false_type{},
+               Ktile.frag_at(0, 0),
+               Ktile.frag_at(1, 0),
+@@ -283,7 +338,7 @@ template <
+     if (do_causal && kb >= kb_min_causal) {
+       constexpr auto neg_inf = Limits<AccumType>::finite_min;
+ 
+-      const int base_row = tid.x * BQ + params->qL_off + tm;
++      const int base_row = qb * BQ + params->qL_off + tm;
+       const int base_col = kb * BK;
+ 
+       STEEL_PRAGMA_UNROLL
+@@ -307,11 +362,39 @@ template <
+       }
+     }
+ 
++    // Mask out keys below the sliding window
++    if (has_window && kb < kb_lim_window) {
++      constexpr auto neg_inf = Limits<AccumType>::finite_min;
++
++      const int base_row = qb * BQ + params->qL_off + tm;
++      const int base_col = kb * BK;
++
++      STEEL_PRAGMA_UNROLL
++      for (short iq = 0; iq < TQ; iq++) {
++        STEEL_PRAGMA_UNROLL
++        for (short ik = 0; ik < TK; ik++) {
++          thread auto& fg = Stile.frag_at(iq, ik);
++
++          STEEL_PRAGMA_UNROLL
++          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
++            STEEL_PRAGMA_UNROLL
++            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
++              const auto r =
++                  base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
++              const auto c = base_col + ik * kU + jj + sn;
++              const auto loc = ii * stile_t::kFragThrCols + jj;
++              fg[loc] = (r - c >= params->window) ? neg_inf : fg[loc];
++            }
++          }
++        }
++      }
++    }
++
+     // Other masking as needed
+     if (has_mask) {
+       constexpr auto neg_inf = Limits<AccumType>::finite_min;
+ 
+-      const int base_row = tid.x * BQ + tm;
++      const int base_row = qb * BQ + tm;
+       const int base_col = kb * BK;
+ 
+       constexpr bool is_bool = is_same_v<MaskType, bool>;
+@@ -394,26 +477,51 @@ template <
+     // Row max
+     Stile.template row_reduce<MaxOp>(new_max);
+ 
+-    // exp(Si - rowmax(Si))
+-    Stile.template row_bin_op<ExpSubOp>(new_max);
++    if (q_in_regs) {
++      // Keep the old max unless the row max grows by more than 2^8.
++      bool rescale = false;
++      STEEL_PRAGMA_UNROLL
++      for (short i = 0; i < kRowsPT; ++i) {
++        const bool up = new_max[i] - max_score[i] > AccumType(8);
++        new_max[i] = up ? new_max[i] : max_score[i];
++        rescale |= up;
++      }
+ 
+-    // Factor exp(rowmax(Si) - rowmax(Si-1))
+-    STEEL_PRAGMA_UNROLL
+-    for (short i = 0; i < kRowsPT; ++i) {
+-      factor[i] = fast::exp2(max_score[i] - new_max[i]);
+-      max_score[i] = new_max[i];
+-    }
++      Stile.template row_bin_op<ExpSubOp>(new_max);
+ 
+-    // Row Sum
+-    STEEL_PRAGMA_UNROLL
+-    for (short i = 0; i < kRowsPT; ++i) {
+-      sum_score[i] = sum_score[i] * factor[i];
+-    }
++      if (simd_any(rescale)) {
++        STEEL_PRAGMA_UNROLL
++        for (short i = 0; i < kRowsPT; ++i) {
++          factor[i] = fast::exp2(max_score[i] - new_max[i]);
++          max_score[i] = new_max[i];
++          sum_score[i] = sum_score[i] * factor[i];
++        }
++        Otile.template row_bin_op<MulOp>(factor);
++      }
+ 
+-    Stile.template row_reduce<SumOp>(sum_score);
++      Stile.template row_reduce<SumOp>(sum_score);
++    } else {
++      // exp(Si - rowmax(Si))
++      Stile.template row_bin_op<ExpSubOp>(new_max);
+ 
+-    // Update O
+-    Otile.template row_bin_op<MulOp>(factor);
++      // Factor exp(rowmax(Si) - rowmax(Si-1))
++      STEEL_PRAGMA_UNROLL
++      for (short i = 0; i < kRowsPT; ++i) {
++        factor[i] = fast::exp2(max_score[i] - new_max[i]);
++        max_score[i] = new_max[i];
++      }
++
++      // Row Sum
++      STEEL_PRAGMA_UNROLL
++      for (short i = 0; i < kRowsPT; ++i) {
++        sum_score[i] = sum_score[i] * factor[i];
++      }
++
++      Stile.template row_reduce<SumOp>(sum_score);
++
++      // Update O
++      Otile.template row_bin_op<MulOp>(factor);
++    }
+ 
+     simdgroup_barrier(mem_flags::mem_none);
+ 
+@@ -421,8 +529,8 @@ template <
+     STEEL_PRAGMA_UNROLL
+     for (short iq = 0; iq < TQ; iq++) {
+       STEEL_PRAGMA_UNROLL
+-      for (short id = 0; id < TD; id += 2) {
+-        if constexpr (BD == 128) {
++      for (short id = 0; id < TDV; id += 2) {
++        if constexpr (BDV == 128) {
+           if (id == 4) {
+             threadgroup_barrier(mem_flags::mem_none);
+           }
+@@ -432,15 +540,15 @@ template <
+         for (short ik = 0; ik < TK; ik++) {
+           NAXTile<T, 1, 2> Vtile;
+ 
+-          const int V_load_off = ik * kU * int(params->V_strides[2]) + id * kU;
++          const int V_load_off = ik * kU * v_ld + id * kU;
+ 
+           if (!align_K && is_last_k) {
+             Vtile.load_rows(
+                 V + V_load_off,
+-                int(params->V_strides[2]),
++                v_ld,
+                 lim_rows_k - ik * kU);
+           } else {
+-            Vtile.load(V + V_load_off, int(params->V_strides[2]));
++            Vtile.load(V + V_load_off, v_ld);
+           }
+ 
+           otile_t::NAXFrag_t::mma(
+@@ -456,8 +564,8 @@ template <
+     }
+ 
+     // Prepare for next iteration
+-    K += BK * int(params->K_strides[2]);
+-    V += BK * int(params->V_strides[2]);
++    K += BK * k_ld;
++    V += BK * v_ld;
+   }
+ 
+   // Normalize output
+@@ -473,15 +581,15 @@ template <
+   Otile.template row_bin_op<MulOp>(rcp);
+ 
+   // Store results
+-  O += tm * int(params->O_strides[2]);
++  O += tm * o_ld;
+ 
+   if (!align_Q && is_last_q) {
+     if (lim_rows_q <= 0)
+       return;
+ 
+-    Otile.store_rows(O, int(params->O_strides[2]), lim_rows_q);
++    Otile.store_rows(O, o_ld, lim_rows_q);
+   } else {
+-    Otile.store(O, int(params->O_strides[2]));
++    Otile.store(O, o_ld);
+   }
+ }
+ 
+@@ -625,6 +733,20 @@ template <
+     kb_min_causal = (q_min / BK);
+   }
+ 
++  // Sliding window: row r sees keys c with r - c < window. Skip blocks
++  // below the window of the first row, mask blocks below the last row.
++  int kb_start = 0;
++  int kb_lim_window = 0;
++  if (has_window) {
++    int q_min = tid.x * BQ + params->qL_off;
++    int q_max = q_min + BQ - 1;
++    kb_start = max(0, q_min - params->window + 1) / BK;
++    kb_start = min(kb_start, kb_lim);
++    kb_lim_window = (max(0, q_max - params->window + 1) + BK - 1) / BK;
++    K += kb_start * BK * int(params->K_strides[2]);
++    V += kb_start * BK * int(params->V_strides[2]);
++  }
++
+   const bool is_last_q = int(tid.x) == (params->NQ_aligned);
+   const short lim_rows_q = params->qL_rem - tm;
+   const short lim_rows_k = params->kL_rem;
+@@ -656,7 +778,7 @@ template <
+   const short sn = simd_coord.x;
+ 
+   // Loop over KV seq length
+-  for (int kb = 0; kb < kb_lim; kb++) {
++  for (int kb = kb_start; kb < kb_lim; kb++) {
+     const int is_last_k = (kb == (params->NK_aligned));
+ 
+     stile_t Stile;
+@@ -757,6 +879,34 @@ template <
+       }
+     }
+ 
++    // Mask out keys below the sliding window
++    if (has_window && kb < kb_lim_window) {
++      constexpr auto neg_inf = Limits<AccumType>::finite_min;
++
++      const int base_row = tid.x * BQ + params->qL_off + tm;
++      const int base_col = kb * BK;
++
++      STEEL_PRAGMA_UNROLL
++      for (short iq = 0; iq < TQ; iq++) {
++        STEEL_PRAGMA_UNROLL
++        for (short ik = 0; ik < TK; ik++) {
++          thread auto& fg = Stile.frag_at(iq, ik);
++
++          STEEL_PRAGMA_UNROLL
++          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
++            STEEL_PRAGMA_UNROLL
++            for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
++              const auto r =
++                  base_row + iq * kU + ii * stile_t::kFragRowsJump + sm;
++              const auto c = base_col + ik * kU + jj + sn;
++              const auto loc = ii * stile_t::kFragThrCols + jj;
++              fg[loc] = (r - c >= params->window) ? neg_inf : fg[loc];
++            }
++          }
++        }
++      }
++    }
++
+     // Other masking as needed
+     if (has_mask) {
+       constexpr auto neg_inf = Limits<AccumType>::finite_min;
+@@ -905,3 +1055,229 @@ template <
+     Otile.store(O, int(params->O_strides[2]));
+   }
+ }
++
++///////////////////////////////////////////////////////////////////////////////
++// Split-KV decode kernel
++///////////////////////////////////////////////////////////////////////////////
++
++// A few queries per head (qL <= 8). Simdgroup i serves query i: the
++// gqa_factor query heads of a KV head form the rows of one 16-row tile. All
++// simdgroups of a threadgroup read the same chunk of the keys, so K and V
++// come from memory once. Writes the unnormalized partial output with its row
++// max and sum in the layout of sdpa_vector_2pass_2.
++
++// clang-format off
++template <
++    typename T,
++    int BK,
++    int BD,
++    int BDV,
++    typename AccumType = float>
++[[kernel, max_total_threads_per_threadgroup(256)]] void attention_nax_decode(
++    const device T* Q [[buffer(0)]],
++    const device T* K [[buffer(1)]],
++    const device T* V [[buffer(2)]],
++    device T* O [[buffer(3)]],
++    device float* sums [[buffer(4)]],
++    device float* maxs [[buffer(5)]],
++    const constant AttnDecodeParams* params [[buffer(6)]],
++    const device T* sinks [[buffer(7), function_constant(has_sinks)]],
++    const device bool* mask [[buffer(8), function_constant(has_mask)]],
++    uint simd_group_id [[simdgroup_index_in_threadgroup]],
++    uint3 tid [[threadgroup_position_in_grid]],
++    uint3 tpg [[threadgroups_per_grid]]) { // clang-format on
++
++  constexpr short kU = 16;
++  constexpr int TD = BD / kU;
++  constexpr int TDV = BDV / kU;
++  constexpr short TK = BK / kU;
++  static_assert(TK % 2 == 0 && TDV % 2 == 0, "Fragments are used in pairs");
++
++  const int G = params->gqa_factor;
++  const int qL = params->qL;
++  const int qi = simd_group_id;
++  const int block = tid.x;
++  const int kv_head = tid.y;
++  const int batch = tid.z;
++  const int q_head0 = kv_head * G;
++  const int n_q_heads = G * int(tpg.y);
++
++  Q += batch * params->Q_strides[0] + q_head0 * params->Q_strides[1] +
++      qi * params->Q_strides[2];
++  K += batch * params->K_strides[0] + kv_head * params->K_strides[1];
++  V += batch * params->V_strides[0] + kv_head * params->V_strides[1];
++
++  // Causal: query qi sees keys up to kL - qL + qi.
++  const int k_lim = do_causal ? params->kL - qL + qi + 1 : params->kL;
++  const int k_start = block * params->chunk;
++  const int k_end = min(k_lim, k_start + params->chunk);
++  K += k_start * params->K_strides[2];
++  V += k_start * params->V_strides[2];
++
++  using otile_t = NAXTile<AccumType, 1, TDV>;
++  using stile_t = NAXTile<AccumType, 1, TK>;
++  constexpr short kRowsPT = otile_t::kRowsPerThread;
++
++  NAXTile<T, 1, TD> Qtile;
++  Qtile.load_rows(Q, int(params->Q_strides[1]), G);
++
++  otile_t Otile;
++  Otile.clear();
++
++  const float scale2 = params->scale * 1.44269504089f;
++
++  metal::vec<AccumType, kRowsPT> max_score;
++  metal::vec<AccumType, kRowsPT> sum_score{0};
++  STEEL_PRAGMA_UNROLL
++  for (short i = 0; i < kRowsPT; ++i) {
++    max_score[i] = Limits<AccumType>::finite_min;
++  }
++
++  const short2 simd_coord = otile_t::NAXFrag_t::get_coord();
++  const short sm = simd_coord.y;
++  const short sn = simd_coord.x;
++
++  if (has_sinks && block == 0) {
++    STEEL_PRAGMA_UNROLL
++    for (short i = 0; i < kRowsPT; ++i) {
++      const int r = min(sm + i * stile_t::kFragRowsJump, G - 1);
++      max_score[i] = M_LOG2E_F * static_cast<AccumType>(sinks[q_head0 + r]);
++      sum_score[i] = 1;
++    }
++  }
++
++  for (int kb = k_start; kb < k_end; kb += BK) {
++    const int k_rem = k_end - kb;
++    const bool full = k_rem >= BK;
++
++    // S = Q @ K.T
++    stile_t Stile;
++    Stile.clear();
++    STEEL_PRAGMA_UNROLL
++    for (short ik = 0; ik < TK; ik += 2) {
++      STEEL_PRAGMA_UNROLL
++      for (short id = 0; id < TD; id++) {
++        NAXTile<T, 2, 1> Ktile;
++        const int K_off = ik * kU * int(params->K_strides[2]) + id * kU;
++        if (full) {
++          Ktile.load(K + K_off, int(params->K_strides[2]));
++        } else {
++          Ktile.load_rows(
++              K + K_off, int(params->K_strides[2]), k_rem - ik * kU);
++        }
++        stile_t::NAXFrag_t::mma(
++            Stile.frag_at(0, ik),
++            Stile.frag_at(0, ik + 1),
++            Qtile.frag_at(0, id),
++            metal::false_type{},
++            Ktile.frag_at(0, 0),
++            Ktile.frag_at(1, 0),
++            metal::true_type{});
++      }
++    }
++
++    STEEL_PRAGMA_UNROLL
++    for (short ii = 0; ii < stile_t::kElemsPerTile; ii++) {
++      Stile.elems()[ii] *= scale2;
++    }
++
++    if (has_mask) {
++      // A boolean mask shared by the query heads of this query.
++      constexpr auto neg_inf = Limits<AccumType>::finite_min;
++      const device bool* mrow =
++          mask + batch * params->M_strides[0] + qi * params->M_strides[1];
++      STEEL_PRAGMA_UNROLL
++      for (short ik = 0; ik < TK; ik++) {
++        thread auto& fg = Stile.frag_at(0, ik);
++        STEEL_PRAGMA_UNROLL
++        for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
++          const int kc = ik * kU + sn + jj;
++          const bool keep =
++              kc < k_rem && mrow[(kb + kc) * params->M_strides[2]];
++          STEEL_PRAGMA_UNROLL
++          for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
++            const auto loc = ii * stile_t::kFragThrCols + jj;
++            fg[loc] = keep ? fg[loc] : neg_inf;
++          }
++        }
++      }
++    } else if (!full) {
++      constexpr auto neg_inf = Limits<AccumType>::finite_min;
++      STEEL_PRAGMA_UNROLL
++      for (short ik = 0; ik < TK; ik++) {
++        thread auto& fg = Stile.frag_at(0, ik);
++        STEEL_PRAGMA_UNROLL
++        for (short ii = 0; ii < stile_t::kFragThrRows; ii++) {
++          STEEL_PRAGMA_UNROLL
++          for (short jj = 0; jj < stile_t::kFragThrCols; jj++) {
++            const auto loc = ii * stile_t::kFragThrCols + jj;
++            fg[loc] = (ik * kU + sn + jj < k_rem) ? fg[loc] : neg_inf;
++          }
++        }
++      }
++    }
++
++    // Online softmax
++    metal::vec<AccumType, kRowsPT> new_max;
++    metal::vec<AccumType, kRowsPT> factor;
++    STEEL_PRAGMA_UNROLL
++    for (short i = 0; i < kRowsPT; ++i) {
++      new_max[i] = max_score[i];
++    }
++    Stile.template row_reduce<MaxOp>(new_max);
++    Stile.template row_bin_op<ExpSubOp>(new_max);
++    STEEL_PRAGMA_UNROLL
++    for (short i = 0; i < kRowsPT; ++i) {
++      factor[i] = fast::exp2(max_score[i] - new_max[i]);
++      max_score[i] = new_max[i];
++      sum_score[i] = sum_score[i] * factor[i];
++    }
++    Stile.template row_reduce<SumOp>(sum_score);
++    Otile.template row_bin_op<MulOp>(factor);
++
++    // O += P @ V
++    STEEL_PRAGMA_UNROLL
++    for (short id = 0; id < TDV; id += 2) {
++      STEEL_PRAGMA_UNROLL
++      for (short ik = 0; ik < TK; ik++) {
++        NAXTile<T, 1, 2> Vtile;
++        const int V_off = ik * kU * int(params->V_strides[2]) + id * kU;
++        if (full) {
++          Vtile.load(V + V_off, int(params->V_strides[2]));
++        } else {
++          Vtile.load_rows(
++              V + V_off, int(params->V_strides[2]), k_rem - ik * kU);
++        }
++        otile_t::NAXFrag_t::mma(
++            Otile.frag_at(0, id),
++            Otile.frag_at(0, id + 1),
++            Stile.frag_at(0, ik),
++            metal::false_type{},
++            Vtile.frag_at(0, 0),
++            Vtile.frag_at(0, 1),
++            metal::false_type{});
++      }
++    }
++
++    K += BK * int(params->K_strides[2]);
++    V += BK * int(params->V_strides[2]);
++  }
++
++  // Partials for sdpa_vector_2pass_2: row r of this tile is query head
++  // q_head0 + r at query qi, stored at ((head * qL + qi) * blocks + block).
++  const int blocks = params->blocks;
++  const size_t row_base = (size_t(batch) * n_q_heads + q_head0) * qL + qi;
++  device T* Ob = O + (row_base * blocks + block) * BDV;
++  Otile.store_rows(Ob, qL * blocks * BDV, G);
++  if (sn == 0) {
++    STEEL_PRAGMA_UNROLL
++    for (short i = 0; i < kRowsPT; ++i) {
++      const int r = sm + i * stile_t::kFragRowsJump;
++      if (r < G) {
++        const size_t idx = (row_base + size_t(r) * qL) * blocks + block;
++        sums[idx] = sum_score[i];
++        maxs[idx] = max_score[i] * M_LN2_F;
++      }
++    }
++  }
++}
+diff --git a/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.metal b/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.metal
+index 66d5553..3f4829e 100644
+--- a/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.metal
++++ b/mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.metal
+@@ -11,6 +11,12 @@
+       "_wm" #wm "_wn" #wn "_mask" #mname,                                \
+   attention_nax, dtype, bq, bk, bd, wm, wn, mtype, float)
+ 
++#define instantiate_attn_vdim(tname, dtype, bq, bk, bd, bdv, wm, wn, mname, mtype) \
++  instantiate_kernel(                                                           \
++      "steel_attention_" #tname "_bq" #bq "_bk" #bk "_bd" #bd "_bdv" #bdv       \
++      "_wm" #wm "_wn" #wn "_mask" #mname,                                       \
++  attention_nax, dtype, bq, bk, bd, wm, wn, mtype, float, bdv)
++
+ #define instantiate_attn_dsplit(tname, dtype, bq, bk, bd, wm, wn, mname, mtype) \
+   instantiate_kernel(                                                           \
+       "steel_attention_dsplit_" #tname "_bq" #bq "_bk" #bk "_bd" #bd            \
+@@ -19,6 +25,7 @@
+ 
+ #define instantiate_attn_shapes_helper(iname, itype, mname, mtype)         \
+     instantiate_attn_dsplit(iname, itype, 64, 32, 256, 4, 2, mname, mtype) \
++    instantiate_attn_vdim(iname, itype, 64, 32, 192, 128, 4, 1, mname, mtype) \
+     instantiate_attn(iname, itype, 64, 32, 128, 4, 1, mname, mtype)        \
+     instantiate_attn(iname, itype, 64, 32,  96, 4, 1, mname, mtype)        \
+     instantiate_attn(iname, itype, 64, 32,  64, 4, 1, mname, mtype)        \
+@@ -33,4 +40,12 @@ instantiate_attn_mask_helper(float16, half);
+ instantiate_attn_mask_helper(bfloat16, bfloat);
+ 
+ instantiate_attn_mask_helper(float32, float);
+-// clang-format on
++
++#define instantiate_attn_decode(tname, dtype, bk, bd, bdv)            \
++  instantiate_kernel(                                                 \
++      "steel_attention_decode_" #tname "_bk" #bk "_bd" #bd "_bdv" #bdv, \
++      attention_nax_decode, dtype, bk, bd, bdv, float)
++
++instantiate_attn_decode(float16, half, 32, 192, 128)
++instantiate_attn_decode(bfloat16, bfloat, 32, 192, 128)
++    // clang-format on
+diff --git a/mlx/backend/metal/kernels/steel/attn/params.h b/mlx/backend/metal/kernels/steel/attn/params.h
+index f1cf09f..93991fa 100644
+--- a/mlx/backend/metal/kernels/steel/attn/params.h
++++ b/mlx/backend/metal/kernels/steel/attn/params.h
+@@ -34,6 +34,22 @@ struct AttnParams {
+   int64_t K_strides[3]; ///< Key    strides (B, H, L, D = 1)
+   int64_t V_strides[3]; ///< Value  strides (B, H, L, D = 1)
+   int64_t O_strides[3]; ///< Output strides (B, H, L, D = 1)
++
++  int window; ///< Sliding window size (used with has_window)
++};
++
++struct AttnDecodeParams {
++  int kL; ///< Key Sequence Length
++  int qL; ///< Query Sequence Length (one simdgroup per query)
++  int gqa_factor; ///< Query heads per KV head (rows of the tile)
++  float scale; ///< Attention scale
++  int chunk; ///< Keys per threadgroup (multiple of the key block)
++  int blocks; ///< Number of key chunks
++
++  int64_t Q_strides[3]; ///< Query strides (B, H, L)
++  int64_t K_strides[3]; ///< Key strides (B, H, L)
++  int64_t V_strides[3]; ///< Value strides (B, H, L)
++  int64_t M_strides[3]; ///< Boolean mask strides (B, qL, kL), heads broadcast
+ };
+ 
+ struct AttnMaskParams {
+diff --git a/mlx/backend/metal/nojit_kernels.cpp b/mlx/backend/metal/nojit_kernels.cpp
+index 4f48a25..9052161 100644
+--- a/mlx/backend/metal/nojit_kernels.cpp
++++ b/mlx/backend/metal/nojit_kernels.cpp
+@@ -505,11 +505,31 @@ MTL::ComputePipelineState* get_steel_attention_nax_kernel(
+     int,
+     int,
+     int,
++    int,
+     const array&,
+     bool) {
+   return d.get_kernel(kernel_name, hash_name, func_consts);
+ }
+ 
++MTL::ComputePipelineState* get_gather_rhs_tiles_kernel(
++    metal::Device& d,
++    const std::string& kernel_name,
++    int) {
++  return d.get_kernel(kernel_name);
++}
++
++MTL::ComputePipelineState* get_steel_attention_nax_decode_kernel(
++    metal::Device& d,
++    const std::string& kernel_name,
++    const std::string& hash_name,
++    const metal::MTLFCList& func_consts,
++    const array&,
++    int,
++    int,
++    int) {
++  return d.get_kernel(kernel_name, hash_name, func_consts);
++}
++
+ MTL::ComputePipelineState* get_gated_delta_kernel(
+     metal::Device& d,
+     const std::string& kernel_name,
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index 5560818..e68670d 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1525,7 +1525,8 @@ void gather_qmm_rhs_nax(
+     int K,
+     metal::Device& d,
+     const Stream& s,
+-    const std::string mode) {
++    const std::string mode,
++    const std::optional<array>& x_rows_ = std::nullopt) {
+   // Start by normalizing the indices
+   array indices = ensure_row_contiguous(indices_, d, s);
+ 
+@@ -1546,8 +1547,10 @@ void gather_qmm_rhs_nax(
+     return ensure_row_contiguous(new_x, d, s);
+   };
+ 
+-  // Normalize the input arrays
+-  array x = broadcast_with_indices(x_);
++  // Normalize the input arrays. With x_rows, the kernel reads row x_rows[r]
++  // of x for row r of the product, so x is not broadcast.
++  const bool gather_x = x_rows_.has_value();
++  array x = gather_x ? ensure_row_contiguous(x_, d, s) : broadcast_with_indices(x_);
+   array w = ensure_row_contiguous(w_, d, s);
+   array scales = ensure_row_contiguous(scales_, d, s);
+   std::optional<array> biases;
+@@ -1565,7 +1568,20 @@ void gather_qmm_rhs_nax(
+   int bn = 64, bk = 64;
+   int wm = 2, wn = 2;
+ 
+-  const bool align_M = (M % bm) == 0;
++  // Expert-aligned row tiles: each threadgroup multiplies rows of one expert
++  // only, so no weight tile is dequantized for a partial expert segment. Four
++  // simdgroups of 16 rows keep the partial last tile of an expert cheap.
++  // A K block of 128 halves the threadgroup barriers per K.
++  const bool use_tiles = transpose && mode != "affine";
++  if (use_tiles) {
++    bm = 64;
++    bk = (K % 128 == 0) ? 128 : 64;
++    wm = 4;
++    wn = 1;
++  }
++  const int max_tiles = (M + bm - 1) / bm + std::min(E, M);
++
++  const bool align_M = !use_tiles && (M % bm) == 0;
+   const bool align_N = (N % bn) == 0;
+   const bool align_K = (K % bk) == 0;
+ 
+@@ -1598,6 +1614,8 @@ void gather_qmm_rhs_nax(
+       {&align_M, MTL::DataType::DataTypeBool, 200},
+       {&align_N, MTL::DataType::DataTypeBool, 201},
+       {&align_K, MTL::DataType::DataTypeBool, 202},
++      {&use_tiles, MTL::DataType::DataTypeBool, 203},
++      {&gather_x, MTL::DataType::DataTypeBool, 204},
+   };
+ 
+   // And the kernel hash that includes the function constants
+@@ -1611,10 +1629,31 @@ void gather_qmm_rhs_nax(
+       "_align_N_",
+       align_N ? 't' : 'n',
+       "_align_K_",
+-      align_K ? 't' : 'n');
++      align_K ? 't' : 'n',
++      "_tiles_",
++      use_tiles ? 't' : 'n',
++      "_gather_x_",
++      gather_x ? 't' : 'n');
+ 
+-  // Get and set the kernel
+   auto& compute_encoder = metal::get_command_encoder(s);
++
++  // Build the expert-aligned tiles from the sorted indices
++  array tiles({max_tiles, 2}, int32, nullptr, {});
++  if (use_tiles) {
++    tiles.set_data(allocator::malloc(tiles.nbytes()));
++    compute_encoder.add_temporary(tiles);
++    auto tiles_kernel = get_gather_rhs_tiles_kernel(
++        d, "gather_rhs_tiles_bm_" + std::to_string(bm), bm);
++    compute_encoder.set_compute_pipeline_state(tiles_kernel);
++    compute_encoder.set_input_array(indices, 0);
++    compute_encoder.set_output_array(tiles, 1);
++    compute_encoder.set_bytes(M, 2);
++    compute_encoder.set_bytes(max_tiles, 3);
++    compute_encoder.dispatch_threadgroups(
++        MTL::Size(1, 1, 1), MTL::Size(1024, 1, 1));
++  }
++
++  // Get and set the kernel
+   auto kernel = get_gather_qmm_nax_kernel(
+       d,
+       kname,
+@@ -1634,7 +1673,8 @@ void gather_qmm_rhs_nax(
+   compute_encoder.set_compute_pipeline_state(kernel);
+ 
+   MTL::Size group_dims(32, wn, wm);
+-  MTL::Size grid_dims((N + bn - 1) / bn, (M + bm - 1) / bm, 1);
++  MTL::Size grid_dims(
++      (N + bn - 1) / bn, use_tiles ? max_tiles : (M + bm - 1) / bm, 1);
+ 
+   compute_encoder.set_input_array(x, 0);
+   compute_encoder.set_input_array(w, 1);
+@@ -1650,6 +1690,12 @@ void gather_qmm_rhs_nax(
+   compute_encoder.set_bytes(M, c++);
+   compute_encoder.set_bytes(N, c++);
+   compute_encoder.set_bytes(K, c++);
++  if (use_tiles) {
++    compute_encoder.set_input_array(tiles, c++);
++  }
++  if (gather_x) {
++    compute_encoder.set_input_array(ensure_row_contiguous(*x_rows_, d, s), 10);
++  }
+ 
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+ }
+@@ -1984,11 +2030,47 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
+   int vector_limit = transpose_ ? get_qmv_batch_limit(K, N, d) : 4;
+   auto mode = quantization_mode_to_string(mode_);
+ 
++  // With the neural accelerators and expert-aligned tiles (fp modes) the
++  // sorted kernel wins from one row per expert on average: MXFP4 4096x2048
++  // experts, E = 256, 512 rows on M5 Ultra take 92 instead of 148 ms per 47
++  // layers.
++  const int min_rows_per_expert =
++      (metal::is_nax_available() && mode_ != QuantizationMode::Affine) ? 1 : 4;
++
++  // Both flags set: lhs_indices pick rows of x and rhs_indices are sorted.
++  // The expert-aligned NAX kernel reads the x rows directly.
++  if (left_sorted_ && right_sorted_) {
++    if (M == 1 && B >= 16 && B / E >= min_rows_per_expert && transpose_ &&
++        metal::is_nax_available() && mode_ != QuantizationMode::Affine &&
++        K % 64 == 0 && x.dtype() != float32) {
++      gather_qmm_rhs_nax(
++          x,
++          w,
++          scales,
++          biases,
++          global_scale,
++          rhs_indices,
++          out,
++          transpose_,
++          group_size_,
++          bits_,
++          B,
++          N,
++          K,
++          d,
++          s,
++          mode,
++          lhs_indices);
++      return;
++    }
++  }
++
+   // We are walking x in order and w is also in order so we can batch up the
+   // matmuls and reuse reading x and w.
+   //
+   // TODO: Tune 16 and 4 here a bit better.
+-  if (M == 1 && B >= 16 && right_sorted_ == true && B / E >= 4) {
++  if (M == 1 && B >= 16 && right_sorted_ && !left_sorted_ &&
++      B / E >= min_rows_per_expert) {
+     gather_qmm_rhs(
+         x,
+         w,
+diff --git a/mlx/backend/metal/scaled_dot_product_attention.cpp b/mlx/backend/metal/scaled_dot_product_attention.cpp
+index 6ece8c4..d6f09d7 100644
+--- a/mlx/backend/metal/scaled_dot_product_attention.cpp
++++ b/mlx/backend/metal/scaled_dot_product_attention.cpp
+@@ -15,6 +15,15 @@ namespace mlx::core::fast {
+ 
+ namespace {
+ 
++bool use_nax_full_attention(const array& q, const array& v) {
++  int D = q.shape(-1);
++  int V = v.shape(-1);
++  bool dims = (D == V && (D == 64 || D == 96 || D == 128 || D == 256)) ||
++      (D == 192 && V == 128);
++  return metal::is_nax_available() && dims &&
++      (env::enable_tf32() || q.dtype() != float32);
++}
++
+ void sdpa_full_self_attention_nax(
+     const Stream& s,
+     metal::Device& d,
+@@ -25,10 +34,12 @@ void sdpa_full_self_attention_nax(
+     array& o,
+     bool do_causal_,
+     const std::optional<array>& mask,
+-    const std::optional<array>& sinks) {
++    const std::optional<array>& sinks,
++    int window_size) {
+   using namespace mlx::steel;
+ 
+   int bd = q.shape(-1);
++  int bdv = v.shape(-1);
+   int bq = 64;
+   int bk = 32;
+ 
+@@ -79,13 +90,19 @@ void sdpa_full_self_attention_nax(
+   const bool has_mask = mask.has_value();
+   const bool do_causal = do_causal_;
+   const bool has_sinks = sinks.has_value();
++  const bool has_window = window_size > 0;
++  // Row strides equal the head dims, so the kernel can use constant strides.
++  const bool row_packed = bd == 192 && bdv == 128 && q.strides(2) == bd &&
++      k.strides(2) == bd && v.strides(2) == bdv && o.strides(2) == bdv;
+ 
+   metal::MTLFCList func_consts = {
+       {&align_Q, MTL::DataType::DataTypeBool, 200},
+       {&align_K, MTL::DataType::DataTypeBool, 201},
+       {&has_mask, MTL::DataType::DataTypeBool, 300},
+       {&do_causal, MTL::DataType::DataTypeBool, 301},
+-      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
++      {&has_sinks, MTL::DataType::DataTypeBool, 302},
++      {&has_window, MTL::DataType::DataTypeBool, 303},
++      {&row_packed, MTL::DataType::DataTypeBool, 304}};
+ 
+   std::string base_name;
+   concatenate(
+@@ -98,6 +115,7 @@ void sdpa_full_self_attention_nax(
+       bk,
+       "_bd",
+       bd,
++      bdv != bd ? "_bdv" + std::to_string(bdv) : "",
+       "_wm",
+       wm,
+       "_wn",
+@@ -118,7 +136,11 @@ void sdpa_full_self_attention_nax(
+       "_do_causal_",
+       (do_causal ? 't' : 'n'),
+       "_has_sinks_",
+-      (has_sinks ? 't' : 'n'));
++      (has_sinks ? 't' : 'n'),
++      "_has_window_",
++      (has_window ? 't' : 'n'),
++      "_row_packed_",
++      (row_packed ? 't' : 'n'));
+ 
+   auto& compute_encoder = metal::get_command_encoder(s);
+ 
+@@ -131,6 +153,7 @@ void sdpa_full_self_attention_nax(
+       bq,
+       bk,
+       bd,
++      bdv,
+       wm,
+       wn,
+       (has_mask ? *mask : q),
+@@ -168,7 +191,8 @@ void sdpa_full_self_attention_nax(
+       /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
+       /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
+       /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
+-      /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)}};
++      /* int64_t O_strides[3] = */ {o.strides(0), o.strides(1), o.strides(2)},
++      /* int window = */ window_size};
+ 
+   compute_encoder.set_input_array(q, 0);
+   compute_encoder.set_input_array(k, 1);
+@@ -206,7 +230,8 @@ void sdpa_full_self_attention_metal(
+     array& o,
+     bool do_causal_,
+     const std::optional<array>& mask,
+-    const std::optional<array>& sinks) {
++    const std::optional<array>& sinks,
++    int window_size) {
+   int B = q.shape(0);
+   int H = q.shape(1);
+   int D = q.shape(3);
+@@ -215,9 +240,7 @@ void sdpa_full_self_attention_metal(
+   int qL = q.shape(2);
+   int kL = k.shape(2);
+ 
+-  if (metal::is_nax_available() &&
+-      (D == 64 || D == 96 || D == 128 || D == 256) &&
+-      (env::enable_tf32() || q.dtype() != float32)) {
++  if (use_nax_full_attention(q, v)) {
+     return sdpa_full_self_attention_nax(
+         /* const Stream& s = */ s,
+         /* metal::Device& d = */ d,
+@@ -228,7 +251,8 @@ void sdpa_full_self_attention_metal(
+         /* array& o = */ o,
+         /* bool do_causal_ = */ do_causal_,
+         /* const std::optional<array>& mask = */ mask,
+-        /* const std::optional<array>& sinks = */ sinks);
++        /* const std::optional<array>& sinks = */ sinks,
++        /* int window_size = */ window_size);
+   }
+ 
+   // Pad head dims 72 and 80 to 96 to reach the NAX kernel. The added lanes
+@@ -283,7 +307,8 @@ void sdpa_full_self_attention_metal(
+         /* array& o = */ op,
+         /* bool do_causal_ = */ do_causal_,
+         /* const std::optional<array>& mask = */ mask,
+-        /* const std::optional<array>& sinks = */ sinks);
++        /* const std::optional<array>& sinks = */ sinks,
++        /* int window_size = */ window_size);
+ 
+     // Slice the padded lanes back out into o's caller-chosen strides.
+     copy_gpu_inplace(
+@@ -521,6 +546,131 @@ void sdpa_vector(
+   compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+ }
+ 
++// Split-KV decode on the neural accelerators for up to 8 queries per head,
++// with the query heads of each KV head as the rows of one 16-row tile. A
++// boolean mask shared by the heads (left-padded batch caches) is supported.
++bool nax_decode_supported(
++    const array& q,
++    const array& k,
++    const array& v,
++    const std::optional<array>& mask) {
++  int qL = q.shape(2);
++  int gqa_factor = q.shape(1) / k.shape(1);
++  bool mask_ok = !mask ||
++      (mask->ndim() == 4 && mask->dtype() == bool_ &&
++       (mask->shape(1) == 1 || mask->strides(1) == 0));
++  return metal::is_nax_available() && mask_ok && qL <= 8 &&
++      (q.dtype() == float16 || q.dtype() == bfloat16) && gqa_factor > 1 &&
++      gqa_factor <= 16 && q.shape(-1) == 192 && v.shape(-1) == 128;
++}
++
++bool use_nax_decode(
++    const array& q,
++    const array& k,
++    const array& v,
++    const std::optional<array>& mask) {
++  if (!nax_decode_supported(q, k, v, mask)) {
++    return false;
++  }
++  // Measured on M5 Ultra (GQA 16, masked): batched decode from 512 keys, e.g.
++  // 8 x 1152 keys 107 -> 55 us. Short keys (sliding window) stay faster on
++  // the vector kernels.
++  int qL = q.shape(2);
++  int gqa_factor = q.shape(1) / k.shape(1);
++  return k.shape(2) >= 4096 || qL * gqa_factor > 32 ||
++      (q.shape(0) >= 2 && k.shape(2) >= 512);
++}
++
++bool use_nax_decode(
++    const array& q,
++    const array& k,
++    const array& v,
++    bool has_arr_mask) {
++  return !has_arr_mask && use_nax_decode(q, k, v, std::nullopt);
++}
++
++void sdpa_nax_decode_pass1(
++    const Stream& s,
++    metal::Device& d,
++    const array& q,
++    const array& k,
++    const array& v,
++    float scale,
++    bool do_causal,
++    const std::optional<array>& mask,
++    const std::optional<array>& sinks,
++    int blocks,
++    array& intermediate,
++    array& sums,
++    array& maxs) {
++  using namespace mlx::steel;
++  constexpr int bk = 32;
++  int bd = q.shape(-1);
++  int bdv = v.shape(-1);
++  int kL = k.shape(2);
++  int chunk = (kL + blocks - 1) / blocks;
++  chunk = ((chunk + bk - 1) / bk) * bk;
++
++  std::string kname;
++  concatenate(
++      kname,
++      "steel_attention_decode_",
++      type_to_name(q),
++      "_bk",
++      bk,
++      "_bd",
++      bd,
++      "_bdv",
++      bdv);
++  const bool has_sinks = sinks.has_value();
++  const bool has_mask = mask.has_value();
++  metal::MTLFCList func_consts = {
++      {&has_mask, MTL::DataType::DataTypeBool, 300},
++      {&do_causal, MTL::DataType::DataTypeBool, 301},
++      {&has_sinks, MTL::DataType::DataTypeBool, 302}};
++  std::string hash_name = kname + (has_sinks ? "_sinks" : "_nosinks") +
++      (do_causal ? "_causal" : "") + (has_mask ? "_mask" : "");
++  auto kernel = get_steel_attention_nax_decode_kernel(
++      d, kname, hash_name, func_consts, q, bk, bd, bdv);
++
++  AttnDecodeParams params{
++      /* int kL = */ kL,
++      /* int qL = */ int(q.shape(2)),
++      /* int gqa_factor = */ int(q.shape(1) / k.shape(1)),
++      /* float scale = */ scale,
++      /* int chunk = */ chunk,
++      /* int blocks = */ blocks,
++      /* int64_t Q_strides[3] = */ {q.strides(0), q.strides(1), q.strides(2)},
++      /* int64_t K_strides[3] = */ {k.strides(0), k.strides(1), k.strides(2)},
++      /* int64_t V_strides[3] = */ {v.strides(0), v.strides(1), v.strides(2)},
++      /* int64_t M_strides[3] = */ {0, 0, 0}};
++  if (has_mask) {
++    auto& m = *mask;
++    params.M_strides[0] = m.shape(0) > 1 ? m.strides(0) : 0;
++    params.M_strides[1] = m.shape(2) > 1 ? m.strides(2) : 0;
++    params.M_strides[2] = m.shape(3) > 1 ? m.strides(3) : 0;
++  }
++
++  auto& compute_encoder = metal::get_command_encoder(s);
++  compute_encoder.set_compute_pipeline_state(kernel);
++  compute_encoder.set_input_array(q, 0);
++  compute_encoder.set_input_array(k, 1);
++  compute_encoder.set_input_array(v, 2);
++  compute_encoder.set_output_array(intermediate, 3);
++  compute_encoder.set_output_array(sums, 4);
++  compute_encoder.set_output_array(maxs, 5);
++  compute_encoder.set_bytes(params, 6);
++  if (has_sinks) {
++    compute_encoder.set_input_array(*sinks, 7);
++  }
++  if (has_mask) {
++    compute_encoder.set_input_array(*mask, 8);
++  }
++  MTL::Size grid_dims(blocks, k.shape(1), q.shape(0));
++  MTL::Size group_dims(32 * q.shape(2), 1, 1);
++  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
++}
++
+ void sdpa_vector_2pass(
+     const Stream& s,
+     metal::Device& d,
+@@ -532,17 +682,22 @@ void sdpa_vector_2pass(
+     bool do_causal,
+     const std::optional<array>& mask,
+     const std::optional<array>& sinks) {
++  const bool nax_decode = use_nax_decode(q, k, v, mask);
++
+   // Set the kernel name
+   std::string kname;
+   kname.reserve(64);
+   kname += "sdpa_vector_2pass_1";
+   int gqa_factor = q.shape(1) / k.shape(1);
++  int qk_dim = q.shape(-1);
++  int v_dim = v.shape(-1);
+   bool gqa_dims =
+-      (gqa_factor == 8 && (q.shape(-1) == 64 || q.shape(-1) == 128)) ||
+-      ((gqa_factor == 12 || gqa_factor == 16) && q.shape(-1) == 128);
++      (qk_dim == v_dim &&
++       ((gqa_factor == 8 && (qk_dim == 64 || qk_dim == 128)) ||
++        ((gqa_factor == 12 || gqa_factor == 16) && qk_dim == 128))) ||
++      (gqa_factor == 16 && qk_dim == 192 && v_dim == 128);
+   if (!mask && !sinks && q.shape(2) == 1 &&
+-      q.shape(1) == gqa_factor * k.shape(1) && q.shape(-1) == v.shape(-1) &&
+-      gqa_dims && k.shape(2) >= 8192) {
++      q.shape(1) == gqa_factor * k.shape(1) && gqa_dims && k.shape(2) >= 8192) {
+     kname += "_gqa_";
+     kname += std::to_string(gqa_factor);
+   }
+@@ -590,6 +745,10 @@ void sdpa_vector_2pass(
+       blocks = 32;
+     }
+   }
++  if (nax_decode) {
++    // Measured on M5 Ultra: long chunks per threadgroup stream the keys best.
++    blocks = N < 8192 ? 32 : (N < 65536 ? 256 : 64);
++  }
+   if (int blocks_env = env::get_var("MLX_SDPA_BLOCKS", 0); blocks_env > 0) {
+     // The 2-pass reduction consumes the partials in simd-width (32) chunks
+     // and silently drops the tail otherwise, so round up to a multiple of 32.
+@@ -621,64 +780,82 @@ void sdpa_vector_2pass(
+   compute_encoder.add_temporary(sums);
+   compute_encoder.add_temporary(maxs);
+ 
+-  bool has_mask = mask.has_value();
+-  bool bool_mask = has_mask && (*mask).dtype() == bool_;
+-  bool float_mask = has_mask && !bool_mask;
+-  bool query_transposed = !q.flags().row_contiguous;
+-  bool has_sinks = sinks.has_value();
+-  metal::MTLFCList func_consts = {
+-      {&has_mask, MTL::DataType::DataTypeBool, 20},
+-      {&query_transposed, MTL::DataType::DataTypeBool, 21},
+-      {&do_causal, MTL::DataType::DataTypeBool, 22},
+-      {&bool_mask, MTL::DataType::DataTypeBool, 23},
+-      {&float_mask, MTL::DataType::DataTypeBool, 24},
+-      {&has_sinks, MTL::DataType::DataTypeBool, 25},
+-      {&blocks, MTL::DataType::DataTypeInt, 26},
+-  };
+-  std::string hash_name = kname;
+-  hash_name += has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
+-  hash_name += query_transposed ? "_qt" : "_qnt";
+-  hash_name += do_causal ? "_c" : "_nc";
+-  hash_name += has_sinks ? "_sinks_" : "_nosinks_";
+-  hash_name += std::to_string(blocks);
+-
+-  // Get the kernel
+-  auto kernel = d.get_kernel(kname, hash_name, func_consts);
+-  check_kernel_threadgroup_size(kernel, group_dims, hash_name);
+-
+-  compute_encoder.set_compute_pipeline_state(kernel);
++  if (nax_decode) {
++    sdpa_nax_decode_pass1(
++        s,
++        d,
++        q,
++        k,
++        v,
++        scale,
++        do_causal,
++        mask,
++        sinks,
++        blocks,
++        intermediate,
++        sums,
++        maxs);
++  } else {
++    bool has_mask = mask.has_value();
++    bool bool_mask = has_mask && (*mask).dtype() == bool_;
++    bool float_mask = has_mask && !bool_mask;
++    bool query_transposed = !q.flags().row_contiguous;
++    bool has_sinks = sinks.has_value();
++    metal::MTLFCList func_consts = {
++        {&has_mask, MTL::DataType::DataTypeBool, 20},
++        {&query_transposed, MTL::DataType::DataTypeBool, 21},
++        {&do_causal, MTL::DataType::DataTypeBool, 22},
++        {&bool_mask, MTL::DataType::DataTypeBool, 23},
++        {&float_mask, MTL::DataType::DataTypeBool, 24},
++        {&has_sinks, MTL::DataType::DataTypeBool, 25},
++        {&blocks, MTL::DataType::DataTypeInt, 26},
++    };
++    std::string hash_name = kname;
++    hash_name +=
++        has_mask ? (bool_mask ? "_boolmask" : "_floatmask") : "_nomask";
++    hash_name += query_transposed ? "_qt" : "_qnt";
++    hash_name += do_causal ? "_c" : "_nc";
++    hash_name += has_sinks ? "_sinks_" : "_nosinks_";
++    hash_name += std::to_string(blocks);
++
++    // Get the kernel
++    auto kernel = d.get_kernel(kname, hash_name, func_consts);
++    check_kernel_threadgroup_size(kernel, group_dims, hash_name);
++
++    compute_encoder.set_compute_pipeline_state(kernel);
++
++    // Set its arguments
++    compute_encoder.set_input_array(q, 0);
++    compute_encoder.set_input_array(k, 1);
++    compute_encoder.set_input_array(v, 2);
++    compute_encoder.set_output_array(intermediate, 3);
++    compute_encoder.set_output_array(sums, 4);
++    compute_encoder.set_output_array(maxs, 5);
++    compute_encoder.set_bytes(N, 7);
++    compute_encoder.set_bytes(k_head_stride, 8);
++    compute_encoder.set_bytes(k_seq_stride, 9);
++    compute_encoder.set_bytes(v_head_stride, 10);
++    compute_encoder.set_bytes(v_seq_stride, 11);
++    compute_encoder.set_bytes(scale, 12);
++    if (has_mask) {
++      auto& m = *mask;
++      compute_encoder.set_input_array(m, 13 + float_mask);
++      int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
++      int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
++      int32_t head_stride =
++          m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
++      compute_encoder.set_bytes(kv_seq_stride, 15);
++      compute_encoder.set_bytes(q_seq_stride, 16);
++      compute_encoder.set_bytes(head_stride, 17);
++    }
++    if (has_sinks) {
++      compute_encoder.set_input_array(*sinks, 18);
++    }
+ 
+-  // Set its arguments
+-  compute_encoder.set_input_array(q, 0);
+-  compute_encoder.set_input_array(k, 1);
+-  compute_encoder.set_input_array(v, 2);
+-  compute_encoder.set_output_array(intermediate, 3);
+-  compute_encoder.set_output_array(sums, 4);
+-  compute_encoder.set_output_array(maxs, 5);
+-  compute_encoder.set_bytes(N, 7);
+-  compute_encoder.set_bytes(k_head_stride, 8);
+-  compute_encoder.set_bytes(k_seq_stride, 9);
+-  compute_encoder.set_bytes(v_head_stride, 10);
+-  compute_encoder.set_bytes(v_seq_stride, 11);
+-  compute_encoder.set_bytes(scale, 12);
+-  if (has_mask) {
+-    auto& m = *mask;
+-    compute_encoder.set_input_array(m, 13 + float_mask);
+-    int32_t kv_seq_stride = m.shape(3) > 1 ? m.strides(3) : 0;
+-    int32_t q_seq_stride = m.shape(2) > 1 ? m.strides(2) : 0;
+-    int32_t head_stride =
+-        m.shape(1) > 1 ? m.strides(1) : (m.shape(0) > 1 ? m.strides(0) : 0);
+-    compute_encoder.set_bytes(kv_seq_stride, 15);
+-    compute_encoder.set_bytes(q_seq_stride, 16);
+-    compute_encoder.set_bytes(head_stride, 17);
+-  }
+-  if (has_sinks) {
+-    compute_encoder.set_input_array(*sinks, 18);
++    // Launch
++    compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+   }
+ 
+-  // Launch
+-  compute_encoder.dispatch_threadgroups(grid_dims, group_dims);
+-
+   // Final pass
+   kname.clear();
+   kname = "sdpa_vector_2pass_2_";
+@@ -687,7 +864,7 @@ void sdpa_vector_2pass(
+   kname += std::to_string(v.shape(-1));
+ 
+   // Get the kernel
+-  kernel = d.get_kernel(kname);
++  auto kernel = d.get_kernel(kname);
+   compute_encoder.set_compute_pipeline_state(kernel);
+ 
+   // Set its arguments
+@@ -712,6 +889,7 @@ std::tuple<bool, std::string> has_fused_kernel(
+     bool has_arr_mask,
+     bool do_causal,
+     bool output_logsumexp,
++    int window_size,
+     Stream s) {
+   if (s.device != Device::gpu) {
+     return {false, "the fused kernels require a GPU (Metal) stream."};
+@@ -733,15 +911,24 @@ std::tuple<bool, std::string> has_fused_kernel(
+ 
+   std::ostringstream msg;
+   if (query_sequence_length > 8) {
+-    const bool supported_head_dim = query_head_dim == value_head_dim &&
+-        (query_head_dim == 64 || query_head_dim == 72 || query_head_dim == 80 ||
+-         query_head_dim == 96 || query_head_dim == 128 ||
+-         query_head_dim == 192 || query_head_dim == 256);
++    const bool use_nax = use_nax_full_attention(q, v);
++    const bool supported_head_dim = use_nax ||
++        (query_head_dim == value_head_dim &&
++         (query_head_dim == 64 || query_head_dim == 72 ||
++          query_head_dim == 80 || query_head_dim == 96 ||
++          query_head_dim == 128 || query_head_dim == 192 ||
++          query_head_dim == 256));
+     if (!supported_head_dim) {
+       msg << "the full attention kernel supports head dims "
+           << "{64, 72, 80, 96, 128, 192, 256} with matching query/value head "
+-          << "dims; got query head dim " << query_head_dim
+-          << " and value head dim " << value_head_dim << ".";
++          << "dims, or query head dim 192 with value head dim 128 on NAX; got "
++          << "query head dim " << query_head_dim << " and value head dim "
++          << value_head_dim << ".";
++      return {false, msg.str()};
++    }
++    if (window_size > 0 && !use_nax) {
++      msg << "the full attention kernel supports a sliding window only on "
++          << "NAX devices with head dims {64, 96, 128, 256} or 192/128.";
+       return {false, msg.str()};
+     }
+     if (has_mask && !has_arr_mask &&
+@@ -753,6 +940,13 @@ std::tuple<bool, std::string> has_fused_kernel(
+       return {false, msg.str()};
+     }
+   } else {
++    if (window_size > 0 &&
++        key_sequence_length - query_sequence_length + 1 > window_size) {
++      msg << "the vector attention kernel does not support a sliding window "
++          << "shorter than the keys; got window " << window_size
++          << " and key length " << key_sequence_length << ".";
++      return {false, msg.str()};
++    }
+     const bool supported_head_dim =
+         (query_head_dim == value_head_dim &&
+          (query_head_dim == 64 || query_head_dim == 96 ||
+@@ -774,7 +968,8 @@ std::tuple<bool, std::string> has_fused_kernel(
+           << ".";
+       return {false, msg.str()};
+     }
+-    if (query_sequence_length * gqa_factor > 32) {
++    if (query_sequence_length * gqa_factor > 32 &&
++        !use_nax_decode(q, k, v, has_arr_mask)) {
+       msg << "the vector attention kernel requires the query length times "
+           << "the GQA factor to be at most 32; got query length "
+           << query_sequence_length << " and GQA factor " << gqa_factor << ".";
+@@ -826,9 +1021,18 @@ bool ScaledDotProductAttention::use_fallback(
+     bool is_training,
+     bool output_logsumexp,
+     bool force_fused,
++    int window_size,
+     Stream s) {
+   auto [has_fused, reason] = has_fused_kernel(
+-      q, k, v, has_mask, has_arr_mask, do_causal, output_logsumexp, s);
++      q,
++      k,
++      v,
++      has_mask,
++      has_arr_mask,
++      do_causal,
++      output_logsumexp,
++      window_size,
++      s);
+   if (force_fused) {
+     if (!has_fused) {
+       std::ostringstream msg;
+@@ -864,6 +1068,9 @@ bool ScaledDotProductAttention::use_fallback(
+ 
+   // Unfused path is faster for following shapes.
+   if (query_sequence_length > 8) {
++    if (query_head_dim == 192 && value_head_dim == 128) {
++      return false;
++    }
+     return query_head_dim == 192 || query_head_dim == 256;
+   } else {
+     return query_head_dim == value_head_dim && query_head_dim == 192;
+@@ -967,8 +1174,16 @@ void ScaledDotProductAttention::eval_gpu(
+           (strides[0] == strides[1] * shape[1]);
+     };
+ 
++    // The NAX decode kernel reads a head-broadcast mask as it is.
++    const bool nax_decode = use_nax_decode(
++        q,
++        k,
++        v,
++        has_arr_mask ? std::optional<array>{inputs[3]} : std::nullopt);
+     auto mask = has_arr_mask
+-        ? std::optional<array>{copy_unless(mask_copy_unless, inputs[3])}
++        ? std::optional<array>{nax_decode
++                                   ? inputs[3]
++                                   : copy_unless(mask_copy_unless, inputs[3])}
+         : std::nullopt;
+ 
+     // We route to the 2 pass fused attention if
+@@ -977,7 +1192,7 @@ void ScaledDotProductAttention::eval_gpu(
+     bool do_causal = do_causal_ && q.shape(2) > 1;
+     char devc = d.get_architecture().back();
+     if (((devc == 'd' || devc == 's') && k.shape(2) >= 1024) ||
+-        (k.shape(1) < q.shape(1) && k.shape(2) >= 4096)) {
++        (k.shape(1) < q.shape(1) && k.shape(2) >= 4096) || nax_decode) {
+       sdpa_vector_2pass(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
+     } else {
+       sdpa_vector(s, d, q, k, v, o, scale_, do_causal, mask, sinks);
+@@ -1013,7 +1228,7 @@ void ScaledDotProductAttention::eval_gpu(
+         : std::nullopt;
+ 
+     sdpa_full_self_attention_metal(
+-        s, d, q, k, v, scale_, o, do_causal_, mask, sinks);
++        s, d, q, k, v, scale_, o, do_causal_, mask, sinks, window_size_);
+   }
+ 
+   metal::get_command_encoder(s).add_temporaries(std::move(copies));
+diff --git a/mlx/backend/no_gpu/primitives.cpp b/mlx/backend/no_gpu/primitives.cpp
+index c37515f..712e5a4 100644
+--- a/mlx/backend/no_gpu/primitives.cpp
++++ b/mlx/backend/no_gpu/primitives.cpp
+@@ -33,6 +33,7 @@ bool fast::ScaledDotProductAttention::use_fallback(
+     bool is_training,
+     bool output_logsumexp,
+     bool force_fused,
++    int window_size,
+     Stream s) {
+   if (force_fused) {
+     throw std::invalid_argument(
+diff --git a/mlx/fast.cpp b/mlx/fast.cpp
+index add78fa..c9608cb 100644
+--- a/mlx/fast.cpp
++++ b/mlx/fast.cpp
+@@ -720,6 +720,7 @@ array scaled_dot_product_attention(
+     std::optional<array> mask_arr /* = {} */,
+     const std::optional<array>& sinks /* = {} */,
+     bool force_fused /* = false */,
++    int window_size /* = -1 */,
+     StreamOrDevice s /* = {} */) {
+   for (const auto& tensor : {queries, keys, values}) {
+     if (tensor.ndim() != 4) {
+@@ -737,6 +738,14 @@ array scaled_dot_product_attention(
+     throw std::invalid_argument(msg.str());
+   }
+ 
++  if (window_size == 0 || window_size < -1) {
++    std::ostringstream msg;
++    msg << "[scaled_dot_product_attention] window_size must be positive or -1 "
++        << "(no window); got " << window_size << ".";
++    throw std::invalid_argument(msg.str());
++  }
++  bool has_window = window_size > 0;
++
+   bool do_causal = false;
+   bool has_mask = false;
+   bool has_arr_mask = false;
+@@ -822,6 +831,7 @@ array scaled_dot_product_attention(
+                    do_causal,
+                    has_sinks,
+                    has_arr_mask,
++                   window_size,
+                    s](const std::vector<array>& inputs) {
+     auto q = multiply(array(scale, inputs[0].dtype()), inputs[0], s);
+     int n_repeats = n_q_heads / n_kv_heads;
+@@ -833,6 +843,15 @@ array scaled_dot_product_attention(
+       v = expand_dims(v, 2, s);
+     }
+     auto scores = matmul(q, swapaxes(k, -1, -2, s), s);
++    if (window_size > 0) {
++      int kL = k.shape(-2);
++      int qL = q.shape(-2);
++      auto q_idx = expand_dims(arange(kL - qL, kL, s), 1, s);
++      auto k_idx = expand_dims(arange(0, kL, s), 0, s);
++      auto window = less(subtract(q_idx, k_idx, s), array(window_size), s);
++      scores = where(
++          window, scores, array(finfo(scores.dtype()).min, scores.dtype()), s);
++    }
+     if (has_arr_mask || do_causal) {
+       // Mask must be broadcast-compatible with [B, n_q_heads, L_q, L_kv]
+       auto make_or_fetch_mask = [&]() {
+@@ -925,7 +944,8 @@ array scaled_dot_product_attention(
+   }
+ 
+   bool is_training = detail::in_grad_tracing();
+-  bool has_fast_vjp = !ScaledDotProductAttentionVJP::use_fallback(q, stream);
++  bool has_fast_vjp =
++      !has_window && !ScaledDotProductAttentionVJP::use_fallback(q, stream);
+   bool output_logsumexp = is_training && has_fast_vjp;
+   if (!ScaledDotProductAttention::use_fallback(
+           q,
+@@ -937,6 +957,7 @@ array scaled_dot_product_attention(
+           is_training,
+           output_logsumexp,
+           force_fused,
++          window_size,
+           stream)) {
+     if (has_bool_mask && !ScaledDotProductAttention::supports_bool_mask()) {
+       // Convert bool mask to additive mask.
+@@ -955,7 +976,8 @@ array scaled_dot_product_attention(
+         do_causal,
+         has_sinks,
+         output_logsumexp,
+-        force_fused);
++        force_fused,
++        window_size);
+     if (output_logsumexp) {
+       return array::make_arrays(
+           {std::move(out_shape), Shape{q.shape(0), q.shape(1), q.shape(2), 1}},
+@@ -1022,7 +1044,8 @@ bool ScaledDotProductAttention::is_equivalent(const Primitive& other) const {
+   return scale_ == a_other.scale_ && do_causal_ == a_other.do_causal_ &&
+       has_sinks_ == a_other.has_sinks_ &&
+       output_logsumexp_ == a_other.output_logsumexp_ &&
+-      force_fused_ == a_other.force_fused_;
++      force_fused_ == a_other.force_fused_ &&
++      window_size_ == a_other.window_size_;
+ }
+ 
+ bool ScaledDotProductAttentionVJP::is_equivalent(const Primitive& other) const {
+diff --git a/mlx/fast.h b/mlx/fast.h
+index 14a46de..715a62f 100644
+--- a/mlx/fast.h
++++ b/mlx/fast.h
+@@ -58,6 +58,7 @@ MLX_API array scaled_dot_product_attention(
+     std::optional<array> mask_arr = {},
+     const std::optional<array>& sinks = {},
+     bool force_fused = false,
++    int window_size = -1,
+     StreamOrDevice s = {});
+ 
+ MLX_API std::vector<array> gated_delta_update(
+diff --git a/mlx/fast_primitives.h b/mlx/fast_primitives.h
+index cef13bb..e6a64e0 100644
+--- a/mlx/fast_primitives.h
++++ b/mlx/fast_primitives.h
+@@ -274,13 +274,15 @@ class ScaledDotProductAttention : public Custom {
+       bool do_causal,
+       bool has_sinks,
+       bool output_logsumexp,
+-      bool force_fused)
++      bool force_fused,
++      int window_size = -1)
+       : Custom(stream, std::move(fallback)),
+         scale_(scale),
+         do_causal_(do_causal),
+         has_sinks_(has_sinks),
+         output_logsumexp_(output_logsumexp),
+-        force_fused_(force_fused) {}
++        force_fused_(force_fused),
++        window_size_(window_size) {}
+ 
+   static bool use_fallback(
+       const array& q,
+@@ -292,6 +294,7 @@ class ScaledDotProductAttention : public Custom {
+       bool is_training,
+       bool output_logsumexp,
+       bool force_fused,
++      int window_size,
+       Stream s);
+   static bool supports_bool_mask();
+ 
+@@ -320,7 +323,8 @@ class ScaledDotProductAttention : public Custom {
+         do_causal_,
+         has_sinks_,
+         output_logsumexp_,
+-        force_fused_);
++        force_fused_,
++        window_size_);
+   }
+ 
+  private:
+@@ -329,6 +333,7 @@ class ScaledDotProductAttention : public Custom {
+   bool has_sinks_;
+   bool output_logsumexp_;
+   bool force_fused_;
++  int window_size_;
+ };
+ 
+ class ScaledDotProductAttentionVJP : public Custom {
+diff --git a/mlx/ops.cpp b/mlx/ops.cpp
+index 95010eb..eb42672 100644
+--- a/mlx/ops.cpp
++++ b/mlx/ops.cpp
+@@ -5623,14 +5623,16 @@ array gather_qmm(
+   return array(
+       std::move(out_shape),
+       out_type,
++      // With both indices and sorted_indices, both flags are set: the rhs
++      // indices are sorted and the lhs indices pick rows of x.
+       std::make_shared<GatherQMM>(
+           to_stream(s),
+           group_size,
+           bits,
+           qmode,
+           transpose,
+-          sorted_indices && !rhs_indices_,
+-          sorted_indices && !lhs_indices_),
++          sorted_indices && (!rhs_indices_ || lhs_indices_),
++          sorted_indices && (!lhs_indices_ || rhs_indices_)),
+       std::move(inputs));
+ }
+ 
+diff --git a/mlx/primitives.cpp b/mlx/primitives.cpp
+index f046670..f3e6e46 100644
+--- a/mlx/primitives.cpp
++++ b/mlx/primitives.cpp
+@@ -3762,7 +3762,7 @@ std::vector<array> GatherQMM::vjp(
+           global_scale,
+           sorted,
+           stream());
+-      if (sorted && no_broadcast) {
++      if (sorted && no_broadcast && !(left_sorted_ && right_sorted_)) {
+         vjps.push_back(g);
+       } else {
+         vjps.push_back(reshape(
+diff --git a/python/src/fast.cpp b/python/src/fast.cpp
+index c388980..ef8b481 100644
+--- a/python/src/fast.cpp
++++ b/python/src/fast.cpp
+@@ -265,7 +265,9 @@ void init_fast(nb::module_& parent_module) {
+          const std::variant<std::monostate, std::string, mx::array>& mask,
+          const std::optional<mx::array>& sinks,
+          bool force_fused,
++         std::optional<int> window_size_opt,
+          mx::StreamOrDevice s) {
++        int window_size = window_size_opt.value_or(-1);
+         bool has_mask = !std::holds_alternative<std::monostate>(mask);
+         bool has_str_mask =
+             has_mask && std::holds_alternative<std::string>(mask);
+@@ -289,6 +291,7 @@ void init_fast(nb::module_& parent_module) {
+                 std::nullopt,
+                 sinks,
+                 force_fused,
++                window_size,
+                 s);
+           } else {
+             auto mask_arr = std::get<mx::array>(mask);
+@@ -301,12 +304,22 @@ void init_fast(nb::module_& parent_module) {
+                 mask_arr,
+                 sinks,
+                 force_fused,
++                window_size,
+                 s);
+           }
+ 
+         } else {
+           return mx::fast::scaled_dot_product_attention(
+-              queries, keys, values, scale, "", {}, sinks, force_fused, s);
++              queries,
++              keys,
++              values,
++              scale,
++              "",
++              {},
++              sinks,
++              force_fused,
++              window_size,
++              s);
+         }
+       },
+       "q"_a,
+@@ -317,9 +330,10 @@ void init_fast(nb::module_& parent_module) {
+       "mask"_a = nb::none(),
+       "sinks"_a = nb::none(),
+       "force_fused"_a = false,
++      "window_size"_a = nb::none(),
+       "stream"_a = nb::none(),
+       nb::sig(
+-          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float,  mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, stream: StreamOrDevice = None) -> array"),
++          "def scaled_dot_product_attention(q: array, k: array, v: array, *, scale: float,  mask: None | str | array = None, sinks: array | None = None, force_fused: bool = False, window_size: int | None = None, stream: StreamOrDevice = None) -> array"),
+       R"pbdoc(
+         A fast implementation of multi-head attention: ``O = softmax(Q @ K.T, dim=-1) @ V``.
+ 
+@@ -366,6 +380,10 @@ void init_fast(nb::module_& parent_module) {
+                fused kernel is available. For certain configurations this would
+                result in slower kernel getting used but can reduce memory
+                consumption. Default: ``False``.
++            window_size (int, optional): If given, query ``i`` only attends to
++               keys ``j`` with ``i - j < window_size``, where query positions
++               use the same lower-right alignment as ``"causal"``. It is
++               applied in addition to ``mask``. Default: ``None``.
+ 
+         Returns:
+             array: The output array.
+diff --git a/python/src/ops.cpp b/python/src/ops.cpp
+index a36b63b..889c3e6 100644
+--- a/python/src/ops.cpp
++++ b/python/src/ops.cpp
+@@ -4868,7 +4868,8 @@ void init_ops(nb::module_& m) {
+               ``nvfp4`` quantization of ``w``. Only supported on the GPU.
+               Default: ``None``.
+             sorted_indices (bool, optional): May allow a faster implementation
+-              if the passed indices are sorted. Default: ``False``.
++              if the passed indices are sorted. If both indices are passed,
++              only ``rhs_indices`` needs to be sorted. Default: ``False``.
+ 
+         Returns:
+             array: The result of the multiplication of ``x`` with ``w``
+diff --git a/python/tests/test_fast_sdpa.py b/python/tests/test_fast_sdpa.py
+index fefe732..9a5c29a 100644
+--- a/python/tests/test_fast_sdpa.py
++++ b/python/tests/test_fast_sdpa.py
+@@ -1062,6 +1062,134 @@ class TestFastSDPA(mlx_tests.MLXTestCase):
+                         tolerance = {"rtol": 1e-2, "atol": 1e-2}
+                     self.assertTrue(mx.allclose(ref, out, **tolerance))
+ 
++    def test_sdpa_window(self):
++        def window_mask(qL, kL, window, causal):
++            q_idx = mx.arange(kL - qL, kL)[:, None]
++            k_idx = mx.arange(kL)[None]
++            mask = (q_idx - k_idx) < window
++            if causal:
++                mask = mask & (q_idx >= k_idx)
++            return mask
++
++        for (qL, kL, D, V, H, kH, window, causal, sinks, dtype) in [
++            (256, 383, 192, 128, 16, 2, 128, True, True, mx.float16),
++            (300, 300, 192, 128, 8, 4, 64, True, False, mx.bfloat16),
++            (130, 500, 128, 128, 8, 2, 100, True, True, mx.float16),
++            (100, 100, 64, 64, 4, 4, 33, False, False, mx.float16),
++            (4, 300, 192, 128, 16, 2, 64, True, True, mx.float16),
++            (1, 128, 192, 128, 16, 2, 128, False, True, mx.float16),
++            (65, 200, 64, 64, 4, 1, 50, True, False, mx.float32),
++        ]:
++            with self.subTest(qL=qL, kL=kL, D=D, V=V, window=window):
++                mx.random.seed(0)
++                q = mx.random.normal((1, H, qL, D)).astype(dtype)
++                k = mx.random.normal((1, kH, kL, D)).astype(dtype)
++                v = mx.random.normal((1, kH, kL, V)).astype(dtype)
++                s = mx.random.normal((H,)).astype(dtype) if sinks else None
++                scale = D**-0.5
++                ref = mlx_ref_attn(
++                    q.astype(mx.float32),
++                    k.astype(mx.float32),
++                    v.astype(mx.float32),
++                    scale=scale,
++                    mask=window_mask(qL, kL, window, causal),
++                    sinks=None if s is None else s.astype(mx.float32),
++                )
++                out = mx.fast.scaled_dot_product_attention(
++                    q,
++                    k,
++                    v,
++                    scale=scale,
++                    mask="causal" if causal else None,
++                    sinks=s,
++                    window_size=window,
++                )
++                self.assertTrue(mx.allclose(ref, out, rtol=1e-2, atol=1e-2))
++
++        with self.assertRaises(ValueError):
++            mx.fast.scaled_dot_product_attention(
++                q, k, v, scale=1.0, mask="causal", window_size=0
++            )
++
++    def test_sdpa_vector_long_qk192_v128(self):
++        # Long-KV single-query decode with query head dim 192, value 128
++        for B, Hq, Hk, kL, sinks, dtype in [
++            (1, 64, 4, 4096, False, mx.bfloat16),
++            (1, 64, 4, 9001, True, mx.float16),
++            (2, 32, 4, 5000, False, mx.bfloat16),
++            (1, 16, 8, 8192, True, mx.bfloat16),
++        ]:
++            with self.subTest(B=B, Hq=Hq, Hk=Hk, kL=kL, sinks=sinks):
++                mx.random.seed(0)
++                q = mx.random.normal((B, Hq, 1, 192)).astype(dtype)
++                k = mx.random.normal((B, Hk, kL, 192)).astype(dtype)
++                v = mx.random.normal((B, Hk, kL, 128)).astype(dtype)
++                s = mx.random.normal((Hq,)).astype(dtype) if sinks else None
++                ref = mlx_ref_attn(
++                    q.astype(mx.float32),
++                    k.astype(mx.float32),
++                    v.astype(mx.float32),
++                    scale=192**-0.5,
++                    sinks=None if s is None else s.astype(mx.float32),
++                )
++                out = mx.fast.scaled_dot_product_attention(
++                    q, k, v, scale=192**-0.5, sinks=s
++                )
++                self.assertTrue(mx.allclose(ref, out, rtol=1e-2, atol=2e-3))
++
++    def test_sdpa_multi_query_qk192_v128(self):
++        # A few causal queries against a long KV (speculative decoding verify)
++        for B, Hq, Hk, qL, kL in [
++            (1, 64, 4, 3, 1000),
++            (1, 64, 4, 4, 5000),
++            (2, 32, 4, 8, 3000),
++        ]:
++            with self.subTest(B=B, qL=qL, kL=kL):
++                mx.random.seed(0)
++                q = mx.random.normal((B, Hq, qL, 192)).astype(mx.bfloat16)
++                k = mx.random.normal((B, Hk, kL, 192)).astype(mx.bfloat16)
++                v = mx.random.normal((B, Hk, kL, 128)).astype(mx.bfloat16)
++                ref = mlx_ref_attn(
++                    q.astype(mx.float32),
++                    k.astype(mx.float32),
++                    v.astype(mx.float32),
++                    scale=192**-0.5,
++                    mask="causal",
++                )
++                out = mx.fast.scaled_dot_product_attention(
++                    q, k, v, scale=192**-0.5, mask="causal"
++                )
++                self.assertTrue(mx.allclose(ref, out, rtol=1e-2, atol=2e-3))
++
++    def test_sdpa_full_qk192_v128(self):
++        for qL, kL, mask, sinks in [
++            (128, 128, "causal", False),
++            (200, 1000, "causal", False),
++            (256, 256, None, True),
++            (97, 97, "array", True),
++        ]:
++            with self.subTest(qL=qL, kL=kL, mask=mask, sinks=sinks):
++                mx.random.seed(0)
++                q = mx.random.normal((2, 32, qL, 192)).astype(mx.float16)
++                k = mx.random.normal((2, 4, kL, 192)).astype(mx.float16)
++                v = mx.random.normal((2, 4, kL, 128)).astype(mx.float16)
++                s = mx.random.normal((32,)).astype(mx.float16) if sinks else None
++                if mask == "array":
++                    mask = mx.random.uniform(shape=(qL, kL)) < 0.8
++                ref = mlx_ref_attn(
++                    q.astype(mx.float32),
++                    k.astype(mx.float32),
++                    v.astype(mx.float32),
++                    scale=192**-0.5,
++                    mask=mask,
++                    sinks=None if s is None else s.astype(mx.float32),
++                )
++                out = mx.fast.scaled_dot_product_attention(
++                    q, k, v, scale=192**-0.5, mask=mask, sinks=s
++                )
++                self.assertEqual(out.shape, (2, 32, qL, 128))
++                self.assertTrue(mx.allclose(ref, out, rtol=1e-2, atol=1e-2))
++
+ 
+ if __name__ == "__main__":
+     mlx_tests.MLXTestRunner(failfast=True)
+diff --git a/python/tests/test_quantized.py b/python/tests/test_quantized.py
+index 7a55474..ecf4032 100644
+--- a/python/tests/test_quantized.py
++++ b/python/tests/test_quantized.py
+@@ -1916,6 +1916,40 @@ class TestQuantized(mlx_tests.MLXTestCase):
+                     self.assertLess(float(max_error.item()), 5e-2)
+                     del y_q, max_error
+ 
++    def test_gather_qmm_sorted_uneven_experts(self):
++        # Sorted rows with uneven, sometimes empty or long, expert segments.
++        E, N, K = 64, 256, 512
++        mx.random.seed(0)
++        w = mx.random.normal((E, N, K)) / K**0.5
++        for mode in ("mxfp4", "mxfp8", "nvfp4"):
++            qw, s = mx.quantize(w, mode=mode)
++            w_hat = mx.dequantize(qw, s, mode=mode)
++            for name, M in (("few", 100), ("odd", 1000), ("skewed", 3000)):
++                with self.subTest(mode=mode, case=name):
++                    if name == "skewed":
++                        u = mx.random.uniform(shape=(M,)) ** 4
++                        idx = (u * E).astype(mx.uint32)
++                    else:
++                        idx = mx.random.randint(0, E, (M,)).astype(mx.uint32)
++                    idx = mx.sort(idx)
++                    x = (mx.random.normal((M, 1, K)) / K**0.5).astype(mx.bfloat16)
++                    y = mx.gather_qmm(
++                        x,
++                        qw,
++                        s,
++                        rhs_indices=idx,
++                        transpose=True,
++                        mode=mode,
++                        sorted_indices=True,
++                    )
++                    y_hat = mx.gather_mm(
++                        x.astype(mx.float32),
++                        w_hat.swapaxes(-1, -2),
++                        rhs_indices=idx,
++                        sorted_indices=True,
++                    )
++                    self.assertLess((y.astype(mx.float32) - y_hat).abs().max(), 2e-2)
++
+     @unittest.skipIf(mx.cuda.is_available(), "Not implemented for CUDA")
+     def test_gather_qmm_sorted_sliced_weight(self):
+         E, R, D, N = 8, 64, 256, 64
