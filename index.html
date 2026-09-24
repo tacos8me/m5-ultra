@@ -33,7 +33,10 @@
   }
   main { max-width: 820px; margin: 0 auto; }
   h1 { font-size: 22px; font-weight: 600; letter-spacing: -0.01em; margin: 0; }
-  h2 { font-size: 17px; font-weight: 600; margin: 0 0 4px; }
+  h2 { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; }
+  .lead { color: var(--dim); font-size: 13px; margin: 0 0 26px; }
+  .meta a { color: var(--accent); text-decoration: none; }
+  .meta a:hover, .meta a:focus-visible { text-decoration: underline; }
   h3 { font-size: 15px; font-weight: 600; margin: 0 0 2px; }
   section { margin-bottom: 56px; }
   td.na { color: var(--ghost); }
@@ -64,7 +67,7 @@
 <body>
 <main>
   <h1>M5 Ultra</h1>
-  <p class="meta">DeepSeek-V4.1-Flash and MiMo-V2.6-Flash on a Mac Studio M5 Ultra, 256 GB.</p>
+  <p class="meta">DeepSeek-V4.1-Flash and MiMo-V2.6-Flash on a Mac Studio M5 Ultra, 256 GB.<br><a href="https://github.com/tacos8me/m5-ultra/tree/main/kernels">Kernels and patches on GitHub</a></p>
   <div class="toggle" role="tablist" aria-label="View">
     <button type="button" role="tab" id="tab-encode" aria-selected="true">Encode</button>
     <button type="button" role="tab" id="tab-decode" aria-selected="false">Decode</button>
@@ -72,7 +75,7 @@
 
   <section id="view-encode">
   <h2>Prefill at depth</h2>
-  <p class="sub">Prompt tokens ÷ time to first token.</p>
+  <p class="lead">Prompt tokens ÷ time to first token.</p>
   <h3>DeepSeek-V4.1-Flash</h3>
   <p class="sub" id="ds-sub">Measured in 8K chunks.</p>
   <div class="chart"><svg id="ds" viewBox="0 0 820 300" role="img" aria-label="DeepSeek-V4.1-Flash prefill rate by prompt length"></svg></div>
@@ -86,7 +89,7 @@
 
   <section id="view-decode" hidden>
   <h2>Decode at depth</h2>
-  <p class="sub">Output tokens per second by context depth. Greedy, speculative decoding on.</p>
+  <p class="lead">Output tokens per second by context depth. Greedy, speculative decoding on.</p>
   <h3>DeepSeek-V4.1-Flash</h3>
   <div class="chart"><svg id="ds-dec" viewBox="0 0 820 260" role="img" aria-label="DeepSeek-V4.1-Flash decode tokens per second by context depth"></svg></div>
   <h3>MiMo-V2.6-Flash</h3>
@@ -95,7 +98,7 @@
   </section>
   <section>
   <h2>What made it faster</h2>
-  <p class="sub">DeepSeek-V4.1-Flash, same day. Every change keeps greedy output bit-identical.</p>
+  <p class="lead">DeepSeek-V4.1-Flash, same day. Every change keeps greedy output bit-identical.</p>
   <ul class="changes">
     <li>Engram table reads moved off the critical path: parallel native SSD reads, one chunk ahead of the GPU.</li>
     <li>Sparse attention and indexer kernels rewritten: accelerator scoring, exact radix top-k, KV decoded once per query tile.</li>
