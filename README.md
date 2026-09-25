@@ -10,7 +10,7 @@ Prompt tokens ÷ time to first token. DeepSeek measured through the server from 
 
 | Prompt | DeepSeek-V4.1-Flash | MiMo-V2.6-Flash | Qwen3.8-Flash-Next | Qwen3.8-27B | RTX PRO 6000 ×2 · MiMo |
 |---|---:|---:|---:|---:|---:|
-| ~130K | 2,469 tok/s · 52.7 s | 2,112 tok/s · 62.1 s | 2,387 tok/s · 54.9 s | 1,116 tok/s · 118 s | 9,724 tok/s · 13.4 s |
+| ~130K | 2,545 tok/s · 51.1 s | 2,112 tok/s · 62.1 s | 2,387 tok/s · 54.9 s | 1,116 tok/s · 118 s | 9,724 tok/s · 13.4 s |
 | ~520K | 2,114 tok/s · 248 s | 873 tok/s · 600 s | 2,173 tok/s · 241 s | 509 tok/s · 1,030 s | ~4,880 tok/s · 107 s |
 | 1M | 1,947 tok/s · 534 s | — | 1,944 tok/s · 535 s | ~294 tok/s (est.) | — |
 
@@ -20,11 +20,11 @@ Output tokens per second, greedy, speculative decoding on.
 
 | | DeepSeek-V4.1-Flash | MiMo-V2.6-Flash | Qwen3.8-Flash-Next | Qwen3.8-27B | RTX PRO 6000 ×2 · MiMo |
 |---|---:|---:|---:|---:|---:|
-| 1 request | 77 | 117 | 109 | 77 | 160 |
-| 2 requests, total | 77 | — | 133 | 96 | — |
+| 1 request | 79 | 117 | 109 | 77 | 160 |
+| 2 requests, total | 78 | — | 133 | 96 | — |
 | 4 requests, total | — | — | 162 | 126 | — |
 | 8 requests, total | — | 194 | — | — | 627 |
-| At 130K context | 67 | 82 | 73 | 39 | — |
+| At 130K context | 66 | 82 | 73 | 39 | — |
 | At 523K context | 61 | 71 | 62 | 22 | 101 |
 | At 1M context | 56 | — | 44 | ~14 (est.) | — |
 
@@ -40,6 +40,7 @@ DeepSeek-V4.1-Flash, same day. Every change keeps greedy output bit-identical.
 - Two requests batched exactly under speculative decoding.
 - Prefix cache: resuming a long conversation reuses its prefill (128K: 53 s → 0.8 s, 512K: 241 s → 2.3 s).
 - Decode at depth: the KV cache grows in place and index keys are scored once for all draft rows.
+- Engram rows cached across requests; replies that copy from the prompt draft from it too (108 → 122 tok/s).
 
 ## Kernels
 
