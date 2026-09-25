@@ -12,7 +12,7 @@ Prompt tokens ÷ time to first token. DeepSeek measured through the server from 
 |---|---:|---:|---:|---:|---:|
 | ~130K | 2,545 tok/s · 51.1 s | 2,112 tok/s · 62.1 s | 2,387 tok/s · 54.9 s | 1,116 tok/s · 118 s | 9,724 tok/s · 13.4 s |
 | ~520K | 2,234 tok/s · 235 s | 873 tok/s · 600 s | 2,173 tok/s · 241 s | 509 tok/s · 1,030 s | ~4,880 tok/s · 107 s |
-| 1M | 1,947 tok/s · 534 s | — | 1,944 tok/s · 535 s | ~294 tok/s (est.) | — |
+| 1M | 1,998 tok/s · 521 s | — | 1,944 tok/s · 535 s | ~294 tok/s (est.) | — |
 
 ## Decode
 
@@ -26,7 +26,7 @@ Output tokens per second, greedy, speculative decoding on.
 | 8 requests, total | — | 194 | — | — | 627 |
 | At 130K context | 66 | 82 | 73 | 39 | — |
 | At 523K context | 63 | 71 | 62 | 22 | 101 |
-| At 1M context | 56 | — | 44 | ~14 (est.) | — |
+| At 1M context | 61 | — | 44 | ~14 (est.) | — |
 
 ## What made it faster
 
