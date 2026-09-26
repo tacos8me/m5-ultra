@@ -1,3 +1,12 @@
-split-nv (RTX box engine, own code): head c75a0a2 (branch og-moe, deployed as systemd unit split-nv-engine)
-sglang-split.patch: SGLang DeepSeek-V4.1 port 757e8f3 (private port, not public) -> a618602
-License: sglang-split.patch modifies SGLang (https://github.com/sgl-project/sglang), Apache-2.0 (LICENSE).
+split-nv engine (own code, src/): c75a0a2 (branch og-moe; deployed as systemd user unit split-nv-engine).
+
+sglang-dsv41-split.patch: applies to the Python tree of the public LMSYS image
+  lmsysorg/sglang:dev-dsv41@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
+  (/sgl-workspace/sglang/python; torch 2.13.0+cu130, flashinfer 0.6.18), and turns it into the exact tested tree:
+  the DeepSeek-V4.1 serving port (SM120 kernels, pinned Engram, launch fusion, long-context indexer) plus the
+  split hooks (prompt-state capture, deterministic top-k ties). Compiled .so modules are not in the patch; the
+  image's own builds are used. Verified: applies cleanly, result identical to the tested tree (excluding .so),
+  and the patched package imports in the public image. The tested engine ran on a local image with the same
+  torch/flashinfer versions; an end-to-end GPU run on the public image has not been done.
+
+License: sglang-dsv41-split.patch modifies SGLang (https://github.com/sgl-project/sglang), Apache-2.0 (LICENSE).
