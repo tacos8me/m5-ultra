@@ -5,7 +5,7 @@ cd /home/ian/split-nv-moe
 PY=/home/ian/.venv/bin/python
 R=/home/ian/split-nv/ref
 S=$R/ids-8192.json; L=$R/ids-131072.json
-OUT=/mnt/nvme-2/og-moe/deploy/${1:?label}
+OUT=/mnt/nvme-1/split-nv-ops/og-moe-deploy/${1:?label}
 mkdir -p $OUT
 fail=0
 g() { echo "## $*"; "$@" 2>&1 | grep -E '"gate"|numerical_gate|rel_rms|resumed_tokens|warning|"ref"|FAIL|Error|context' | cut -c1-400; [ ${PIPESTATUS[0]} -eq 0 ] || { fail=$((fail+1)); echo "FAILED: $*"; }; }

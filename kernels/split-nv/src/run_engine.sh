@@ -15,7 +15,16 @@ ROOT=${SPLIT_NV_ROOT:-/home/ian/split-nv}
 # encoder-model: the text-only view (rollback)
 MODEL=${SPLIT_NV_MODEL:-encoder-model-vl}
 VERSION=$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)$(git -C "$ROOT" diff --quiet 2>/dev/null || echo -dirty)
-SGLANG_VERSION=$(git -C "$ROOT/sglang" rev-parse --short HEAD 2>/dev/null)$(git -C "$ROOT/sglang" diff --quiet 2>/dev/null || echo -dirty)
+# Image: sglang-dsv41-split:<m5-ultra commit> is built from public parts only (m5-ultra kernels/split-nv/Dockerfile:
+# lmsysorg/sglang:dev-dsv41 + SGLang and FlashInfer patches) and carries the tested SGLang tree itself; proven
+# bit-identical to the old local image. local/sglang-dsv41:base (private base) still works: it mounts ROOT/sglang.
+IMAGE=${SPLIT_NV_IMAGE:-sglang-dsv41-split:6152b54}
+if [ "$IMAGE" = local/sglang-dsv41:base ]; then
+  SGLANG_MOUNT=(-v "$ROOT"/sglang/sglang:/sgl-workspace/sglang/python/sglang:ro)
+  SGLANG_VERSION=$(git -C "$ROOT/sglang" rev-parse --short HEAD 2>/dev/null)$(git -C "$ROOT/sglang" diff --quiet 2>/dev/null || echo -dirty)
+else
+  SGLANG_MOUNT=(); SGLANG_VERSION=$IMAGE
+fi
 mkdir -p /dev/shm/split-nv
 exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime nvidia --ipc=host --network host \
   --stop-timeout 60 --shm-size 64g --ulimit memlock=-1 --ulimit stack=67108864 \
@@ -27,17 +36,17 @@ exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime 
   -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/home/ian/split-nv/hooks \
   -e SPLIT_NV_HOOKS=1 -e SPLIT_NV_CONFIG=/home/ian/split-nv/$MODEL/config.json \
   -e SPLIT_NV_DIR=/dev/shm/split-nv -e SPLIT_NV_MAX_TOKENS=1056768 -e SPLIT_NV_STEP_LOG="${SPLIT_NV_STEP_LOG:-}" \
-  -e SPLIT_NV_VERSION="$VERSION" -e SPLIT_NV_SGLANG_VERSION="$SGLANG_VERSION" -e SPLIT_NV_CACHE_GB="${SPLIT_NV_CACHE_GB:-64}" -e SPLIT_NV_DRAIN_S="${SPLIT_NV_DRAIN_S:-30}" \
+  -e SPLIT_NV_VERSION="$VERSION" -e SPLIT_NV_SGLANG_VERSION="$SGLANG_VERSION" -e SPLIT_NV_CACHE_GB="${SPLIT_NV_CACHE_GB:-96}" -e SPLIT_NV_DRAIN_S="${SPLIT_NV_DRAIN_S:-30}" \
   -e SPLIT_NV_PUBLIC_HTTP="${SPLIT_NV_PUBLIC_HTTP-0.0.0.0:10051}" \
   -e SPLIT_NV_SELFTEST="${SPLIT_NV_SELFTEST:-}" -e CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-0}" -e SPLIT_NV_GRAPHS="${SPLIT_NV_GRAPHS-2,3,4,5}" \
   -e SPLIT_NV_TRACE="${SPLIT_NV_TRACE:-}" -e SPLIT_NV_DEV="${SPLIT_NV_DEV:-}" -e SPLIT_NV_TRIM="${SPLIT_NV_TRIM-1}" -e SPLIT_NV_B12X="${SPLIT_NV_B12X-1}" \
   -e SPLIT_NV_OG_MOE="${SPLIT_NV_OG_MOE-1}" \
   -v "$ROOT":/home/ian/split-nv:ro \
   -v /home/ian/models/DeepSeek-V4.1-Flash-original:/home/ian/models/DeepSeek-V4.1-Flash-original:ro \
-  -v "$ROOT"/sglang/sglang:/sgl-workspace/sglang/python/sglang:ro \
+  "${SGLANG_MOUNT[@]}" \
   -v /home/ian/models/dsv41-engram:/engram \
   -v /mnt/nvme-1/dsv41-fi-cache:/root/.cache/flashinfer -v /mnt/nvme-1/dsv41-sglang-jit:/root/.cache/sglang \
-  local/sglang-dsv41:base python3 -m split_nv.engine \
+  "$IMAGE" python3 -m split_nv.engine \
   --model-path /home/ian/split-nv/$MODEL --trust-remote-code --served-model-name split-nv-encoder \
   --tp 2 --host 127.0.0.1 --port 10050 --mem-fraction-static "$MEMFRAC" \
   --context-length 1048576 --max-total-tokens "$MAX_TOTAL" --max-running-requests "$MAX_REQS" \

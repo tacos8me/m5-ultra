@@ -35,7 +35,8 @@ from .kernels import packed_index_scores, packed_index_topk, packed_sparse_atten
 from .mtp import DSparkMixin
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
-from . import decode_fusions, decode_topk, growth, affine_gather, fast_rope, moe_decode
+from . import attn_fusions, decode_fusions, decode_topk, growth, affine_gather, fast_rope, moe_decode
+from . import hc_fuse
 
 logger = logging.getLogger(__name__)
 
@@ -194,20 +195,26 @@ def rope_params(config, compressed):
 _ROPE_TABLES = {}
 
 
+def rope_tables(start, length, config, compressed, inverse=False, step=1):
+    """(cos, sin, rope_dim) that rope_range's fast path applies to these positions."""
+    params = rope_params(config, compressed)
+    key = (params, bool(compressed), bool(inverse), int(start), int(length), int(step))
+    tables = _ROPE_TABLES.get(key)
+    if tables is None:
+        if len(_ROPE_TABLES) >= 64:
+            _ROPE_TABLES.clear()
+        positions = mx.arange(start, start + length)
+        if step != 1:
+            positions = positions * step
+        tables = _ROPE_TABLES[key] = _rope_table(positions, params, compressed, inverse)
+    return (*tables, params[0])
+
+
 def rope_range(x, start, length, config, compressed, inverse=False, step=1):
     """rope(x, mx.arange(start, start + length) * step, ...) with shared tables."""
     params = rope_params(config, compressed)
     if DS41_FAST_ROPE and fast_rope.supported_length(x, length, params[0]):
-        key = (params, bool(compressed), bool(inverse), int(start), int(length), int(step))
-        tables = _ROPE_TABLES.get(key)
-        if tables is None:
-            if len(_ROPE_TABLES) >= 64:
-                _ROPE_TABLES.clear()
-            positions = mx.arange(start, start + length)
-            if step != 1:
-                positions = positions * step
-            tables = _ROPE_TABLES[key] = _rope_table(positions, params, compressed, inverse)
-        return fast_rope.partial_rope(x, *tables, params[0])
+        return fast_rope.partial_rope(x, *rope_tables(start, length, config, compressed, inverse, step))
     positions = mx.arange(start, start + length)
     if step != 1:
         positions = positions * step
@@ -341,20 +348,32 @@ class Indexer(nn.Module):
             if not prebuilt:
                 cache[3] = previous
         key = shared["index_k"]
-        q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
-        q = quantize_activation(rope_range(q, start, end - start, c, True), bits=4)
+        pre = shared.get("qr8")
+        if pre is not None and pre[0] is qr and _prequantized(self.wq_b):
+            q = self.wq_b.project_quantized(pre[1])
+        else:
+            q = self.wq_b(qr)
+        q = q.reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
+        if DS41_FAST_ROPE and not verify_tile() and attn_fusions.index_q_supported(q, c.rope_head_dim):
+            q = attn_fusions.index_q(q, *rope_tables(start, end - start, c, True))
+        else:
+            q = quantize_activation(rope_range(q, start, end - start, c, True), bits=4)
         weights = self.weights_proj(x).astype(mx.float32) * (
             c.index_head_dim**-0.5 * c.index_n_heads**-0.5
         )
         candidates = None
         if 0 <= c.candidate_source_layer < layer:
             blocks = shared["candidates"]
-            candidates = blocks[..., None] * c.candidate_block_size + mx.arange(
-                c.candidate_block_size
-            )
-            candidates = mx.where(blocks[..., None] >= 0, candidates, -1).reshape(
-                1, x.shape[1], blocks.shape[-1] * c.candidate_block_size
-            )
+
+            def expand(blocks):
+                candidates = blocks[..., None] * c.candidate_block_size + mx.arange(
+                    c.candidate_block_size
+                )
+                return mx.where(blocks[..., None] >= 0, candidates, -1).reshape(
+                    1, x.shape[1], blocks.shape[-1] * c.candidate_block_size
+                )
+            # Every candidate layer of a forward expands the same blocks.
+            candidates = _memo(shared, ("candidate_ids", id(blocks)), expand, blocks)
         if candidates is None:
             tile = verify_tile()
             parts = [
@@ -392,11 +411,20 @@ class Indexer(nn.Module):
             valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
             idx = mx.take_along_axis(candidates, order, -1)
             return mx.sort(mx.where(valid, idx, -1), axis=-1)
+        if x.shape[1] <= 8 and not verify_tile() and attn_fusions.select_supported(scores.shape[-1], count):
+            # One kernel, the same result as the stable argsort below: (score
+            # desc, position asc), and valid candidate ids ascend with position.
+            return attn_fusions.select_rows(scores, count, ids=candidates.astype(mx.int32))
         order = mx.argsort(-scores, axis=-1)[..., :count].astype(mx.int32)
         valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
         idx = mx.take_along_axis(candidates, order, -1)
         # Keep chronological order; invalid slots are masked by attention.
         return mx.sort(mx.where(valid, idx, -1), axis=-1)
+
+
+def _prequantized(projection):
+    """An MXFP8 projection that FP8-rounds its input (project_quantized takes the rounded input)."""
+    return isinstance(projection, QuantizedProjection) and projection.quantize_input
 
 
 def _memo(shared, key, fn, *args):
@@ -451,6 +479,7 @@ class Attention(nn.Module):
     def __call__(
         self, x, cache, shared, start, ced_kv=None, ced_kv_start=None,
         *, projections=None, return_projected=False, prebuilt_end=None,
+        return_heads=False,
     ):
         c, layer = self._config, self._layer
         ratio, length = c.compress_ratios[layer], x.shape[1]
@@ -458,10 +487,29 @@ class Attention(nn.Module):
         # build each once instead of once per layer.
         span = (start, length)
         positions = _memo(shared, ("positions", span), mx.arange, start, start + length)
+        # Short decode/verify blocks: fused norm/RoPE/pack/merge kernels
+        # (attn_fusions), bitwise equal to the op chains they replace.
+        fuse = (
+            attn_fusions.ENABLED
+            and length <= attn_fusions.MAX_ROWS
+            and not verify_tile()
+            and DS41_FAST_ROPE
+            and x.dtype == mx.bfloat16
+        )
         if projections is None:
             query, kv_input = self._input_projections(x)
-            qr = self.q_norm(query)
-            q_input = self.wq_b(qr)
+            if (
+                fuse
+                and _prequantized(self.wq_b)
+                and attn_fusions.rms_supported(query, self.q_norm.weight)
+            ):
+                # One FP8 round trip of qr feeds wq_b and the indexer's wq_b.
+                qr, qr8 = attn_fusions.rms_quant(query, self.q_norm.weight, self.q_norm.eps, True)
+                shared["qr8"] = (qr, qr8)
+                q_input = self.wq_b.project_quantized(qr8)
+            else:
+                qr = self.q_norm(query)
+                q_input = self.wq_b(qr)
         else:
             qr, kv_input, q_input = projections
         q = rope_range(
@@ -471,21 +519,31 @@ class Attention(nn.Module):
             c,
             bool(ratio),
         )
-        rotated = rope_range(self.kv_norm(kv_input), start, length, c, bool(ratio))
-        if (
-            decode_fusions.DS41_DECODE_KERNELS_V2
-            and (length <= 8 or verify_tile())
-            and rotated.shape[-1] % 32 == 0
-            and rotated.dtype in (mx.bfloat16, mx.float16, mx.float32)
-            and mx.default_device() == mx.gpu
-        ):
-            new = decode_fusions.pack_fp8(rotated)
-        else:
-            new = pack_activation(rotated)
         old = cache[1]
         # CED clears the stale window whenever bounded replay skips tokens.
         old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
-        kv = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
+        if (
+            fuse
+            and decode_fusions.DS41_DECODE_KERNELS_V2
+            and attn_fusions.kv_supported(kv_input, self.kv_norm.weight, old_len)
+        ):
+            kv = attn_fusions.kv_rows(
+                kv_input, self.kv_norm.weight, self.kv_norm.eps,
+                *rope_tables(start, length, c, bool(ratio)), old, old_len,
+            )
+        else:
+            rotated = rope_range(self.kv_norm(kv_input), start, length, c, bool(ratio))
+            if (
+                decode_fusions.DS41_DECODE_KERNELS_V2
+                and (length <= 8 or verify_tile())
+                and rotated.shape[-1] % 32 == 0
+                and rotated.dtype in (mx.bfloat16, mx.float16, mx.float32)
+                and mx.default_device() == mx.gpu
+            ):
+                new = decode_fusions.pack_fp8(rotated)
+            else:
+                new = pack_activation(rotated)
+            kv = mx.concatenate([old[:, :old_len], new], 1) if old_len else new
         verify_state = getattr(cache, "_mtp_verify_state", None)
         if verify_state is not None:
             verify_state["window"] = kv
@@ -546,6 +604,7 @@ class Attention(nn.Module):
                 shared["kv"] = cache[2] = growth.append(cache, 2, shared["kv"], compressed, kv_start // ratio)
             ci, pooled = shared["idx"], shared["kv"]
         tile = verify_tile()
+        out_rotated = False
         if tile and length > 8:
             out = mx.concatenate(
                 [
@@ -576,11 +635,22 @@ class Attention(nn.Module):
                 max(ratio, 1),
                 c.window_size,
             ).transpose(0, 2, 1, 3)
+        elif fuse:
+            # The merge applies the inverse output RoPE.
+            out_rotated = True
+            out = packed_sparse_attention(
+                q, kv, pooled, idx, ci, self.attn_sink, c.head_dim**-0.5,
+                rope_tables=rope_tables(start, length, c, bool(ratio), inverse=True),
+            )
         else:
             out = packed_sparse_attention(
                 q, kv, pooled, idx, ci, self.attn_sink, c.head_dim**-0.5
             )
-        out = rope_range(out, start, length, c, bool(ratio), inverse=True)
+        if not out_rotated:
+            out = rope_range(out, start, length, c, bool(ratio), inverse=True)
+        if return_heads:
+            # og_fused: wo_a and wo_b run once over several requests' rows.
+            return out
         grouped = out.reshape(1, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
         if (
@@ -1061,6 +1131,9 @@ class Block(nn.Module):
     ):
         # prebuilt_end/hc_rows: encoder replay over a chunk's tail rows whose
         # global KV/index rows (up to prebuilt_end) already exist in the cache.
+        if (DS41_MHC and ced_tail is None and hc_rows is None
+                and hc_fuse.eligible(self, h, pre, verify_tile())):
+            return hc_fuse.block_forward(self, h, pre, cache, shared, start, image_mask, prebuilt_end)
         ced_kv = ced_kv_start = None
         if ced_tail is not None:
             # CED bounded replay: queries, SWA KV and MoE run on the tail

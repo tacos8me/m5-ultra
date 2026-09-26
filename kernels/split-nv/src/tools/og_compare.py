@@ -12,11 +12,11 @@ def m(a, b):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--cuda', default='/mnt/nvme-2/pipe1-cuda-trace-8213.pt')
-    ap.add_argument('--mac', default='/mnt/nvme-2/og-box/og-trace-8k.trace.safetensors')
+    ap.add_argument('--cuda', default='/mnt/nvme-1/split-nv-ops/traces/pipe1-cuda-trace-8213.pt')
+    ap.add_argument('--mac', default='/mnt/nvme-1/split-nv-ops/og-box/og-trace-8k.trace.safetensors')
     ap.add_argument('--layers', default='0-20')
     ap.add_argument('--raw', help='CUDA raw state (split-nv-raw-v1) to compare SWA/ckv/idxk rows')
-    ap.add_argument('--mac-state', default='/mnt/nvme-2/og-box/og-trace-8k.safetensors')
+    ap.add_argument('--mac-state', default='/mnt/nvme-1/split-nv-ops/og-box/og-trace-8k.safetensors')
     args = ap.parse_args()
     c = {k: v[1] for k, v in torch.load(args.cuda, map_location='cpu', weights_only=True).items()}
     mac = {k: v[0] for k, v in load_file(args.mac).items()}

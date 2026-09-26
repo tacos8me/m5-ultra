@@ -2354,18 +2354,16 @@ def _dspark_host(model: Any) -> Optional[Any]:
     return None
 
 
-def _dspark_next_drafts(
+def _dspark_prepare(
     gen_batch: Any,
     state: _MtpState,
     hidden_rows: Any,
     committed: Any,
-    prev_buf: Optional[Any],
-) -> None:
-    """Append committed target taps and sample one DSpark block.
+) -> Optional[tuple]:
+    """Everything of _dspark_next_drafts before the DSpark decoder forward.
 
-    The expensive three-stage decoder runs once over anchor+noise positions.
-    A rank-R Markov head then samples left-to-right, preserving DSpark's
-    intra-block dependency without another decoder pass.
+    Returns None when this cycle's block is already set (a copy/extra-source
+    proposal, or depth 0), else ``(host, width, anchor, cost_policy)``.
     """
     import mlx.core as mx
 
@@ -2412,7 +2410,7 @@ def _dspark_next_drafts(
             state.draft_lps = [None] * len(draft)
             state.draft_accept_lps = [None] * len(draft)
             state.draft_source = source
-            return
+            return None
     state.draft_source = "dspark"
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
@@ -2420,22 +2418,27 @@ def _dspark_next_drafts(
         state.drafts = mx.zeros((0,), dtype=mx.uint32)
         state.draft_lps = []
         state.draft_accept_lps = []
-        return
+        return None
 
     cost_policy = (
         bool(getattr(state.controller, "cost_policy", False))
         and state.hist_offset >= 1024
     )
     width = state.controller.max_depth if cost_policy else depth
-    anchor = committed[-1:].reshape(1, 1)
-    logits, _ = host.dspark_forward(
-        hidden_rows,
-        anchor,
-        state.mtp_cache,
-        draft_length=width,
-    )
-    state.hist_offset += n
+    return host, width, committed[-1:].reshape(1, 1), cost_policy
 
+
+def _dspark_finish(
+    gen_batch: Any,
+    state: _MtpState,
+    plan: tuple,
+    logits: Any,
+    prev_buf: Optional[Any],
+) -> None:
+    """Everything of _dspark_next_drafts after the DSpark decoder forward (Markov sampling)."""
+    import mlx.core as mx
+
+    host, width, anchor, cost_policy = plan
     sampler = _resolve_sampler(gen_batch)
     procs = _proc_list(gen_batch)
     draft_toks: List[Any] = []
@@ -2468,15 +2471,110 @@ def _dspark_next_drafts(
     _restore_snapshotable(procs, snap)
 
     if cost_policy:
-        probabilities = mx.exp(mx.stack([mx.max(lp) for lp in draft_lps])).tolist()
-        depth = state.controller.choose_cost_depth(probabilities, state.hist_offset)
-        draft_toks = draft_toks[:depth]
+        # One host sync resolves the probabilities and every draft id; the
+        # chosen prefix is host-built, so sending it (og presend) costs no
+        # second GPU round trip for a tiny concatenate (~0.25 ms).
+        probabilities = mx.exp(mx.stack([mx.max(lp) for lp in draft_lps]))
+        drafted = mx.concatenate(draft_toks)
+        mx.eval(probabilities, drafted)
+        depth = state.controller.choose_cost_depth(
+            probabilities.tolist(), state.hist_offset
+        )
+        state.drafts = mx.array(drafted.tolist()[:depth], dtype=drafted.dtype)
         draft_lps = draft_lps[:depth]
         draft_accept_lps = draft_accept_lps[:depth]
-    state.drafts = mx.concatenate(draft_toks)
+    else:
+        state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
     state.draft_accept_lps = draft_accept_lps
     mx.async_eval(state.drafts)
+
+
+
+
+def _dspark_next_drafts(
+    gen_batch: Any,
+    state: _MtpState,
+    hidden_rows: Any,
+    committed: Any,
+    prev_buf: Optional[Any],
+) -> None:
+    """Append committed target taps and sample one DSpark block.
+
+    The expensive three-stage decoder runs once over anchor+noise positions.
+    A rank-R Markov head then samples left-to-right, preserving DSpark's
+    intra-block dependency without another decoder pass.
+    """
+    plan = _dspark_prepare(gen_batch, state, hidden_rows, committed)
+    if plan is None:
+        return
+    host, width, anchor, _ = plan
+    logits, _ = host.dspark_forward(
+        hidden_rows,
+        anchor,
+        state.mtp_cache,
+        draft_length=width,
+    )
+    state.hist_offset += int(committed.shape[0])
+    _dspark_finish(gen_batch, state, plan, logits, prev_buf)
+
+
+def dspark_draft_jobs(jobs: List[tuple], depths: List[Optional[int]]) -> bool:
+    """Draft several requests' next blocks, sharing one DSpark decoder pass when possible.
+
+    ``jobs`` are _run_verify_cycle_chain draft_jobs entries (gen_batch, state,
+    hidden_rows, committed, prev_buf); ``depths`` the controller depth each
+    request had when its chain queued the job (the chain's controller.observe
+    runs before a queued draft). Every request gets exactly the block its own
+    _dspark_next_drafts would produce: the same per-request steps, with the
+    decoder forward of the requests that need one run by
+    host.dspark_forward_batch when it accepts them (else one by one).
+    Returns whether one shared pass was used.
+    """
+    plans = []
+    for (gen_batch, state, hidden_rows, committed, _), depth in zip(jobs, depths):
+        t0 = time.perf_counter()
+        if not state.head_clone:
+            _mtp_head_trim_to(state.mtp_cache, state.hist_offset)
+        controller = state.controller
+        if controller is not None and depth is not None:
+            observed, controller.cur = controller.cur, depth
+        try:
+            plans.append(_dspark_prepare(gen_batch, state, hidden_rows, committed))
+        finally:
+            if controller is not None and depth is not None:
+                controller.cur = observed
+        state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000
+    t0 = time.perf_counter()
+    forward = [i for i, plan in enumerate(plans) if plan is not None]
+    host = plans[forward[0]][0] if forward else None
+    batch = getattr(host, "dspark_forward_batch", None)
+    logits = (
+        batch(
+            [jobs[i][2] for i in forward],
+            [plans[i][2] for i in forward],
+            [jobs[i][1].mtp_cache for i in forward],
+            [plans[i][1] for i in forward],
+        )
+        if len(forward) > 1 and batch is not None
+        else None
+    )
+    batched = logits is not None
+    if logits is None:
+        logits = [
+            host.dspark_forward(
+                jobs[i][2], plans[i][2], jobs[i][1].mtp_cache, draft_length=plans[i][1]
+            )[0]
+            for i in forward
+        ]
+    share = (time.perf_counter() - t0) * 1000 / max(1, len(forward))
+    for i, block in zip(forward, logits):
+        gen_batch, state, _, committed, prev_buf = jobs[i]
+        t0 = time.perf_counter()
+        state.hist_offset += int(committed.shape[0])
+        _dspark_finish(gen_batch, state, plans[i], block, prev_buf)
+        state.stats.mtp_head_ms += (time.perf_counter() - t0) * 1000 + share
+    return batched
 
 
 def _chain_next_drafts(
@@ -3507,7 +3605,8 @@ def _run_verify_cycle_chain(
         committed = mx.array(
             [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
         )
-        next_main = committed[-1:]
+        # Host-built (not a slice of committed): reading it back is free.
+        next_main = mx.array([int(emit_last_id)], dtype=mx.uint32)
         hidden_rows = hidden[:, : m + 1]
         prev_buf = None
         if procs is not None:

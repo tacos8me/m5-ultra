@@ -30,6 +30,8 @@ for key, value in dict(MLX_ENABLE_TF32='0', OMLX_BONJOUR='0', OMLX_DISCOVERY='0'
     os.environ.setdefault(key, value)
 OG = Path(os.environ.get('DS41_OG_HOME', str(HOME/'llm/ds41/og')))
 GIB = 1024**3
+# Fused verify (og_fused) pays from 3 decoding requests up: two pairs pipeline against the box.
+CONCURRENCY = '4' if os.environ.get('DS41_OG_FUSE', '1') == '1' else '2'
 
 watch = subprocess.Popen(['/opt/homebrew/bin/python3', str(HERE/'watch.py'), str(os.getpid()),
                           str(OG/'logs'/'og-worker.memory.json'), os.environ.get('DS41_OG_LEASE_S', '0')])
@@ -68,6 +70,7 @@ def guard():
 threading.Thread(target=guard, daemon=True).start()
 
 WARM = threading.Event()
+from fastapi import Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 from omlx import server  # noqa: E402
 
@@ -82,14 +85,39 @@ async def gate_health(request, call_next):
 @server.app.get('/og/stats')
 async def og_stats():
     from omlx.patches.deepseek_v41 import pipe_wire
+    from omlx.patches.deepseek_v41 import fast_encode
     store = og_model.STORE.summary() if og_model.STORE is not None else None
+    encoders = [e.summary() for e in fast_encode.ENCODERS]
     return dict(og_model.STATS, sessions=len(og_model.SESSIONS), recoveries=pipe_wire.RECOVERIES[-20:],
-                resume=og_resume.STATS, prefix_rows=store)
+                resume=og_resume.STATS, prefix_rows=store, encode=encoders[0] if encoders else fast_encode.STATS)
+
+
+from omlx.patches.deepseek_v41 import fe_trace  # noqa: E402
+
+if os.environ.get('DS41_FE_TRACE', '0') == '1':
+    @server.app.post('/og/fe')
+    async def og_fe(request: Request):
+        """Trace mode only: switch the front-end paths at runtime for A/B runs in one process."""
+        from omlx.patches.deepseek_v41 import encoder_replay, fast_encode
+        body = await request.json()
+        if 'encode_cache' in body:
+            fast_encode.ACTIVE[0] = bool(body['encode_cache'])
+        if 'kickoff' in body:
+            og_model.KICKOFF = bool(body['kickoff'])
+        if 'wake' in body:
+            og_model.WAKE = bool(body['wake'])
+        if 'replay_eval_every' in body:
+            encoder_replay.EVAL_EVERY = max(1, int(body['replay_eval_every']))
+        if 'profile' in body:
+            fe_trace.PROFILE[0] = bool(body['profile'])
+        return dict(encode_cache=fast_encode.ACTIVE[0], kickoff=og_model.KICKOFF, wake=og_model.WAKE,
+                    replay_eval_every=encoder_replay.EVAL_EVERY, profile=fe_trace.PROFILE[0])
 
 
 sys.path.insert(0, str(HERE))
 import og_resume  # noqa: E402
 og_resume.install(server.app)
+fe_trace.install(server.app)
 
 
 def warmup():
@@ -135,7 +163,7 @@ def main():
     args = [a for a in sys.argv[1:]]
     sys.argv = [sys.argv[0], 'serve', '--base-path', str(OG/'profile'), '--model-dir', str(OG/'models'),
                 '--no-hf-cache', '--no-cache', '--max-concurrent-requests',
-                os.environ.get('DS41_OG_CONCURRENCY', '2'), *args]
+                os.environ.get('DS41_OG_CONCURRENCY', CONCURRENCY), *args]
     from omlx.cli import main as cli
     cli()
 

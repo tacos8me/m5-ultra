@@ -1,6 +1,7 @@
 Applies on top of deepseek-v41.patch (head ef88391e):
 base: ef88391e
-head: f56f7ffa (branch ds41-og, served as llama-swap ds41)
+head: 51233501 (branch ds41-draft, served as llama-swap ds41; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
+      ds41-batch, ds41-draft on f56f7ffa)
 
 5b17cbbc perf: keep DeepSeek V4.1 decode KV growth in place across extract and rollback
 88cfffd9 perf: score DeepSeek V4.1 decode index keys in one lazy tile
@@ -70,3 +71,16 @@ edb5c44e feat(ds41-og): native image input: the box runs the vision tower (OPEN 
 76bd014a feat(ds41-og): supervisor serves images on og (DS41_OG_VISION=og default; never q3: box down -> retryable 503, no q3 resume for images); reject message without ds41-q3; tests
 7c72a52f test(ds41-og): vision leg: objective image QA (official two-image example, OCR, count, color), cache repeats, text identity vs the production tree; no q3
 f56f7ffa feat: og only by default (DS41_OG_Q3=off): never start q3; clean 503/SSE errors; real model on keepalives
+
+f56f7ffa..51233501 (no merges):
+51233501 perf(ds41-draft): one DSpark drafter pass per fused pair (bitwise per request)
+8fe0a2df docs(ds41-batch): c2 re-validation analysis; draft fingerprint + log split tools
+bdec155c perf(ds41-batch): fused multi-request Mac verify for the og split (pairs pipelined against the box)
+6431b87c perf(ds41-attn): fused attention-sublayer decode kernels (bitwise), one-kernel index top-k
+fece2d81 perf(ds41-host): GPU keep-warm during the box wait; served-flow A/B harness; MERGE-READY note
+c329972f feat(ds41-moe): fused MXFP4 routed-expert kernels for 1-16 rows (bitwise); union kernel measured, not shipped
+8ed87692 docs(ds41-fe): MERGE-READY note; fe_cmp identity compare tool
+73be036f perf(ds41-host): fused mHC kernels (4/Block, bitwise), early first submit, 4 MB step rcvbuf, fewer handoff syncs
+01a5b6f7 perf(ds41-og): a box OPEN finishing during a scheduler step is admitted by the next step (no lost wake, no 50 ms idle wait)
+f7a48ef2 perf(ds41-fe): text-only prepare_inputs through the piece cache; private tokenizer backends (no inherited padding); window tooling fixes
+3adc68be perf(ds41-fe): incremental tokenization, engine wake, kickoff presend, front-end trace + A/B tooling (pre-window-2 state)

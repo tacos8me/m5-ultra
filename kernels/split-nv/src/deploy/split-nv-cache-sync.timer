@@ -1,0 +1,9 @@
+[Unit]
+Description=Mirror the split-nv box prefix cache every 10 minutes
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target

@@ -57,6 +57,8 @@ ff1558a chore(og-moe): import a prebuilt extension for the exact source hash
 e1d1ec4 chore(og-moe): post-deploy gate script; deploy fetches every dev branch
 985ef3e chore(og-moe): post-deploy gate script (strict validate, prefix, resume, HTTP, image, og-s4.4 reference + determinism, latency)
 c75a0a2 fix(split-nv): og_valid set after StepRunner's local os import
+1954bf6 feat(split-nv): run from the public-parts image; prefix cache 96 GiB with an NVMe mirror restored after reboot
+9947c60 chore(split-nv): gate references, deploy logs and traces live on local NVMe
 
 sglang (757e8f3..a618602):
 fca050c feat(split-nv): optional prompt-state capture hooks for encoder prefill

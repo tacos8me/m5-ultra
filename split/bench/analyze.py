@@ -127,39 +127,41 @@ S['leg5_vision_summary'] = {'1 image': {'ttft_s': agg([r['ttft_s'] for r in v if
 contention += [('leg5', r['foreign_requests'], r['pre_idle']['box_sessions']) for r in L5]
 
 # ---------- leg 6 ----------
-nv = list(csv.reader(open(D / 'box/nvsmi.csv')))
-def nvts(s):
-    return calendar.timegm(time.strptime(s.split('.')[0], '%Y/%m/%d %H:%M:%S')) + float('0.' + s.split('.')[1])
-gpu = {}
-for i in ('0', '1'):
-    rr = [r for r in nv if r[1].strip() == i]
-    mem = [int(r[2].split()[0]) for r in rr]
-    gpu[f'gpu{i}'] = {'vram_used_mib_start': mem[0], 'vram_used_mib_peak': max(mem), 'vram_total_mib': int(rr[0][3].split()[0]),
-                      'util_peak_pct': max(int(r[4].split()[0]) for r in rr), 'power_peak_w': max(float(r[5].split()[0]) for r in rr)}
-one_m = [r for r in L1 if r['target'] == 1040000][0]
-w0, w1 = one_m['wall_start'], one_m['wall_start'] + one_m['ttft_s']
-for i in ('0', '1'):
-    rr = [r for r in nv if r[1].strip() == i and w0 <= nvts(r[0]) <= w1]
-    gpu[f'gpu{i}']['during_1M_prefill'] = {'util_mean_pct': round(st.mean(int(r[4].split()[0]) for r in rr), 1),
-                                           'power_mean_w': round(st.mean(float(r[5].split()[0]) for r in rr), 1)}
-nic = [tuple(map(float, l.split())) for l in open(D / 'box/nic.log')]
-def link(t0, t1):
-    sel = [r for r in nic if t0 <= r[0] <= t1]; a, b = sel[0], sel[-1]; dt = b[0] - a[0]
-    pk = max((y[2] - x[2]) / (y[0] - x[0]) for x, y in zip(sel, sel[1:]))
-    return {'window_s': round(dt, 1), 'box_to_mac_MBps_mean': round((b[2] - a[2]) / dt / 1e6, 1), 'box_to_mac_MBps_peak_0.5s': round(pk / 1e6, 1),
-            'box_to_mac_GB_total': round((b[2] - a[2]) / 1e9, 3), 'mac_to_box_MBps_mean': round((b[1] - a[1]) / dt / 1e6, 2)}
-r512 = [r for r in L1 if r['target'] == 524288][0]
-dec = [r for r in L2 if r['target'] == 1040000 and r['q'] > 0]
-mac_after = (D / 'system_mac_after.txt').read_text()
-S['leg6_system'] = {
-    'mac_og_worker': {'text_after_bench': mac_after, 'text_before_bench': (D / 'system_mac_before.txt').read_text()},
-    'box_gpus': gpu,
-    'box_step_ms (from Mac og/stats deltas, per decode step, all leg-2 requests)': {
-        'box_compute': agg([r.get('box_ms_per_step') for r in L2]), 'roundtrip_incl_link': agg([r.get('roundtrip_ms_per_step') for r in L2]),
-        'by_depth': {k: {'box': p2[k]['box_ms_per_step']['mean'], 'roundtrip': p2[k]['roundtrip_ms_per_step']['mean']} for k in p2}},
-    'link_10GbE': {'512K prefill': link(r512['wall_start'], r512['wall_start'] + r512['ttft_s']),
-                   '1M prefill': link(w0, w1),
-                   '1M follow-up window (5 cached questions incl. tail re-prefills)': link(dec[0]['wall_start'] + dec[0]['ttft_s'], dec[-1]['wall_start'] + dec[-1]['total_s'])}}
+HAVE_SYS = (D / 'box/nvsmi.csv').exists() and (D / 'system_mac_after.txt').exists()
+if HAVE_SYS:
+    nv = list(csv.reader(open(D / 'box/nvsmi.csv')))
+    def nvts(s):
+        return calendar.timegm(time.strptime(s.split('.')[0], '%Y/%m/%d %H:%M:%S')) + float('0.' + s.split('.')[1])
+    gpu = {}
+    for i in ('0', '1'):
+        rr = [r for r in nv if r[1].strip() == i]
+        mem = [int(r[2].split()[0]) for r in rr]
+        gpu[f'gpu{i}'] = {'vram_used_mib_start': mem[0], 'vram_used_mib_peak': max(mem), 'vram_total_mib': int(rr[0][3].split()[0]),
+                          'util_peak_pct': max(int(r[4].split()[0]) for r in rr), 'power_peak_w': max(float(r[5].split()[0]) for r in rr)}
+    one_m = [r for r in L1 if r['target'] == 1040000][0]
+    w0, w1 = one_m['wall_start'], one_m['wall_start'] + one_m['ttft_s']
+    for i in ('0', '1'):
+        rr = [r for r in nv if r[1].strip() == i and w0 <= nvts(r[0]) <= w1]
+        gpu[f'gpu{i}']['during_1M_prefill'] = {'util_mean_pct': round(st.mean(int(r[4].split()[0]) for r in rr), 1),
+                                               'power_mean_w': round(st.mean(float(r[5].split()[0]) for r in rr), 1)}
+    nic = [tuple(map(float, l.split())) for l in open(D / 'box/nic.log')]
+    def link(t0, t1):
+        sel = [r for r in nic if t0 <= r[0] <= t1]; a, b = sel[0], sel[-1]; dt = b[0] - a[0]
+        pk = max((y[2] - x[2]) / (y[0] - x[0]) for x, y in zip(sel, sel[1:]))
+        return {'window_s': round(dt, 1), 'box_to_mac_MBps_mean': round((b[2] - a[2]) / dt / 1e6, 1), 'box_to_mac_MBps_peak_0.5s': round(pk / 1e6, 1),
+                'box_to_mac_GB_total': round((b[2] - a[2]) / 1e9, 3), 'mac_to_box_MBps_mean': round((b[1] - a[1]) / dt / 1e6, 2)}
+    r512 = [r for r in L1 if r['target'] == 524288][0]
+    dec = [r for r in L2 if r['target'] == 1040000 and r['q'] > 0]
+    mac_after = (D / 'system_mac_after.txt').read_text()
+    S['leg6_system'] = {
+        'mac_og_worker': {'text_after_bench': mac_after, 'text_before_bench': (D / 'system_mac_before.txt').read_text()},
+        'box_gpus': gpu,
+        'box_step_ms (from Mac og/stats deltas, per decode step, all leg-2 requests)': {
+            'box_compute': agg([r.get('box_ms_per_step') for r in L2]), 'roundtrip_incl_link': agg([r.get('roundtrip_ms_per_step') for r in L2]),
+            'by_depth': {k: {'box': p2[k]['box_ms_per_step']['mean'], 'roundtrip': p2[k]['roundtrip_ms_per_step']['mean']} for k in p2}},
+        'link_10GbE': {'512K prefill': link(r512['wall_start'], r512['wall_start'] + r512['ttft_s']),
+                       '1M prefill': link(w0, w1),
+                       '1M follow-up window (5 cached questions incl. tail re-prefills)': link(dec[0]['wall_start'] + dec[0]['ttft_s'], dec[-1]['wall_start'] + dec[-1]['total_s'])}}
 S['contention'] = {'requests_checked': len(contention), 'foreign_requests_total': sum(c[1] or 0 for c in contention),
                    'box_sessions_nonzero_before_request': sum(1 for c in contention if c[2]),
                    'method': 'before every measured request: wait until box /health sessions==0 and Mac /health inflight==0; after: og/stats opened delta must equal own requests'}
@@ -224,29 +226,32 @@ vs = S['leg5_vision_summary']
 M.append(f"\n1 image: TTFT {vs['1 image']['ttft_s']['mean']:.2f} s, {vs['1 image']['correct']} correct. 2 images: TTFT {vs['2 images']['ttft_s']['mean']:.2f} s, {vs['2 images']['correct']} correct. "
          'The one miss echoed the answer template ("first, second"). Re-asked without the template, the same images gave "red ... green". q3 had no vision.\n')
 M.append('## 6. System\n')
-M.append('| Item | Value |'); M.append('|---|---|')
-for line in mac_after.splitlines():
-    if 'Footprint' in line:
-        M.append(f'| Mac omlx-server footprint (after bench) | {line.split("Footprint:")[1].strip()} |')
-rss = [l for l in mac_after.splitlines() if l.strip().isdigit()]
-M.append(f'| Mac omlx-server RSS (after bench) | {int(rss[0]) / 1048576:.1f} GiB |')
-mj = json.loads([l for l in mac_after.splitlines() if l.startswith('{')][0])
-M.append(f"| Mac og worker peak RSS / footprint (watcher) | {mj['peak_rss_gib']:.1f} / {mj['peak_footprint_gib']:.1f} GiB of 256 GB |")
-for g, a in gpu.items():
-    M.append(f"| Box {g} VRAM used (start / peak / total) | {a['vram_used_mib_start']:,} / {a['vram_used_mib_peak']:,} / {a['vram_total_mib']:,} MiB |")
-    M.append(f"| Box {g} during 1M prefill | util {a['during_1M_prefill']['util_mean_pct']}% mean, {a['during_1M_prefill']['power_mean_w']} W mean (peak {a['power_peak_w']} W) |")
-bs = S['leg6_system']['box_step_ms (from Mac og/stats deltas, per decode step, all leg-2 requests)']
-M.append(f"| Box compute per decode step (layers 0-19, 8K-1M) | {bs['box_compute']['mean']:.2f} ms mean ({rng(bs['box_compute'], 2)}) |")
-M.append(f"| Mac-observed box round trip per step (incl. 10GbE) | {bs['roundtrip_incl_link']['mean']:.2f} ms mean ({rng(bs['roundtrip_incl_link'], 2)}) |")
-for k, l in S['leg6_system']['link_10GbE'].items():
-    M.append(f"| Link box->Mac during {k} | {l['box_to_mac_MBps_mean']} MB/s mean, {l['box_to_mac_MBps_peak_0.5s']} MB/s peak, {l['box_to_mac_GB_total']} GB total |")
-M.append('\nThe link is nowhere near saturated: a prefill ships about 0.43 KB per token of layer-20 state. Step times are Mac-side og/stats deltas per request; the box engine log records only per-session prefill times (box/engine_sessions.log).\n')
+if HAVE_SYS:
+    M.append('| Item | Value |'); M.append('|---|---|')
+    for line in mac_after.splitlines():
+        if 'Footprint' in line:
+            M.append(f'| Mac omlx-server footprint (after bench) | {line.split("Footprint:")[1].strip()} |')
+    rss = [l for l in mac_after.splitlines() if l.strip().isdigit()]
+    M.append(f'| Mac omlx-server RSS (after bench) | {int(rss[0]) / 1048576:.1f} GiB |')
+    mj = json.loads([l for l in mac_after.splitlines() if l.startswith('{')][0])
+    M.append(f"| Mac og worker peak RSS / footprint (watcher) | {mj['peak_rss_gib']:.1f} / {mj['peak_footprint_gib']:.1f} GiB of 256 GB |")
+    for g, a in gpu.items():
+        M.append(f"| Box {g} VRAM used (start / peak / total) | {a['vram_used_mib_start']:,} / {a['vram_used_mib_peak']:,} / {a['vram_total_mib']:,} MiB |")
+        M.append(f"| Box {g} during 1M prefill | util {a['during_1M_prefill']['util_mean_pct']}% mean, {a['during_1M_prefill']['power_mean_w']} W mean (peak {a['power_peak_w']} W) |")
+    bs = S['leg6_system']['box_step_ms (from Mac og/stats deltas, per decode step, all leg-2 requests)']
+    M.append(f"| Box compute per decode step (layers 0-19, 8K-1M) | {bs['box_compute']['mean']:.2f} ms mean ({rng(bs['box_compute'], 2)}) |")
+    M.append(f"| Mac-observed box round trip per step (incl. 10GbE) | {bs['roundtrip_incl_link']['mean']:.2f} ms mean ({rng(bs['roundtrip_incl_link'], 2)}) |")
+    for k, l in S['leg6_system']['link_10GbE'].items():
+        M.append(f"| Link box->Mac during {k} | {l['box_to_mac_MBps_mean']} MB/s mean, {l['box_to_mac_MBps_peak_0.5s']} MB/s peak, {l['box_to_mac_GB_total']} GB total |")
+    M.append('\nThe link is nowhere near saturated: a prefill ships about 0.43 KB per token of layer-20 state. Step times are Mac-side og/stats deltas per request; the box engine log records only per-session prefill times (box/engine_sessions.log).\n')
+else:
+    M.append('Box/Mac system sampling (VRAM, power, link throughput) was not collected in this run.\n')
 M.append('## Caveats\n')
 M.append('- Decode rates depend on content through DSpark acceptance (per-sample range about +-15%). Every point is a mean of 6 samples. Follow-ups reuse the same document with different questions.')
 M.append('- The q3 baseline is mostly single samples taken on a different build. The ratios show the order of magnitude, not a controlled A/B.')
 M.append('- TTFT is client-measured on the Mac through llama-swap. Box-only prefill time comes from the og worker log (`box open ... prefill Xs`).')
-M.append('- Follow-up questions on an 8K document got no box-cache resume (box log `resumed 0`), so their TTFT is a full 8K re-prefill (~1.0 s). From 128K up, follow-ups resume in 8,192-token blocks: all but the last partial block is reused, and TTFT is 1.5 s at 128K and 5.8 s at 1M. Turn-2 continuations (leg 4) resume the whole turn-1 prompt at every size.')
-M.append('- Turn-2 resume at 128K takes 1.25 s, slower than q3 (0.85 s). Box prefill is only 0.05 s; the Mac import of box state takes about 0.55 s, and the Mac layers 20-39 take the rest.')
-M.append('- The llama-swap description still says "text only", but vision is live (box /health vision:true) and was tested here.')
+M.append('- Follow-up questions on an 8K document got no box-cache resume (box log `resumed 0`), so their TTFT is a full 8K re-prefill (~1.0 s). From 128K up, follow-ups resume in 8,192-token blocks: all but the last partial block is reused, and TTFT is 1.3 s at 128K and 3.3 s at 1M. Turn-2 continuations (leg 4) resume the whole turn-1 prompt at every size.')
+M.append('- Round-trip ms/step counts from the moment a step is pre-sent to the box, which now happens before the Mac finishes the previous step, so it overlaps Mac work. It is not comparable with the link-only figure of the earlier run; box ms/step is.')
+M.append('- Four requests now decode together as two fused pairs (earlier builds ran two at a time and queued the rest).')
 (D / 'SUMMARY.md').write_text('\n'.join(M) + '\n')
 print('\n'.join(M))

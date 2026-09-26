@@ -50,6 +50,7 @@ DS41_OG_VISION=q3 is the old interim (images on the q3 child); never the default
 import argparse
 import asyncio
 import contextlib
+import contextvars
 import json
 import logging
 import os
@@ -95,6 +96,35 @@ DROP = {'host', 'content-length', 'transfer-encoding', 'connection', 'keep-alive
         'content-encoding'}
 MARK = 'ds41-og-resume:'
 DONE = b'data: [DONE]\n\n'
+# DS41_FE_TRACE=1: one "ds41-fe sup" log line per inference request with wall-clock stamps
+# (recv, body, parsed, sent, headers, first_content, end), comparable with the worker's trace.
+TRACE = os.environ.get('DS41_FE_TRACE', '0') == '1'
+_trace = contextvars.ContextVar('ds41_fe_sup', default=None)
+CONTENT = (b'"content":"', b'"reasoning_content":"', b'"text":"', b'"delta":"', b'"arguments":"')
+
+
+def stamp(key):
+    trace = _trace.get() if TRACE else None
+    if trace is not None and key not in trace:
+        trace[key] = time.time()
+
+
+def stamp_content(chunk):
+    trace = _trace.get() if TRACE else None
+    if trace is None or 'first_content' in trace:
+        return
+    for marker in CONTENT:
+        at = chunk.find(marker)
+        if at >= 0 and chunk[at + len(marker):at + len(marker) + 1] not in (b'"', b''):
+            trace['first_content'] = time.time()
+            return
+
+
+def trace_done():
+    trace = _trace.get() if TRACE else None
+    if trace is not None and 'end' not in trace:
+        trace['end'] = time.time()
+        LOG.info('ds41-fe sup %s', json.dumps(trace, sort_keys=True))
 
 
 def box_state(timeout=0.5):
@@ -551,7 +581,9 @@ class Supervisor:
             raise RuntimeError(f'images need the q3 child, current backend is {self.mode}')
         mode, port = self.mode, self.port
         headers = dict(headers)
-        if isinstance(data, dict):
+        if isinstance(data, dict) and (resume is not None or not body
+                                       or data.get('model', self.model_id) != self.model_id):
+            # Re-serialize only when the body changes (model id, resume); else forward the client's bytes.
             data = dict(data)
             if 'model' in data:
                 data['model'] = self.model_id
@@ -563,9 +595,11 @@ class Supervisor:
         self.inflight += 1
         self.idle.clear()
         self.stats[mode] += 1
+        stamp('sent')
         try:
             upstream = await self.client.send(self.client.build_request(method, url, headers=headers, content=body),
                                               stream=True)
+            stamp('headers')
         except BaseException:
             self._done()
             raise
@@ -585,6 +619,7 @@ class Supervisor:
         if body and request.headers.get('content-type', '').startswith('application/json'):
             with contextlib.suppress(ValueError):
                 data = json.loads(body)
+        stamp('parsed')
         if path in INFERENCE and isinstance(data, dict) and has_image(data):
             if VISION == 'reject' or (VISION == 'q3' and Q3):
                 return await self.forward_images(request.method, path, query, headers, data)
@@ -604,7 +639,7 @@ class Supervisor:
             return self.relay_raw(upstream, mode)
         if data.get('stream'):
             try:
-                upstream, mode = await self.open(request.method, path, query, headers, data)
+                upstream, mode = await self.open(request.method, path, query, headers, data, body)
             except (OSError, RuntimeError, httpx.HTTPError) as exc:
                 LOG.exception('no backend for a stream')
                 return self.error_response(f'no backend: {type(exc).__name__}')
@@ -614,7 +649,7 @@ class Supervisor:
             out_headers['x-ds41-og-backend'] = mode
             return StreamingResponse(self.splice(upstream, request.method, path, query, headers, data),
                                      status_code=200, headers=out_headers)
-        return await self.complete(request.method, path, query, headers, data)
+        return await self.complete(request.method, path, query, headers, data, body)
 
     async def forward_images_og(self, method, path, query, headers, data, body):
         """Image request on the og worker (the box runs the vision tower); never on q3."""
@@ -698,12 +733,14 @@ class Supervisor:
             try:
                 if sse:  # event by event, so a resume marker (not resumable on this path) never leaks
                     async for event in sse_events(upstream):
+                        stamp_content(event)
                         yield fix_keepalive(strip_marker(event), getattr(upstream, '_ds41_model', None))
                 else:
                     async for chunk in upstream.aiter_bytes():
                         yield strip_marker(chunk)
             finally:
                 await self.release(upstream)
+                trace_done()
         return StreamingResponse(relay(), status_code=upstream.status_code, headers=out_headers)
 
     async def release(self, upstream):
@@ -733,6 +770,7 @@ class Supervisor:
                         if splice.seen is None or not isinstance(obj, dict):
                             if isinstance(obj, dict):
                                 splice.record(obj)
+                            stamp_content(event)
                             yield fix_keepalive(event, getattr(upstream, '_ds41_model', None))
                             continue
                         obj = splice.rewrite(obj)
@@ -791,6 +829,7 @@ class Supervisor:
                 LOG.warning('resuming on %s after %.1fs (%d replayed tokens)', mode, time.monotonic() - started,
                             len(output))
         finally:
+            trace_done()
             self.stats['divergent'] += splice.divergent
             if pending is not None and not pending.done():
                 # Client went away while a backend was starting; let the switch finish, drop the request.
@@ -802,12 +841,12 @@ class Supervisor:
         upstream, _ = task.result()
         asyncio.ensure_future(self.release(upstream))
 
-    async def complete(self, method, path, query, headers, data):
+    async def complete(self, method, path, query, headers, data, body=b''):
         """Non-streaming chat/text completion with the same failover (nothing sent yet)."""
         started, resumes, resume = time.monotonic(), 0, None
         while True:
             try:
-                upstream, mode = await self.open(method, path, query, headers, data, resume=resume)
+                upstream, mode = await self.open(method, path, query, headers, data, body, resume=resume)
             except (OSError, RuntimeError, httpx.HTTPError) as exc:
                 LOG.exception('no backend for a completion')
                 return self.error_response(f'no backend: {type(exc).__name__}')
@@ -912,7 +951,10 @@ def main():
 
     @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
     async def proxy(path: str, request: Request):
+        if TRACE and request.url.path in INFERENCE:
+            _trace.set(dict(path=request.url.path, recv=time.time()))
         body = await request.body()
+        stamp('body')
         if sup.proc is None and request.url.path not in INFERENCE:
             return Response(status_code=503)
         return await sup.forward(request, body)

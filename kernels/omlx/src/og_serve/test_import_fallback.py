@@ -55,6 +55,7 @@ STORE = Store()
 pkg = stub('ogtest')
 pkg.__path__ = []
 stub('ogtest.growth')
+stub('ogtest.og_fused', ENABLED=False, eligible=lambda *a, **k: False)
 stub('ogtest.og_cache', from_env=lambda: STORE, numerics_key=lambda m: 'k')
 stub('ogtest.cache', DeepseekV41Cache=object)
 stub('ogtest.pipe_decoder', DecoderHalf=type('DecoderHalf', (), {}), load_decoder=lambda *a, **k: None)
@@ -79,6 +80,8 @@ def load(name):
     return mod
 
 
+load('fe_trace')
+load('fast_encode')
 wire = load('pipe_wire')
 failover = load('og_failover')
 load('og_images')

@@ -1,5 +1,6 @@
 """Box-side prefix cache: snapshots of a session's layers 0-20 state, kept as files in host shared memory
-(/dev/shm/split-nv/cache/<numerics>/) so they survive an engine or container restart (not a host reboot).
+(/dev/shm/split-nv/cache/<numerics>/) so they survive an engine or container restart; tools/cache_mirror.sh keeps
+an NVMe mirror that the unit restores after a host reboot.
 
 Layout (one set per numerics version; `.r0`/`.r1` = TP rank):
   blk-<bid>.r<rank>    native pages of one 8K grid block [8192 b, 8192 (b+1)): compressed KV (ratio 2 layers 2/8/14,
@@ -40,6 +41,7 @@ def _atomic_save(tensors, path, metadata=None):
 
     tmp = f"{path}.tmp{os.getpid()}"
     save_file({k: v.contiguous() for k, v in tensors.items()}, tmp, metadata=metadata)
+    os.chmod(tmp, 0o644)  # safetensors writes 0600; the host-side NVMe mirror (tools/cache_mirror.sh) reads as the user
     os.replace(tmp, path)
 
 

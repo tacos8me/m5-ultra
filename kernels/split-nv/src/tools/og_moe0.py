@@ -9,7 +9,7 @@ import og_ref as R
 layer = int(sys.argv[1]) if len(sys.argv) > 1 else 0
 cuda_path = sys.argv[2] if len(sys.argv) > 2 else '/dev/shm/split-nv/og/e0-base.pt'
 c = {k: v[1] for k, v in torch.load(cuda_path, map_location='cpu', weights_only=True).items()}
-mac = {k: v[0] for k, v in load_file('/mnt/nvme-2/og-box/og-trace-8k.trace.safetensors').items()}
+mac = {k: v[0] for k, v in load_file('/mnt/nvme-1/split-nv-ops/og-box/og-trace-8k.trace.safetensors').items()}
 L = f'layers.{layer}.ffn.'
 
 

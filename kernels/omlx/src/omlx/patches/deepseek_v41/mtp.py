@@ -107,6 +107,19 @@ class DSparkMixin:
         self.dspark_append_context(main_hidden, cache)
         return proposal_forward(self, anchor_ids, cache, draft_length)
 
+    def dspark_forward_batch(self, main_hiddens, anchors, caches, widths):
+        """dspark_forward for several requests in one decoder pass (dspark.proposal_forward_batch).
+
+        Returns each request's draft logits, or None (nothing done) when the blocks cannot share a pass.
+        """
+        from .dspark import batch_supported, proposal_forward_batch
+
+        if not batch_supported(self, list(widths)):
+            return None
+        for hidden, cache in zip(main_hiddens, caches):
+            self.dspark_append_context(hidden, cache)
+        return proposal_forward_batch(self, anchors, caches, widths[0])
+
     def dspark_markov(self, token_ids):
         return self.mtp[-1].markov_head(token_ids)
 

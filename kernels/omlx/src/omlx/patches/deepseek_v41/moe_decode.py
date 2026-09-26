@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""MXFP4 routed experts for short decode/verify blocks (1-5 rows).
+"""MXFP4 routed experts for short decode/verify blocks (1-16 rows).
 
 Replaces MLX's three gather_qmv launches (gate, up, down) with two: gate and
 up share one launch, and every kernel dispatches the pair index fastest, so the
@@ -9,7 +9,14 @@ MLX's per-pair arithmetic: the lane -> K mapping, qdot expression, E8M0/E2M1
 decode, per-group scale and simd_sum of fp_qmv_fast (gate/up, K % 512 == 0)
 and fp_qmv (down, K = 2304), so results are bitwise those of
 mx.gather_qmm(..., mode="mxfp4"). (An expert-major variant that kept all pairs
-of an expert in one threadgroup was slower: register pressure.)
+of an expert in one threadgroup was slower: register pressure. Re-measured on the
+M5 Ultra with real-routing unions for 1-10 rows: expert-major variants -- scalar
+leaders with 2-8 pairs per weight pass with prefetch, and a matrix-unit (NAX)
+kernel -- were all slower than these pair kernels, whose marginal cost per
+distinct expert is already ~95% of DRAM bandwidth; even dropping every duplicate
+pair outright would save only ~5% at 5 rows and ~10% at 8.)
+Per-pair arithmetic does not depend on the row count, so 6-16 row blocks (wider
+verify, two-stream batches) stay bitwise the gather_qmm path they replace.
 """
 
 import os
@@ -18,6 +25,7 @@ from functools import cache
 import mlx.core as mx
 
 ENABLED = os.environ.get("DS41_MOE_FUSED", "1") == "1"
+MAX_ROWS = int(os.environ.get("DS41_MOE_FUSED_ROWS", "16"))
 
 _HEADER = r"""
 inline float ds41_fp4(uint8_t bits) {
@@ -176,7 +184,7 @@ def supported(expert, x, indices):
     rows = indices.size // indices.shape[-1]
     return (w3.weight.shape == w1.weight.shape and k % 512 == 0 and n % 8 == 0
             and w2.weight.shape[1] % 8 == 0 and w2.weight.shape[2] * 8 == n
-            and n % 256 == 0 and (n // 256) >= 2 and 1 <= rows <= 5)
+            and n % 256 == 0 and (n // 256) >= 2 and 1 <= rows <= MAX_ROWS)
 
 
 def gate_up(xq, w1, w3, ids, topk):

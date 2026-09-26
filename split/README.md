@@ -40,7 +40,9 @@ room for 3M tokens of KV on the box and 1M-context requests on the Mac.
 3. **Tail replay (Mac).** Layers 20-39 run over the last ≤256 prompt rows to fill the decoder windows and prime DSpark.
 4. **Decode (both).** Each step: the Mac drafts up to 4 tokens (DSpark, verify-cost-aware depth), the box runs layers
    0-19 for the verify rows (6-7 ms), the Mac runs layers 20-39 + head, accepts, and drafts the next rows.
-   Two requests pipeline: the box works on one while the Mac works on the other.
+   Two requests pipeline: the box works on one while the Mac works on the other. Three or four run as fused pairs:
+   the Mac verifies and drafts a pair in one pass (weights read once, bit-identical per request) while the box
+   runs the other pair's steps.
 
 ## Correctness
 

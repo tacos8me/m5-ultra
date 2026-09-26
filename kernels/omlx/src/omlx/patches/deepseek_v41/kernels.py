@@ -19,10 +19,17 @@ DS41_DECODE_SINGLE_TILE = os.environ.get("DS41_DECODE_SINGLE_TILE", "1") == "1"
 DS41_INDEX_ROWS = os.environ.get("DS41_INDEX_ROWS", "1") == "1"
 DS41_DECODE_RADIX = os.environ.get("DS41_DECODE_RADIX", "1") == "1"
 DS41_PREFILL_MID_INDEX = int(os.environ.get("DS41_PREFILL_MID_INDEX", "1"))
+# Decode/verify attention (1-8 rows, D=512): decode each key once for eight
+# heads (attention_shared), bitwise equal to attention_fastdec.
+DS41_ATTN_SHARED = os.environ.get("DS41_ATTN_SHARED", "1") == "1"
+ATTN_HG = 8
+# Their merge: 4 simdgroups per head (bitwise the same sums), 4x the parallelism.
+DS41_MERGE_WIDE = os.environ.get("DS41_MERGE_WIDE", "1") == "1"
+MERGE_CH = 4
 
 import mlx.core as mx
 
-from . import decode_fusions, decode_topk
+from . import attn_fusions, decode_fusions, decode_topk
 from .packed_attention import rounded_packed_attention
 
 _HEADER = r"""
@@ -179,6 +186,105 @@ _ATTENTION_FASTDEC = r"""
         for (int v = 0; v < D / 32; ++v)
             acc[v] = acc[v] * correction + probability * values[v];
         maximum = next_maximum;
+    }
+    const size_t base = ((size_t(query) * H + head) * NS + split) * (D + 2);
+    for (int v = 0; v < D / 32; ++v) partial[base + first + v] = acc[v];
+    if (lane == 0) {
+        partial[base + D] = maximum;
+        partial[base + D + 1] = denominator;
+    }
+"""
+
+# Bitwise-equal _ATTENTION_FASTDEC for D=512 with the key decode shared by
+# HG heads: the heads of one query read the same packed rows (one KV head),
+# so each threadgroup decodes eight keys at a time into threadgroup memory
+# (one simdgroup per key slice) and every head reduces them from there. Per
+# (query, head, split) the keys, their order, the decoded values and the
+# per-key arithmetic are those of _ATTENTION_FASTDEC; partials are unchanged.
+_ATTENTION_SHARED = r"""
+    const uint tid = thread_index_in_threadgroup;
+    const uint lane = tid % 32, sg = tid / 32;
+    const uint head = threadgroup_position_in_grid.x * HG + sg;
+    const uint query = threadgroup_position_in_grid.y;
+    const uint split = threadgroup_position_in_grid.z;
+    const int H = meta[0], W = meta[1], C = meta[2];
+    const int NW = meta[3], NC = meta[4], NS = meta[5];
+    static_assert(D == 512, "shared decode attention layout");
+    constexpr int KEYS = 8, PER = KEYS / HG;
+    threadgroup float4 tile[KEYS * D / 4];
+    const uint first = lane * (D / 32);
+    float query_values[D / 32], acc[D / 32];
+    for (int v = 0; v < D / 32; ++v) {
+        query_values[v] = float(q[(query * H + head) * D + first + v]);
+        acc[v] = 0.0f;
+    }
+    float maximum = -INFINITY, denominator = 0.0f;
+    const int begin = int(split) * CHUNK;
+    const int count = max(0, min(CHUNK, W + C - begin));
+    int own_row = -1;
+    if (int(lane) < count) {
+        const int j = begin + int(lane);
+        const bool compressed = j >= W;
+        const int row = compressed ? ci[query * C + j - W] : wi[query * W + j];
+        own_row = (row < 0 || row >= (compressed ? NC : NW)) ? -1 : row;
+    }
+    for (int j0 = 0; j0 < count; j0 += KEYS) {
+        for (int i = 0; i < PER; ++i) {
+            const int t = int(sg) * PER + i;
+            const int row = simd_shuffle(own_row, ushort(j0 + t));
+            if (j0 + t >= count || row < 0) continue;
+            float values[D / 32];
+            if (begin + j0 + t >= W) {
+                const size_t base = size_t(row) * (D / 2 + D / 16);
+                const uint2 packed = *(const device uint2*)(pooled + base + first / 2);
+                const float pooled_scale = v41_fp8_bits(pooled[base + D / 2 + first / 16]);
+                for (int v = 0; v < D / 32; ++v) {
+                    const uint byte = ((v < 8 ? packed.x : packed.y) >> (8 * ((v / 2) % 4))) & 255u;
+                    const uchar code = uchar((byte >> ((v % 2) * 4)) & 15u);
+                    values[v] = v41_fp4_lut(code) * pooled_scale;
+                }
+            } else {
+                const size_t base = size_t(row) * (D + D / 32);
+                const uint4 packed = *(const device uint4*)(window + base + first);
+                const int window_exp = int(window[base + D + first / 32]) - 127;
+                if (window_exp >= -117 && window_exp <= 118) {
+                    const float window_scale = as_type<float>(uint(window_exp + 127) << 23);
+                    for (int v = 0; v < D / 32; ++v) {
+                        const uchar code = uchar((packed[v / 4] >> (8 * (v % 4))) & 255u);
+                        values[v] = v41_fp8_bits(code) * window_scale;
+                    }
+                } else {
+                    for (int v = 0; v < D / 32; ++v) {
+                        const uchar code = uchar((packed[v / 4] >> (8 * (v % 4))) & 255u);
+                        values[v] = ldexp(v41_fp8_bits(code), window_exp);
+                    }
+                }
+            }
+            for (int v = 0; v < D / 128; ++v)
+                tile[t * (D / 4) + lane * (D / 128) + v] =
+                    float4(values[4 * v], values[4 * v + 1], values[4 * v + 2], values[4 * v + 3]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int n = min(KEYS, count - j0);
+        for (int t = 0; t < n; ++t) {
+            if (simd_shuffle(own_row, ushort(j0 + t)) < 0) continue;
+            float values[D / 32], dot = 0.0f;
+            for (int v = 0; v < D / 128; ++v) {
+                const float4 x = tile[t * (D / 4) + lane * (D / 128) + v];
+                values[4 * v] = x.x; values[4 * v + 1] = x.y; values[4 * v + 2] = x.z; values[4 * v + 3] = x.w;
+            }
+            for (int v = 0; v < D / 32; ++v)
+                dot += query_values[v] * values[v];
+            const float score = simd_sum(dot) * scalep[0];
+            const float next_maximum = max(maximum, score);
+            const float correction = exp(maximum - next_maximum);
+            const float probability = exp(score - next_maximum);
+            denominator = denominator * correction + probability;
+            for (int v = 0; v < D / 32; ++v)
+                acc[v] = acc[v] * correction + probability * values[v];
+            maximum = next_maximum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const size_t base = ((size_t(query) * H + head) * NS + split) * (D + 2);
     for (int v = 0; v < D / 32; ++v) partial[base + first + v] = acc[v];
@@ -495,10 +601,86 @@ _MERGE = r"""
         out[(query * H + head) * D + lane + v * 32] = T(acc[v] / denominator);
 """
 
+# _MERGE with CH simdgroups per head (one threadgroup), each owning D/32/CH of
+# a lane's values: every output keeps _MERGE's sink-first maximum,
+# split-ordered denominator and sums; short decode blocks get CH times the
+# simdgroups. R > 0 applies the output's partial RoPE (fast_rope arithmetic on
+# the bf16 merge output; value pairs (2p, 2p + 1) sit in lanes (2m, 2m + 1)).
+_MERGE_WIDE = r"""
+    const uint lane = thread_index_in_simdgroup;
+    const uint chunk = simdgroup_index_in_threadgroup;
+    const uint head = threadgroup_position_in_grid.x;
+    const uint query = threadgroup_position_in_grid.y;
+    const int H = meta[0], NS = meta[1];
+    constexpr int VPS = D / 32 / CH;
+    const size_t base = (size_t(query) * H + head) * NS * (D + 2);
+    float maximum = float(sink[head]);
+    for (int s = 0; s < NS; ++s)
+        maximum = max(maximum, partial[base + s * (D + 2) + D]);
+    float denominator = exp(float(sink[head]) - maximum);
+    float acc[VPS];
+    for (int i = 0; i < VPS; ++i) acc[i] = 0.0f;
+    for (int s = 0; s < NS; ++s) {
+        const size_t pos = base + s * (D + 2);
+        const float correction = exp(partial[pos + D] - maximum);
+        denominator += partial[pos + D + 1] * correction;
+        for (int i = 0; i < VPS; ++i)
+            acc[i] += partial[pos + lane + (chunk * VPS + i) * 32] * correction;
+    }
+    for (int i = 0; i < VPS; ++i) {
+        const int v = int(chunk) * VPS + i;
+        T value = T(acc[i] / denominator);
+        if (R > 0 && v * 32 >= D - R) {
+            const uint p = (lane + v * 32) / 2;
+            const uint j = query * (R / 2) + (p - (D - R) / 2);
+            float c = cos_t[j];
+            float s = sin_t[j];
+            const float own = static_cast<float>(value);
+            const float other = simd_shuffle_xor(own, ushort(1));
+            float a = (lane & 1) ? other : own;
+            float b2 = (lane & 1) ? own : other;
+            float a_c = a * c;
+            float b_s = b2 * s;
+            float a_s = a * s;
+            float b_c = b2 * c;
+            value = (lane & 1) ? static_cast<T>(a_s + b_c) : static_cast<T>(a_c - b_s);
+        }
+        out[(query * H + head) * D + lane + v * 32] = value;
+    }
+"""
+
+# _MERGE followed by the output's partial RoPE (fast_rope arithmetic on the
+# bf16 merge output): value pairs (2p, 2p + 1) sit in lanes (2m, 2m + 1).
+_MERGE_ROPE = _MERGE.replace(
+    """    for (int v = 0; v < D / 32; ++v)
+        out[(query * H + head) * D + lane + v * 32] = T(acc[v] / denominator);
+""",
+    """    for (int v = 0; v < D / 32; ++v) {
+        T value = T(acc[v] / denominator);
+        if (v * 32 >= D - R) {
+            const uint p = (lane + v * 32) / 2;
+            const uint j = query * (R / 2) + (p - (D - R) / 2);
+            float c = cos_t[j];
+            float s = sin_t[j];
+            const float own = static_cast<float>(value);
+            const float other = simd_shuffle_xor(own, ushort(1));
+            float a = (lane & 1) ? other : own;
+            float b2 = (lane & 1) ? own : other;
+            float a_c = a * c;
+            float b_s = b2 * s;
+            float a_s = a * s;
+            float b_c = b2 * c;
+            value = (lane & 1) ? static_cast<T>(a_s + b_c) : static_cast<T>(a_c - b_s);
+        }
+        out[(query * H + head) * D + lane + v * 32] = value;
+    }
+""",
+)
+
 
 @cache
 def _kernel(kind):
-    if kind in ("attention", "attention_mma", "attention_fastdec"):
+    if kind in ("attention", "attention_mma", "attention_fastdec", "attention_shared"):
         inputs = ["q", "window", "pooled", "wi", "ci", "meta", "scalep"]
         outputs, source = (
             ["partial"],
@@ -506,11 +688,18 @@ def _kernel(kind):
                 "attention": _ATTENTION,
                 "attention_mma": _ATTENTION_MMA,
                 "attention_fastdec": _ATTENTION_FASTDEC,
+                "attention_shared": _ATTENTION_SHARED,
             }[kind],
         )
     elif kind == "merge":
         inputs = ["partial", "sink", "meta"]
         outputs, source = ["out"], _MERGE
+    elif kind == "merge_rope":
+        inputs = ["partial", "sink", "meta", "cos_t", "sin_t"]
+        outputs, source = ["out"], _MERGE_ROPE
+    elif kind == "merge_wide":
+        inputs = ["partial", "sink", "meta", "cos_t", "sin_t"]
+        outputs, source = ["out"], _MERGE_WIDE
     elif kind == "index_mma_rows":
         inputs = ["q", "keys", "weights", "meta"]
         outputs, source = ["scores"], _INDEX_MMA_ROWS
@@ -526,8 +715,12 @@ def _kernel(kind):
     )
 
 
-def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
-    """Read packed rows directly; scratch scales with split count, not selected D."""
+def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale, rope_tables=None):
+    """Read packed rows directly; scratch scales with split count, not selected D.
+
+    rope_tables (cos, sin, rope_dim): also apply that partial RoPE (fast_rope)
+    to the output; short decode blocks fuse it into the merge.
+    """
     if q.ndim != 4 or q.shape[0] != 1 or q.shape[-1] % 32:
         raise ValueError("Prepare one request with 32-aligned attention heads")
     _, length, heads, dim = q.shape
@@ -541,8 +734,16 @@ def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
         raise ValueError("Expected packed uint8 KV")
     if window.shape[-1] != dim + dim // 32 or pooled.shape[-1] != dim // 2 + dim // 16:
         raise ValueError("Invalid packed KV row width")
+
+    def rotated(out):
+        if rope_tables is None:
+            return out
+        from .fast_rope import partial_rope
+
+        return partial_rope(out, *rope_tables)
+
     if q.dtype == mx.bfloat16 and not (DS41_SPARSE and length <= 8 and dim == 512):
-        return rounded_packed_attention(q, window, pooled, wi, ci, sink, scale)
+        return rotated(rounded_packed_attention(q, window, pooled, wi, ci, sink, scale))
 
     # Short verification blocks share the decode reduction and split geometry.
     # Each query owns its causal indices while all rows share one dispatch.
@@ -556,6 +757,9 @@ def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
     placeholder = 1
     if kind == "attention" and decode_fusions.DS41_DECODE_KERNELS_V2 and dim == 512:
         kind, placeholder = "attention_fastdec", 16
+        if DS41_ATTN_SHARED and heads % ATTN_HG == 0:
+            kind, head_group = "attention_shared", ATTN_HG
+    threads = head_group * 32 if kind == "attention_shared" else 128
     partial = _kernel(kind)(
         inputs=[
             q,
@@ -576,20 +780,40 @@ def packed_sparse_attention(q, window, pooled, wi, ci, sink, scale):
             ),
             mx.array([scale]),
         ],
-        template=[("D", dim), ("CHUNK", chunk)],
-        grid=((heads + head_group - 1) // head_group * 128, length, splits),
-        threadgroup=(128, 1, 1),
+        template=[("D", dim), ("CHUNK", chunk)] + ([("HG", head_group)] if kind == "attention_shared" else []),
+        grid=((heads + head_group - 1) // head_group * threads, length, splits),
+        threadgroup=(threads, 1, 1),
         output_shapes=[(1, length, heads, splits, dim + 2)],
         output_dtypes=[mx.float32],
     )[0]
-    return _kernel("merge")(
-        inputs=[partial, sink, mx.array([heads, splits], mx.int32)],
-        template=[("D", dim), ("T", q.dtype)],
-        grid=((heads + 3) // 4 * 128, length, 1),
-        threadgroup=(128, 1, 1),
-        output_shapes=[q.shape],
-        output_dtypes=[q.dtype],
-    )[0]
+    fuse_rope = (
+        rope_tables is not None
+        and q.dtype == mx.bfloat16
+        and rope_tables[2] % 64 == 0
+        and 0 < rope_tables[2] <= dim
+        and rope_tables[0].shape == (length, rope_tables[2] // 2)
+    )
+    if DS41_MERGE_WIDE and (dim // 32) % MERGE_CH == 0:
+        dummy = mx.zeros((1,), mx.float32)
+        merged = _kernel("merge_wide")(
+            inputs=[partial, sink, mx.array([heads, splits], mx.int32)]
+            + (list(rope_tables[:2]) if fuse_rope else [dummy, dummy]),
+            template=[("D", dim), ("T", q.dtype), ("CH", MERGE_CH), ("R", rope_tables[2] if fuse_rope else 0)],
+            grid=(heads * MERGE_CH * 32, length, 1),
+            threadgroup=(MERGE_CH * 32, 1, 1),
+            output_shapes=[q.shape],
+            output_dtypes=[q.dtype],
+        )[0]
+    else:
+        merged = _kernel("merge_rope" if fuse_rope else "merge")(
+            inputs=[partial, sink, mx.array([heads, splits], mx.int32)] + (list(rope_tables[:2]) if fuse_rope else []),
+            template=[("D", dim), ("T", q.dtype)] + ([("R", rope_tables[2])] if fuse_rope else []),
+            grid=((heads + 3) // 4 * 128, length, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[q.shape],
+            output_dtypes=[q.dtype],
+        )[0]
+    return merged if fuse_rope else rotated(merged)
 
 
 def packed_index_scores(
@@ -1159,7 +1383,7 @@ def packed_index_topk(
             mx.full((1, end - begin, block_count), 2147483647, mx.int32),
         )
         visible = min(width, (start + end) // ratio)
-        selected = None
+        selected = block_selected = None
         for first in range(0, visible, chunk_size):
             stop = min(first + chunk_size, visible)
             scores = packed_index_scores(
@@ -1170,7 +1394,12 @@ def packed_index_topk(
                 ratio,
                 key_start=first,
             )
-            if (
+            select = single_tile and q.shape[1] <= 8 and attn_fusions.DECODE_SELECT
+            if select and attn_fusions.select_supported(scores.shape[-1], count):
+                # Decode/verify rows: one-kernel exact selection of the same
+                # ids (score desc, id asc) as the tile sort + rank merges.
+                selected = attn_fusions.select_rows(scores, count, offset=first)
+            elif (
                 DS41_DECODE_RADIX
                 and single_tile
                 and q.shape[1] <= 8
@@ -1186,7 +1415,19 @@ def packed_index_topk(
                     if first == 0 and values.shape[-1] == count
                     else _merge_topk(running, (values, ids), count)
                 )
-            if block_count:
+            if block_count and select and attn_fusions.select_supported(
+                (scores.shape[-1] + block_size - 1) // block_size, block_count
+            ):
+                block_selected = attn_fusions.select_rows(
+                    scores,
+                    block_count,
+                    offset=first // block_size,
+                    block_size=block_size,
+                    force_latest=True,
+                    start=start + begin,
+                    ratio=ratio,
+                )
+            elif block_count:
                 values, ids = _tile_topk(
                     scores,
                     block_count,
@@ -1216,7 +1457,9 @@ def packed_index_topk(
             else mx.sort(mx.where(running[0] > -float("inf"), running[1], -1), axis=-1)
         )
         block_results.append(
-            mx.sort(mx.where(blocks[0] > -float("inf"), blocks[1], -1), axis=-1)
+            block_selected
+            if block_selected is not None
+            else mx.sort(mx.where(blocks[0] > -float("inf"), blocks[1], -1), axis=-1)
         )
     if pending:
         mx.eval(*pending)

@@ -20,7 +20,9 @@ import mlx.core as mx
 ENABLED = os.environ.get("DS41_FAST_QMV", "1") == "1"
 ENABLED_M1 = True
 # Measured in the full model: faster for M=4-5, slower for M=2 (fewer threadgroups).
-MIN_ROWS = 4
+# M=3 (bitwise the same MLX qmv_wide arithmetic) is faster too: 51-56 vs 61-85 us for
+# the attention projections (attn_bench), so it starts at 3.
+MIN_ROWS = int(os.environ.get("DS41_FAST_QMV_MIN_ROWS", "3"))
 
 _HEADER = r"""
 inline float ds41_fp8_e4m3(uchar bits) {

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Post-deploy gates (box must be quiet). usage: tools/s4_after.sh <label>
-LOG=/mnt/nvme-2/og-box-s4/${1:?label}-gates.log
+LOG=/mnt/nvme-1/split-nv-ops/og-box-s4/${1:?label}-gates.log
 S=/tmp/claude-1000/-home-ian-mac/3b1e9369-a329-4d79-992c-bf60818fcab6/scratchpad
 cd /home/ian/split-nv
 {

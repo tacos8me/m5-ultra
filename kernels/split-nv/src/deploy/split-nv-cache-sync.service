@@ -1,0 +1,6 @@
+[Unit]
+Description=Mirror the split-nv box prefix cache from /dev/shm to local NVMe
+
+[Service]
+Type=oneshot
+ExecStart=/home/ian/split-nv-deploy/tools/cache_mirror.sh sync

@@ -2,7 +2,7 @@
 # Deploy a gated commit from the deploy worktree and run the gates. usage: tools/s4_deploy.sh <commit> <label>
 set -u
 C=${1:?commit}; LABEL=${2:?label}
-LOG=/mnt/nvme-2/og-box-s4/$LABEL.log
+LOG=/mnt/nvme-1/split-nv-ops/og-box-s4/$LABEL.log
 git -C /home/ian/split-nv-deploy fetch -q /home/ian/split-nv '+refs/heads/*:refs/remotes/dev/*' && git -C /home/ian/split-nv-deploy checkout -q --detach "$C" || exit 1
 cp /home/ian/split-nv-deploy/deploy/split-nv-engine.service ~/.config/systemd/user/split-nv-engine.service
 systemctl --user daemon-reload

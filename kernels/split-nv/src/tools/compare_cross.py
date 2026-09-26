@@ -17,7 +17,7 @@ def metrics(a, b):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--raw')
-    ap.add_argument('--native', default='/mnt/nvme-2/native-encoder-8k.safetensors')
+    ap.add_argument('--native', default='/mnt/nvme-1/split-nv-ops/traces/native-encoder-8k.safetensors')
     ap.add_argument('--cuda-trace', default='/dev/shm/split-nv/cuda-trace-8213.pt')
     ap.add_argument('--mac-trace')
     args = ap.parse_args()

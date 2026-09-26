@@ -14,6 +14,10 @@ cost policy, sampling, tool/reasoning parsing and OpenAI API run unchanged:
 * Decode/verify: each forward sends the rows to the box (rollback is implied by
   `keep` = the cache offset) and runs layers 20-39 on the returned boundary.
   Two requests' STEPs are sent before either reply is read.
+* Fused verify (og_fused.py): with three or more requests decoding, pairs of
+  requests verify in one Mac pass (dense weights and head read once); the two
+  pairs alternate, so the box runs one pair's steps while the Mac serves the
+  other. Each request's arithmetic is bitwise its own forward_boundary.
 * Session binding: layer 1's Engram-history slot (unused on the Mac, Engram runs
   on the box) holds the session id as a [1, 1] int64 row, so it follows every
   cache extract/merge/extend/filter the scheduler performs for batching.
@@ -35,7 +39,7 @@ import time
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import growth, og_cache, og_failover, og_images, pipe_wire
+from . import fast_encode, fe_trace, growth, og_cache, og_failover, og_fused, og_images, pipe_wire
 from .cache import DeepseekV41Cache
 from .pipe_decoder import DecoderHalf, load_decoder
 from .pipe_session import PipelineDepthController, open_remote
@@ -48,13 +52,27 @@ REQUESTS = {}
 STATS = dict(opened=0, open_failed=0, open_retries=0, closed=0, steps=0, box_s=0.0, wait_s=0.0, rows=0, roundtrip_s=0.0,
              payload_s=0.0, single_calls=0, multi_calls=0, present_hits=0, presend_errors=0, box_lost=0,
              box_resumed=0, box_resumed_tokens=0, delta_opens=0, delta_rows=0, delta_retries=0,
-             import_failed=0, import_fallbacks=0)
+             import_failed=0, import_fallbacks=0, kickoff_sent=0, kickoff_errors=0, fused_calls=0, fused_steps=0, draft_batches=0)
 BOX_CACHE = os.environ.get('DS41_OG_BOX_CACHE', '1') == '1'
 STATE = os.environ.get('DS41_OG_STATE', 'lean')
 STREAM = os.environ.get('DS41_OG_STREAM', '1') == '1'
 DELTA_MIN = int(os.environ.get('DS41_OG_DELTA_MIN', '4096'))
+# Send the kickoff STEP (the last prompt token at N-1) as soon as the OPEN is done, so the box
+# computes it while the Mac imports the state; the first forward finds it in flight (ensure_step).
+KICKOFF = os.environ.get('DS41_OG_KICKOFF', '1') == '1'
+# Wake the idle engine loop when a box OPEN completes (else the loop notices within step_interval, 50 ms).
+WAKE = os.environ.get('DS41_OG_WAKE', '1') == '1'
 STORE = og_cache.from_env()
+# GPU keep-warm while a STEP is in flight: the box wait (~10 ms) is the one long GPU idle
+# of a cycle, and the forward after it ran ~0.5 ms slower at 5 rows (partial-load bench,
+# 10 ms idle with the host spinning; restored by this). A 4 MB add on a side stream every
+# DS41_OG_GPU_WARM_US; never waited on, so the forward never queues behind it. 0 = off.
+GPU_WARM_S = float(os.environ.get('DS41_OG_GPU_WARM_US', '500')) / 1e6
 NUMERICS = [None]  # numerics key of the latest import; store lookups match it
+# Fused multi-request verify (og_fused, DS41_OG_FUSE=0 = off): pair requests into one Mac pass once
+# at least FUSE_MIN requests verify in a scheduler step. With 2 the lone pair waits for both box steps
+# (per-request verify hides them), so pairs start at 3.
+FUSE_MIN = int(os.environ.get('DS41_OG_FUSE_MIN', '3'))
 _lock = threading.Lock()
 _ids = itertools.count(1)
 
@@ -91,6 +109,28 @@ def _log_trace(t):
                 gap('prepare_end', 'first_step'), gap('arrival', 'first_step'), t['first_step'])
 
 
+DIGEST = os.environ.get('DS41_FE_DIGEST', '0') == '1'  # validation runs: log a digest of every imported state
+
+
+def _log_digest(request_id, tokens, cache):
+    """sha256 of the prompt ids and of every Mac-side cache array after the import (bitwise evidence)."""
+    import hashlib
+    import numpy as np
+    h = hashlib.sha256(np.asarray(tokens, np.uint32).tobytes())
+    ids = h.hexdigest()[:16]
+    for i, item in enumerate(cache[20:], 20):
+        for slot, x in enumerate(item.cache):
+            if i == 20 and slot in (2, 3):
+                continue  # layer 20's global rows are the box's bytes (+ stored delta base), not replayed
+            if x is not None and x.size:
+                h.update(np.array(x.view(mx.uint8) if x.dtype != mx.uint8 else x).tobytes())
+    ctx = getattr(cache[0], '_omlx_mtp_prime_ctx', None)
+    for stage in (ctx.caches if ctx is not None else ()):
+        if stage.keys is not None:
+            h.update(np.array(stage.keys.view(mx.uint8)).tobytes())
+    logger.info('ds41-og digest %s: %d tokens, ids %s, state %s', request_id, len(tokens), ids, h.hexdigest()[:16])
+
+
 def session_of(cache):
     value = cache[SID_LAYER][6]
     if value is None or value.shape != (1, 1):
@@ -100,6 +140,26 @@ def session_of(cache):
     if encoder is None:
         raise RuntimeError(f'ds41-og box session {sid} is closed')
     return encoder
+
+
+class GpuWarm:
+    """Recv-spin hook of the engine thread: keeps the GPU clocked during the box wait."""
+
+    def __init__(self, interval):
+        self.interval, self.next, self.x, self.stream = interval, 0.0, None, None
+
+    def __call__(self):
+        now = time.perf_counter()
+        if now < self.next:
+            return
+        self.next = now + self.interval
+        if self.x is None:
+            self.stream = mx.new_stream(mx.gpu)
+            with mx.stream(self.stream):
+                self.x = mx.zeros((1 << 20,), mx.float32)
+                mx.eval(self.x)
+        with mx.stream(self.stream):
+            mx.async_eval(self.x + 1.0)
 
 
 class OgLanguageModel(DecoderHalf):
@@ -115,6 +175,14 @@ class OgLanguageModel(DecoderHalf):
     def make_mtp_depth_controller(self, depth):
         return PipelineDepthController(depth)
 
+    def _gpu_warm(self):
+        if not GPU_WARM_S:
+            return None
+        warm = self.__dict__.get('_og_gpu_warm')
+        if warm is None:
+            warm = self.__dict__['_og_gpu_warm'] = GpuWarm(GPU_WARM_S)
+        return warm
+
     def _remote(self, ids_list, caches, states_list):
         """Send every request's STEP first, then run layers 20-39 as replies land.
 
@@ -125,27 +193,42 @@ class OgLanguageModel(DecoderHalf):
         sessions = [session_of(cache) for cache in caches]
         starts = [cache[0].size() for cache in caches]
         ids_list = [list(ids) for ids in ids_list]
+        fuse = (len(caches) > 1 and all(states is not None for states in states_list)
+                and og_fused.eligible(self, [len(ids) for ids in ids_list]))
         try:
             for encoder, ids, start in zip(sessions, ids_list, starts):
                 STATS['present_hits'] += encoder.ensure_step_safe(ids, start)
-            out = []
+            out, items = [], []
             for encoder, ids, start, cache, states in zip(sessions, ids_list, starts, caches, states_list):
-                raw, timing = encoder.recv_step_safe(ids, start)
+                raw, timing = encoder.recv_step_safe(ids, start, self._gpu_warm())
                 arrays = mlx_step(raw, len(ids))
-                logits, hidden = self.forward_boundary(
-                    **arrays, cache=cache, start=start, verify=states is not None, verify_states=states)
-                cache[0]._pipe1_verify = None
+                if fuse:
+                    # One Mac pass for all of them once every boundary is in (og_fused).
+                    items.append(dict(**arrays, cache=cache, start=start, verify_states=states))
+                else:
+                    logits, hidden = self.forward_boundary(
+                        **arrays, cache=cache, start=start, verify=states is not None, verify_states=states)
+                    cache[0]._pipe1_verify = None
+                    out.append((logits, hidden))
                 STATS['steps'] += 1
                 STATS['rows'] += len(ids)
                 STATS['box_s'] += timing['box_s']
                 STATS['wait_s'] += timing['wait_s']
                 STATS['roundtrip_s'] += timing['roundtrip_s']
                 STATS['payload_s'] += timing['payload_s']
-                out.append((logits, hidden))
                 trace = getattr(encoder, '_og_trace', None)
                 if trace is not None and 'first_step' not in trace:
                     trace['first_step'] = time.time()
+                    fe_trace.og_stamp(trace.get('request_id'), 'first_step', trace['first_step'])
                     _log_trace(trace)
+                elif trace is not None and fe_trace.ON:
+                    fe_trace.og_stamp(trace.get('request_id'), 'second_step')
+            if fuse:
+                out = self.forward_boundaries(items)
+                for cache in caches:
+                    cache[0]._pipe1_verify = None
+                STATS['fused_calls'] += 1
+                STATS['fused_steps'] += len(items)
         except BoxLost as exc:
             STATS['box_lost'] += 1
             og_failover.note_lost(exc)
@@ -193,6 +276,48 @@ class OgLanguageModel(DecoderHalf):
             results.append((logits, hidden, None))
         return results
 
+    def mtp_verify_groups(self, lengths):
+        """Verify groups for one scheduler step (fused_batch.advance), or None for per-request verify.
+
+        With at least DS41_OG_FUSE_MIN requests to verify, consecutive requests of 2-5 rows pair
+        up into one fused Mac pass (og_fused); a request of one row stays alone. Groups run one
+        after another, each pre-sending its next STEPs after its drafts, so the box computes one
+        pair's steps while the Mac verifies and drafts the other pair.
+        """
+        if not og_fused.ENABLED or len(lengths) < FUSE_MIN:
+            return None
+        groups, pair = [], []
+        for i, length in enumerate(lengths):
+            if 2 <= length <= 5:
+                pair.append(i)
+                if len(pair) == 2:
+                    groups.append(pair)
+                    pair = []
+            else:
+                groups.append([i])
+        if pair:
+            groups.append(pair)
+        if all(len(g) == 1 for g in groups) or not og_fused.eligible(self, [2, 2]):
+            return None
+        return groups
+
+    @property
+    def mtp_draft_jobs_enabled(self):
+        """Fused pairs draft together (dspark.proposal_forward_batch); DS41_OG_DRAFT_BATCH=0 = per request."""
+        from . import dspark
+        return dspark.DRAFT_BATCH
+
+    def mtp_draft_jobs(self, jobs, depths):
+        """Draft a verified group's next blocks (one DSpark pass when they share a width), then pre-send each."""
+        from ..mlx_lm_mtp import batch_generator as bg
+        STATS['draft_batches'] += bg.dspark_draft_jobs(jobs, depths)
+        for gen_batch, state, *_ in jobs:
+            try:
+                presend(gen_batch, state)
+            except Exception:  # noqa: BLE001 -- the ordinary send path still runs
+                STATS['presend_errors'] += 1
+                logger.debug('ds41-og presend skipped', exc_info=True)
+
     def mtp_partial_rollback(self, cache, accepted, num_drafts):
         """Served rollback semantics on layers 20-39; the box rewinds on the next STEP."""
         if not 0 <= accepted <= num_drafts:
@@ -223,7 +348,8 @@ class OgLanguageModel(DecoderHalf):
             item[0] = mx.array([end], mx.int32)
             item.left_padding, item.lengths = snapshot[1], snapshot[2]
             item.advance(count)
-        mx.eval([item.state for item in cache[20:]])
+        # No eval here: the next verify forward consumes these slices, so the
+        # rollback costs no host sync (27a9b621; lost in the 45ef51f8 rebase).
         return True
 
 
@@ -276,6 +402,8 @@ def load(path, **kwargs):
     tokenizer.tool_call_start = tool_call_start
     tokenizer.tool_call_end = tool_call_end
     tokenizer.tool_parser = parse_tool_call
+    if fast_encode.install(tokenizer) is not None:
+        fast_encode.install_prepare_inputs(Processor)
     model = OgModel(language_model)
     return model, Processor(tokenizer, model.config)
 
@@ -298,9 +426,10 @@ class Job(threading.Thread):
     DS41_OG_RESUME_TRIES times.
     """
 
-    def __init__(self, host, port, request_id, tokens, images=None):
+    def __init__(self, host, port, request_id, tokens, images=None, wake=None):
         super().__init__(name=f'ds41-og-open-{request_id}', daemon=True)
         self.host, self.port, self.request_id, self.tokens = host, port, request_id, list(tokens)
+        self.wake = wake  # wakes the idle engine loop when the open is done (else it polls every 50 ms)
         self.images = list(images or ())
         # Prefix keys for the Mac row store: token ids, image-content keys inside image spans (og_images).
         self.keys = og_images.prompt_keys(self.tokens[:-1], self.images)
@@ -333,6 +462,17 @@ class Job(threading.Thread):
                 raise RuntimeError('box sent a delta state that was not requested')
         if delta:
             self.base_rows = (entry.kv, entry.index)
+        info = self.encoder.open_info
+        for key in ('t_ack', 't_first_part', 't_end'):
+            if info.get(key) is not None:
+                fe_trace.og_stamp(self.request_id, 'box_' + key[2:], info[key])
+        if KICKOFF:
+            try:
+                self.encoder.send_step(self.tokens[-1:], len(self.tokens) - 1)
+                STATS['kickoff_sent'] += 1
+            except (OSError, ValueError) as exc:  # the first forward's ensure_step recovers the session
+                STATS['kickoff_errors'] += 1
+                logger.warning('ds41-og kickoff step for %s not sent: %r', self.request_id, exc)
 
     def run(self):
         since, failures = time.monotonic(), 0
@@ -360,7 +500,14 @@ class Job(threading.Thread):
                 self.encoder.close()
         finally:
             self.trace['job_end'] = time.time()
+            fe_trace.og_stamp(self.request_id, 'job_start', self.trace['job_start'])
+            fe_trace.og_stamp(self.request_id, 'job_end', self.trace['job_end'])
             self.done.set()
+            if self.wake is not None:
+                try:
+                    self.wake()
+                except Exception:  # noqa: BLE001 -- the engine loop still polls
+                    logger.debug('ds41-og engine wake failed', exc_info=True)
 
 
 class OgPrefill:
@@ -392,9 +539,11 @@ class OgPrefill:
             og_failover.open_failed(request.request_id, ValueError(
                 f'ds41-og serves prompts of 2..1048576 tokens (got {len(tokens)})'), kind='invalid')
             return True
-        job = Job(self.host, self.port, request.request_id, tokens, images)
+        job = Job(self.host, self.port, request.request_id, tokens, images, wake=opened_wake(scheduler) if WAKE else None)
         job.arrival = time.time() - (time.monotonic() - getattr(request, 'arrival_time', time.monotonic()))
         job.deferred = time.time()
+        fe_trace.og_stamp(request.request_id, 'arrival', job.arrival)
+        fe_trace.og_stamp(request.request_id, 'deferred', job.deferred)
         self.jobs[request.request_id] = job
         job.start()
         return True
@@ -411,12 +560,17 @@ class OgPrefill:
             return False
         tensors, manifest, open_s = job.result
         start = time.perf_counter()
+        fe_trace.og_stamp(request.request_id, 'prepare_start')
+        marks = fe_trace.for_request(request.request_id)
         encoder = job.encoder
         lm = language_model_of(scheduler.model)
         try:
             cache, rows = lm.import_state(tensors, manifest, tokens, identity=encoder.identity,
-                                          base_rows=job.base_rows)
+                                          base_rows=job.base_rows, **({'marks': marks} if marks is not None else {}))
             mx.eval([x for item in cache for x in item.cache if x is not None] + list(rows))
+            fe_trace.og_stamp(request.request_id, 'import_eval')
+            if DIGEST:
+                _log_digest(request.request_id, tokens, cache)
             if STORE is not None:
                 NUMERICS[0] = og_cache.numerics_key(manifest)
                 STORE.record(job.keys, *rows, NUMERICS[0])
@@ -455,6 +609,7 @@ class OgPrefill:
         STATS['delta_opens'] += bool(delta)
         STATS['delta_rows'] += delta
         STATS['image_opens'] = STATS.get('image_opens', 0) + bool(job.images)
+        fe_trace.og_stamp(request.request_id, 'prepare_end')
         logger.info('ds41-og %s: %d tokens, %d image(s), box open %.2fs (resumed %d, prefill %.2fs, %d bytes, delta_from %d), '
                     'import+replay %.2fs, session %d',
                     request.request_id, len(tokens), len(job.images), open_s, resumed, info.get('box_prefill_s') or 0,
@@ -487,6 +642,33 @@ class OgPrefill:
                     job.encoder.close()
             threading.Thread(target=reap, daemon=True).start()
         close_request(request_id)
+
+
+def opened_wake(scheduler):
+    """Called by a Job when its OPEN is done: mark the scheduler, then wake the idle engine loop.
+
+    The mark covers an OPEN that finishes while a step is running (after its defer
+    check): opened_step() then reports work, so the loop runs the admitting step at
+    once instead of clearing the wake and sleeping step_interval.
+    """
+    def wake():
+        scheduler._ds41_opened = True
+        notify = getattr(scheduler, '_ds41_wake', None)
+        if notify is not None:
+            notify()
+    return wake
+
+
+def opened_step(step):
+    """Scheduler.step wrapper: a step during which a box OPEN finished has work (see opened_wake)."""
+    def wrapped(self):
+        self._ds41_opened = False
+        output = step(self)
+        if getattr(self, '_ds41_opened', False) and output is not None and not getattr(output, 'has_work', True):
+            output.has_work = True
+        return output
+    wrapped.__wrapped__ = step
+    return wrapped
 
 
 def presend(gen_batch, state):
@@ -527,6 +709,15 @@ def install(host='10.10.10.1', port=10052):
 
     loading.load = og_load
     manager = OgPrefill(host, port)
+    from omlx.engine_core import EngineCore
+    engine_init = EngineCore.__init__
+
+    def _engine_init(self, *args, **kwargs):
+        engine_init(self, *args, **kwargs)
+        if getattr(self, 'scheduler', None) is not None:
+            self.scheduler._ds41_wake = self._wake_engine_loop
+
+    EngineCore.__init__ = _engine_init
     defer, prepare = Scheduler._should_defer_for_cache_freshness, Scheduler._prepare_prefix_cache_for_request
     abort, cleanup = Scheduler._do_abort_request, Scheduler._cleanup_finished
 
@@ -568,6 +759,7 @@ def install(host='10.10.10.1', port=10052):
 
     bg._run_verify_cycle_chain = _chain
     Scheduler._should_defer_for_cache_freshness = _defer
+    Scheduler.step = opened_step(Scheduler.step)
     Scheduler._prepare_prefix_cache_for_request = _prepare
     Scheduler._do_abort_request = _abort
     Scheduler._cleanup_finished = _cleanup

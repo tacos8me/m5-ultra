@@ -53,7 +53,7 @@ class DecoderHalf(LanguageModel):
                 cache[i][slot] = empty_slot(self._config, slot, mx.bfloat16)
         return cache
 
-    def import_state(self, tensors, manifest, tokens, *, identity, base_rows=None):
+    def import_state(self, tensors, manifest, tokens, *, identity, base_rows=None, marks=None):
         """Import a full, lean or delta ``ds41-encoder-state-v1`` (raw wire tensors).
 
         Returns (cache, rows): rows = layer 20's packed global KV / index K for
@@ -141,7 +141,10 @@ class DecoderHalf(LanguageModel):
             item.cache = [mx.array([prefilled], mx.int32)] + [None] * 6
             item.left_padding = item.lengths = None
             cache.append(item)
-        replay(self, cache, hidden, pre, first, tokens)
+        if marks is not None:
+            mx.eval(hidden, pre, slots[2], slots[3])
+            marks.setdefault("og.import_arrays", time.time())
+        replay(self, cache, hidden, pre, first, tokens, **({"marks": marks} if marks is not None else {}))
         return cache, (slots[2], slots[3])
 
     def forward_boundary(self, h, pre, cache, *, start, kv=None, index=None,
@@ -153,26 +156,7 @@ class DecoderHalf(LanguageModel):
         and use split-wire's prebuilt attention path.
         """
         c = self._config
-        if h.ndim != 4 or h.shape[0] != 1 or tuple(h.shape[2:]) != (c.hc_mult, c.dim):
-            raise ValueError("Invalid encoder hidden shape")
-        length = h.shape[1]
-        if not 1 <= length <= 5 or pre.shape != h.shape[:-1]:
-            raise ValueError("Decode boundary must contain 1..5 rows")
-        if h.dtype != mx.bfloat16 or pre.dtype != mx.float32:
-            raise ValueError("Unexpected encoder hidden/pre dtype")
-        if len(cache) != 40 or any(item.size() != start for item in cache):
-            raise ValueError("Decoder/session offsets diverged")
-        if (kv is None) != (index is None):
-            raise ValueError("Supply both global KV and index increments")
-        snapshots = [(list(x.cache), x.left_padding, x.lengths) for x in cache] if verify else None
-        states = (verify_states if verify_states is not None else [{} for _ in cache]) if verify else None
-        if kv is not None:
-            if kv.shape != (1, length, 288) or index.shape != (1, length, 68):
-                raise ValueError("Invalid layer20 increments")
-            if kv.dtype != mx.uint8 or index.dtype != mx.uint8:
-                raise ValueError("Expected packed layer20 bytes")
-            for slot, value in ((2, kv), (3, index)):
-                cache[20][slot] = growth.append(cache[20], slot, cache[20][slot], value, start)
+        length, snapshots, states = self._open_boundary(h, pre, cache, start, kv, index, verify, verify_states)
         shared, captured = {}, {}
         for i in range(20, 40):
             if verify:
@@ -197,6 +181,37 @@ class DecoderHalf(LanguageModel):
         if verify:
             cache[0]._pipe1_verify = (start, length, snapshots, states)
         return logits, hidden
+
+    def forward_boundaries(self, items, capture=True):
+        """Verify several requests' boundaries in one pass (og_fused): each item's
+        forward_boundary(verify=True) result, caches and verify stash."""
+        from . import og_fused
+        return og_fused.forward(self, items, capture)
+
+    def _open_boundary(self, h, pre, cache, start, kv, index, verify, verify_states):
+        """Validate a boundary and append its layer-20 rows; returns (length, snapshots, states)."""
+        c = self._config
+        if h.ndim != 4 or h.shape[0] != 1 or tuple(h.shape[2:]) != (c.hc_mult, c.dim):
+            raise ValueError("Invalid encoder hidden shape")
+        length = h.shape[1]
+        if not 1 <= length <= 5 or pre.shape != h.shape[:-1]:
+            raise ValueError("Decode boundary must contain 1..5 rows")
+        if h.dtype != mx.bfloat16 or pre.dtype != mx.float32:
+            raise ValueError("Unexpected encoder hidden/pre dtype")
+        if len(cache) != 40 or any(item.size() != start for item in cache):
+            raise ValueError("Decoder/session offsets diverged")
+        if (kv is None) != (index is None):
+            raise ValueError("Supply both global KV and index increments")
+        snapshots = [(list(x.cache), x.left_padding, x.lengths) for x in cache] if verify else None
+        states = (verify_states if verify_states is not None else [{} for _ in cache]) if verify else None
+        if kv is not None:
+            if kv.shape != (1, length, 288) or index.shape != (1, length, 68):
+                raise ValueError("Invalid layer20 increments")
+            if kv.dtype != mx.uint8 or index.dtype != mx.uint8:
+                raise ValueError("Expected packed layer20 bytes")
+            for slot, value in ((2, kv), (3, index)):
+                cache[20][slot] = growth.append(cache[20], slot, cache[20][slot], value, start)
+        return length, snapshots, states
 
     def rollback_boundary(self, cache, keep):
         """Retain the causal prefix of the most recent verify; remote mirrors it."""

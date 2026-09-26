@@ -23,6 +23,10 @@ STEP_TIMEOUT = float(os.environ.get('DS41_OG_STEP_TIMEOUT_S', '120'))
 # thread wakes on a cold core and the following MLX graph build runs ~3x slower
 # (measured 7.5 -> 2.1 ms per 20-layer build, drafter 8.9 -> 7.7 ms).
 SPIN_S = float(os.environ.get('DS41_OG_SPIN_MS', '60'))/1000
+# Per-socket receive buffer (no sysctl): a 5-row STEP reply is 206 KB, above the
+# 128 KB default window, so the box stalled mid-payload for an ACK round trip
+# (payload 0.76 -> 0.05 ms, roundtrip - box 1.72 -> 1.16 ms at 5 rows). 0 = OS default.
+RCVBUF = int(os.environ.get('DS41_OG_RCVBUF_KB', '4096')) * 1024
 IDENTITY = 'split-nv:sglang-757e8f35+hooks:fp8-original:enc0-20'
 # Mid-stream recovery: a lost box session (link drop, engine restart) is
 # re-opened on the committed tokens with OPEN state "none" and the failed STEP
@@ -110,6 +114,8 @@ class EncoderSession:
     def _connect(self, timeout=120):
         self.sock = socket.create_connection((self.host, self.port), timeout=5)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        if RCVBUF:
+            self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
         self.sock.settimeout(timeout)
 
     def close(self):
@@ -167,11 +173,13 @@ class EncoderSession:
             raise refused(tag, ack, 'Encoder open')
         self.session = int(ack['session'])
         self.open_info = dict(resumed_tokens=int(ack.get('resumed_tokens') or 0),
-                              ack_s=time.perf_counter()-start, delta_requested=int(delta_from))
+                              ack_s=time.perf_counter()-start, delta_requested=int(delta_from), t_ack=time.time())
         tensors, manifest, total = {}, None, 0
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
             tag, h, n = frame(self.sock)
+            if 't_first_part' not in self.open_info and tag in (b'STAT', b'TENS'):
+                self.open_info['t_first_part'] = time.time()
             if tag == b'STAT':
                 if tensors or manifest is not None or h.get('bytes',n) != n:
                     raise ValueError('Unexpected STAT frame')
@@ -180,6 +188,7 @@ class EncoderSession:
                 self.open_info.update(box_prefill_s=h.get('prefill_s'),state_bytes=n,
                                       transfer_s=time.perf_counter()-received)
                 tensors,manifest=parse_state_blob(blob)
+                self.open_info['t_end']=time.time()
                 if manifest.get('identity') != self.identity or manifest.get('token_sha256') != digest:
                     raise ValueError('Encoder identity/prompt mismatch')
                 self.length=len(tokens)-1
@@ -214,7 +223,7 @@ class EncoderSession:
                     raise ValueError('Incomplete encoder state')
                 if h.get('bytes',total) != total or manifest.get('bytes') != total:
                     raise ValueError('Encoder byte count mismatch')
-                self.open_info.update(box_prefill_s=h.get('prefill_s'), state_bytes=total)
+                self.open_info.update(box_prefill_s=h.get('prefill_s'), state_bytes=total, t_end=time.time())
                 if manifest.get('identity') != self.identity or manifest.get('token_sha256') != digest:
                     raise ValueError('Encoder identity/prompt mismatch')
                 self.length = len(tokens)-1
@@ -246,12 +255,14 @@ class EncoderSession:
         self.send_step(tokens, keep)
         return False
 
-    def recv_step(self):
+    def recv_step(self, idle=None):
+        """idle: optional callable run on each spin iteration while the reply is in flight."""
         rows_sent, keep, start, _ = self._pending
         waited = time.perf_counter()
         deadline = waited + SPIN_S
         while time.perf_counter() < deadline and not select.select([self.sock], [], [], 0)[0]:
-            pass
+            if idle is not None:
+                idle()
         tag, h, n = frame(self.sock)
         header_at = time.perf_counter()
         if tag != b'STPR' or len(h) != STPR.size:
@@ -352,12 +363,12 @@ class EncoderSession:
             self.recover(tokens, keep, exc)
             return False
 
-    def recv_step_safe(self, tokens, keep):
+    def recv_step_safe(self, tokens, keep, idle=None):
         """recv_step() for STEP(tokens, keep) that rebuilds a lost session and resends the step."""
         since = None
         while True:
             try:
-                return self.recv_step()
+                return self.recv_step(idle)
             except (OSError, RuntimeError, ValueError, struct.error, TypeError) as exc:
                 if isinstance(exc, BoxLost):
                     raise

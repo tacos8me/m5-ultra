@@ -14,6 +14,9 @@ DSpark target hidden states (layers 37/38/39) are captured per segment exactly
 like the served prompt capture, which rebuilds the prime ring.
 """
 
+import os
+import time
+
 import mlx.core as mx
 
 from .cache import DeepseekV41Cache
@@ -23,6 +26,9 @@ from ..mlx_lm_mtp.deepseek_v4_dspark import capture_prompt
 
 FORMAT = "ds41-encoder-state-v1"
 CHUNK = 8192
+# Host syncs in the replay: 1 = wait for every layer (as before); N > 1 = submit each layer
+# asynchronously and wait every N layers (same kernels on the same inputs, fewer idle gaps).
+EVAL_EVERY = max(1, int(os.environ.get("DS41_OG_REPLAY_EVAL_EVERY", "1")))
 
 
 def segments(prefilled, chunk=CHUNK, window=128):
@@ -105,8 +111,11 @@ def build_cache(lm, arrays, manifest, tokens, *, identity):
     return cache, manifest
 
 
-def replay(lm, cache, hidden, pre, first, tokens):
-    """Run layers mid..n-1 over the tail rows following the served geometry."""
+def replay(lm, cache, hidden, pre, first, tokens, marks=None):
+    """Run layers mid..n-1 over the tail rows following the served geometry.
+
+    ``marks`` (tracing only): a dict that receives wall-clock stamps per segment.
+    """
     c = lm._config
     mid = c.n_layers // 2
     prefilled = len(tokens) - 1
@@ -121,7 +130,7 @@ def replay(lm, cache, hidden, pre, first, tokens):
             return None
         mask = ids[:, lo:hi] == image_id
         return mask if bool(mx.any(mask).item()) else None
-    for a, b, chunk_len in segments(prefilled, CHUNK, c.window_size):
+    for seg, (a, b, chunk_len) in enumerate(segments(prefilled, CHUNK, c.window_size)):
         long = chunk_len > c.window_size
         chunk_start = b - chunk_len
         h = hidden[:, a - first : b - first]
@@ -151,16 +160,25 @@ def replay(lm, cache, hidden, pre, first, tokens):
                     prebuilt_end=b if i == mid else None,
                     hc_rows=chunk_len if (long and i == mid) else None,
                 )
-            mx.eval(h, p)
+            if EVAL_EVERY == 1 or (i - mid + 1) % EVAL_EVERY == 0 or i == c.n_layers - 1:
+                mx.eval(h, p)
+            else:
+                mx.async_eval(h, p)
             cache[i][0] = mx.array([b], mx.int32)
             for slot in range(1, 7):
                 if cache[i][slot] is None:
                     cache[i][slot] = empty_slot(c, slot, h.dtype)
         for i in range(mid):
             cache[i][0] = mx.array([b], mx.int32)
+        if marks is not None:
+            marks.setdefault("og.replay_layers%d" % seg, time.time())
         if prime:
             aux = mx.concatenate([captured[i] for i in c.dspark_target_layer_ids], axis=-1)
             capture_prompt(lm, ids[:, a:b], aux, cache)
+            if marks is not None:
+                ctx = getattr(cache[0], "_omlx_mtp_prime_ctx", None)
+                mx.eval([s.keys for s in ctx.caches if s.keys is not None] if ctx is not None else [])
+                marks.setdefault("og.replay_prime%d" % seg, time.time())
     mx.eval([x for item in cache for x in item.cache if x is not None])
     ctx = getattr(cache[0], "_omlx_mtp_prime_ctx", None)
     if ctx is not None:

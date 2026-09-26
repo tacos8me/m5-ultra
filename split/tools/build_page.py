@@ -266,7 +266,7 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
     <div><h3>Concurrency</h3><dl>
       <dt>2 requests, 8K</dt><dd>{c3["c2 8K"]["aggregate_tok_s"]["mean"]:.1f} tok/s<span>{c3["c2 8K"]["per_stream_tok_s"]["mean"]:.0f} each</span></dd>
       <dt>2 requests, 128K</dt><dd>{c3["c2 128K"]["aggregate_tok_s"]["mean"]:.1f} tok/s<span>{c3["c2 128K"]["per_stream_tok_s"]["mean"]:.0f} each</span></dd>
-      <dt>4 requests, 8K</dt><dd>{c3["c4 8K"]["aggregate_tok_s"]["mean"]:.1f} tok/s<span>2 at a time</span></dd>
+      <dt>4 requests, 8K</dt><dd>{c3["c4 8K"]["aggregate_tok_s"]["mean"]:.1f} tok/s<span>all 4 at once, {c3["c4 8K"]["per_stream_tok_s"]["mean"]:.0f} each</span></dd>
     </dl></div>
     <div><h3>Resuming a conversation</h3><dl>
       <dt>Turn 2 at 8K</dt><dd>{r4["8K"]["turn2_ttft_s"]["mean"]:.2f} s</dd>
@@ -289,7 +289,8 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
     <p>The box prefills layers 0–20 over the whole prompt and streams the state to the Mac in 8K chunks while it works.
     The Mac replays the last rows through layers 20–39, then each decode step crosses the link twice: draft tokens go to
     the box, which returns 41&nbsp;KB of hidden state per row. Two requests pipeline, so each machine works on one while the
-    other finishes the next.</p>
+    other finishes the next. From three requests up they run as fused pairs: the Mac verifies and drafts a pair in one pass,
+    reading the weights once, while the box runs the other pair's steps.</p>
     <p>A step on the box is bit-identical to prefilling the same rows, including rejected drafts, so a box engine restart
     mid-answer rebuilds the session and the text continues unchanged. If the box stays down, clients get a retryable
     error; no other model ever stands in.</p>
@@ -300,7 +301,7 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
     load. Prefill at 8K–128K is the mean of three fresh prompts, longer points single runs that repeat within 1%. Decode
     samples swing about ±15% with speculative acceptance.</p>
     <p>The 3-bit baseline is the previous production build (Mac only, LSQ 3-bit experts), measured earlier with a similar
-    harness; ratios are indicative, not a controlled A/B. Box engine c75a0a2, numerics og-s4.4.</p>
+    harness; ratios are indicative, not a controlled A/B. Box engine {S["deployment"]["box_engine"]}, numerics {S["deployment"]["numerics"]}; Mac build 51233501.</p>
     <p>Hardware: Mac Studio M5 Ultra, 80-core GPU, 256&nbsp;GB · 2× NVIDIA RTX PRO 6000 Blackwell, 96&nbsp;GB each ·
     direct 10GbE. Model: <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">deepseek-ai/DeepSeek-V4.1-Flash</a>, original weights.</p>
   </footer>

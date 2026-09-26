@@ -2,7 +2,7 @@
 # Post-restart gates for the s4 engine (live, bounded ~5 min). Exit code = number of failed gates.
 cd /home/ian/split-nv
 PY=/home/ian/.venv/bin/python
-REF=/mnt/nvme-2/og-box-s4/ref-2256aec
+REF=/mnt/nvme-1/split-nv-ops/og-box-s4/ref-2256aec
 fail=0
 g() { echo "## $*"; "$@" || { fail=$((fail+1)); echo "FAILED: $*"; }; }
 S=ref/ids-8192.json; L=ref/ids-131072.json

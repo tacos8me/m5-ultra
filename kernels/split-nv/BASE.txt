@@ -1,4 +1,5 @@
-split-nv engine (own code, src/): c75a0a2 (branch og-moe; deployed as systemd user unit split-nv-engine).
+split-nv engine (own code, src/): 9947c60 (branch og-moe; deployed as systemd user unit split-nv-engine, running the
+  image built from this Dockerfile). Engine numerics unchanged since c75a0a2 (og-s4.4).
 
 Base image: lmsysorg/sglang:dev-dsv41@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
   (torch 2.13.0+cu130, flashinfer 0.6.18+cu130 git 69ff11fc). The Dockerfile applies two patches:

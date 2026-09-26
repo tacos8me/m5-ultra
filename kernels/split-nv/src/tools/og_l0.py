@@ -8,7 +8,7 @@ import og_ref as R
 
 cuda_path = sys.argv[1] if len(sys.argv) > 1 else '/dev/shm/split-nv/og/e0-base.pt'
 c = {k: v[1] for k, v in torch.load(cuda_path, map_location='cpu', weights_only=True).items()}
-mac = {k: v[0] for k, v in load_file('/mnt/nvme-2/og-box/og-trace-8k.trace.safetensors').items()}
+mac = {k: v[0] for k, v in load_file('/mnt/nvme-1/split-nv-ops/og-box/og-trace-8k.trace.safetensors').items()}
 ids = torch.tensor(json.load(open('/home/ian/split-nv/ref/ids-8192.json'))[:8213])
 P0, P1 = 8077, 8213
 pos = torch.arange(P0, P1)
