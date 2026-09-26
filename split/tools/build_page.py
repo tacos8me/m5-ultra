@@ -120,14 +120,14 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
     font: 15px/1.6 -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, "Segoe UI", Roboto, sans-serif;
     font-variant-numeric: tabular-nums; padding-inline: 24px; padding-block: 56px 72px; }}
   main {{ max-width: 820px; margin: 0 auto; }}
-  h1 {{ font-size: 28px; font-weight: 600; letter-spacing: -0.015em; margin: 0; }}
+  h1 {{ font-size: 24px; font-weight: 600; letter-spacing: -0.015em; margin: 0; text-wrap: balance; }}
   h2 {{ font-size: 18px; font-weight: 600; letter-spacing: -0.01em; margin: 0 0 4px; text-wrap: balance; }}
-  .meta {{ color: var(--dim); margin: 6px 0 36px; max-width: 64ch; }}
+  .meta {{ color: var(--dim); margin: 6px 0 36px; }}
   .meta b {{ color: var(--fg); font-weight: 500; }}
   .meta .links {{ font-size: 13px; }}
   .meta a {{ color: var(--accent); text-decoration: none; }}
   .meta a:hover, .meta a:focus-visible {{ text-decoration: underline; }}
-  .lead {{ color: var(--dim); font-size: 13px; margin: 0 0 18px; max-width: 64ch; }}
+  .lead {{ color: var(--dim); font-size: 13px; margin: 0 0 18px; }}
   section {{ margin-bottom: 52px; }}
   .figs {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; background: var(--rule);
     border: 1px solid var(--rule); border-radius: 10px; overflow: hidden; margin-bottom: 52px; }}
@@ -174,10 +174,10 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
   .facts dl {{ margin: 0; display: grid; grid-template-columns: 1fr auto; gap: 4px 16px; }}
   .facts dt {{ color: var(--dim); }} .facts dd {{ margin: 0; text-align: right; }}
   .facts dd span {{ color: var(--ghost); font-size: 12.5px; margin-left: 6px; }}
-  .prose p {{ max-width: 66ch; margin: 0 0 12px; }}
+  .prose p {{ margin: 0 0 12px; }}
   .prose code {{ font: 13px ui-monospace, "SF Mono", Menlo, monospace; color: var(--fg); }}
   .foot {{ color: var(--dim); font-size: 12.5px; border-top: 1px solid var(--rule); padding-top: 18px; }}
-  .foot p {{ margin: 0 0 8px; max-width: 80ch; }}
+  .foot p {{ margin: 0 0 8px; }}
   .foot a {{ color: inherit; text-decoration-color: var(--ghost); text-underline-offset: 2px; }}
   @media (max-width: 640px) {{
     .figs {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
