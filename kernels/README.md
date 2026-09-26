@@ -88,9 +88,11 @@ Results: [tacos8me.github.io/m5-ultra/split](https://tacos8me.github.io/m5-ultra
   prefix reuse, image input, verify-cost-aware draft depth, extra draft sources, and the `og_serve/` supervisor
   (OpenAI-compatible server, failover that never swaps models, parity/soak/bench harnesses). `src/` holds the changed files.
 - `split-nv/`: the RTX half.
-  - `Dockerfile` + `sglang-dsv41-split.patch`: the engine image from public parts only. The patch applies to the
-    public `lmsysorg/sglang:dev-dsv41` image (pinned by digest) and yields the exact tested SGLang tree: the
-    DeepSeek-V4.1 serving port plus the split hooks. `docker build -t sglang-dsv41-split kernels/split-nv`.
+  - `Dockerfile` + `sglang-dsv41-split.patch` + `flashinfer-sparse-mla-sm120.patch`: the engine image from public
+    parts only. On the public `lmsysorg/sglang:dev-dsv41` image (pinned by digest) it yields the exact tested SGLang
+    tree (DeepSeek-V4.1 serving port plus the split hooks, checked file by file against `TREE.sha256`) and rebuilds
+    FlashInfer's SM120 sparse-MLA module with the page sizes V4.1 needs. Verified bit-identical to the production
+    engine (`BASE.txt`). `docker build -t sglang-dsv41-split kernels/split-nv`.
   - `src/`: the engine that runs on it (step API server, prefix cache, streamed prompt state, fused MoE decode
     kernel, deploy and gate tools). `src/run_engine.sh` was written for the local image, which mounts the SGLang
     tree; with the built image, use `sglang-dsv41-split` and drop that mount.

@@ -1,12 +1,23 @@
 split-nv engine (own code, src/): c75a0a2 (branch og-moe; deployed as systemd user unit split-nv-engine).
 
-sglang-dsv41-split.patch: applies to the Python tree of the public LMSYS image
-  lmsysorg/sglang:dev-dsv41@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
-  (/sgl-workspace/sglang/python; torch 2.13.0+cu130, flashinfer 0.6.18), and turns it into the exact tested tree:
-  the DeepSeek-V4.1 serving port (SM120 kernels, pinned Engram, launch fusion, long-context indexer) plus the
-  split hooks (prompt-state capture, deterministic top-k ties). Compiled .so modules are not in the patch; the
-  image's own builds are used. Verified: applies cleanly, result identical to the tested tree (excluding .so),
-  and the patched package imports in the public image. The tested engine ran on a local image with the same
-  torch/flashinfer versions; an end-to-end GPU run on the public image has not been done.
+Base image: lmsysorg/sglang:dev-dsv41@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
+  (torch 2.13.0+cu130, flashinfer 0.6.18+cu130 git 69ff11fc). The Dockerfile applies two patches:
 
-License: sglang-dsv41-split.patch modifies SGLang (https://github.com/sgl-project/sglang), Apache-2.0 (LICENSE).
+sglang-dsv41-split.patch: applies to /sgl-workspace/sglang/python and yields the tested SGLang tree: the
+  DeepSeek-V4.1 serving port (SM120 kernels, pinned Engram, launch fusion, long-context indexer) plus the split hooks
+  (prompt-state capture, deterministic top-k ties). The build checks every resulting file against TREE.sha256
+  (4,784 files, .so and __pycache__ excluded) and fails on any difference.
+
+flashinfer-sparse-mla-sm120.patch: FlashInfer's SM120 sparse-MLA prefill only instantiated extra_page_block_size 64
+  and 2; V4.1's compressed layers need 128 and 256 (the decode kernel already takes it at runtime). The patch adds
+  those dispatch cases, no kernel logic changes. The image ships an AOT .so that shadows the sources, so the build
+  recompiles it (sm_120f, -O3, ~30 s, no GPU needed). Its SASS is identical to the production library's.
+
+Verified end to end (Sep 26, 2026): the built image served in place of production (same weights, same engine code)
+  and matched production's reference bit for bit: layer-20 state and 6 decode steps (150 tensors) at 301, 8,193 and
+  131,073 tokens, plain and streamed; step == prefill (0 non-zero diffs) at 256/8,190/8,192; image gates
+  (determinism, resume, cache keys by image hash); HTTP /v1/prefill == step-API OPEN. Step latency 6.1-7.3 ms
+  (1-5 rows at 8K), same as production. Log: PROOF.txt.
+
+License: both patches modify Apache-2.0 projects (SGLang https://github.com/sgl-project/sglang, FlashInfer
+  https://github.com/flashinfer-ai/flashinfer); LICENSE.

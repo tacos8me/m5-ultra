@@ -1,0 +1,31 @@
+# Public image (sglang-dsv41-split, built from this Dockerfile) serving in place of production c75a0a2, Sep 26 2026.
+# References were recorded from the production engine. Box time.
+[11:49:19] production sessions before stop: 0
+[11:49:19] stopping production engine
+[11:49:42] GPU memory after stop: 0 MiB
+[11:49:42] starting proof engine (public image, fresh JIT caches)
+[11:51:45] proof engine ready after 123 s: {"ok": true, "encoder": "up", "step_api": "up", "token_map": true, "sessions": 0, "connections": 0, "gpu_job": null, "gpu_job_s": 0.0, "queued_jobs": 0
+{"gate": "check n=301 {}", "tensors": 150, "tensor_mismatch": [], "steps": 6, "step_mismatch": [], "pass": true}
+{"gate": "check n=301 {'stream': 1}", "tensors": 150, "tensor_mismatch": [], "steps": 6, "step_mismatch": [], "pass": true}
+{"gate": "check n=8193 {}", "tensors": 150, "tensor_mismatch": [], "steps": 6, "step_mismatch": [], "pass": true}
+{"gate": "check n=8193 {'stream': 1}", "tensors": 150, "tensor_mismatch": [], "steps": 6, "step_mismatch": [], "pass": true}
+{"gate": "check n=131073 {}", "tensors": 150, "tensor_mismatch": [], "steps": 6, "step_mismatch": [], "pass": true}
+{"gate": "check n=131073 {'stream': 1}", "tensors": 150, "tensor_mismatch": [], "steps": 6, "step_mismatch": [], "pass": true}
+## step==prefill validate n=256: 28 max_abs values, 0 non-zero
+## step==prefill validate n=8190: 28 max_abs values, 0 non-zero
+## step==prefill validate n=8192: 28 max_abs values, 0 non-zero
+{"gate": "http /v1/prefill == OPEN STAT", "tensors": 150, "mismatch": [], "numerics": "og-s4.4", "pass": true}
+{"gate": "resume", "ok": true, "resumed": 3743
+{"gate": "other-image", "ok": true, "resumed": 0}
+{"gate": "resume-after-image", "ok": true, "resumed": 9143}
+{"gate": "mid-span-grid", "ok": true, "resumed": 8192, "note": "the only matching entry is the 8192 grid point inside the span 8100..8544: the delta starts mid-image"}
+{"gate": "image tokens without images", "ok": true, "reply": "OPEN refused: b'ERR ' {'error': 'bad OPEN images: image_token_id in a prompt without images', 'retry': False}"}
+{"gate": "wrong sha256", "ok": true, "reply": "{\"error\":\"bad OPEN images: image at 3000: sha256 mismatch\",\"retry\":false}"}
+context     8213 L=1: box median    6.2 ms (min   6.2)  client rtt median    6.6 ms
+context     8213 L=2: box median    6.1 ms (min   6.1)  client rtt median    6.4 ms
+context     8213 L=3: box median    6.5 ms (min   6.5)  client rtt median    6.9 ms
+context     8213 L=4: box median    7.0 ms (min   6.9)  client rtt median    7.4 ms
+context     8213 L=5: box median    7.3 ms (min   7.2)  client rtt median    7.9 ms
+PROOF FAILED GATES: 0
+[11:52:15] RESTORE: stopping proof engine, starting production
+[11:54:48] production health: {"ok": true, "encoder": "up", "step_api": "up", "token_map": true, "sessions": 0, "connections": 0, "gpu_job": null, "gpu_job_s": 0.0, "queued_jobs": 0

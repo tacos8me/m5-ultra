@@ -1,0 +1,57 @@
+diff --git a/data/csrc/sparse_mla_sm120_prefill.cu b/data/csrc/sparse_mla_sm120_prefill.cu
+index 0c988ca..c70a224 100644
+--- a/data/csrc/sparse_mla_sm120_prefill.cu
++++ b/data/csrc/sparse_mla_sm120_prefill.cu
+@@ -321,8 +321,16 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
+                                int num_tokens, size_t stride_kv_block, size_t stride_kv_block_extra,
+                                const int* topk_length_ptr, const int* topk_length_extra_ptr,
+                                cudaStream_t stream) {
++  // PAGE_BLOCK_SIZE_EXTRA only enters page/offset addressing of the extra
++  // cache (idx / pbs, idx % pbs, and the pbs * 576 scale-footer offset), so
++  // each supported extra page size is one more instantiation of the same
++  // kernel with identical smem and register footprints. 64 is the DSV4 C4A
++  // page, 2 the DSV4 C128A page, 128 and 256 the DSV4.1 compressed caches
++  // (ratio-1/2 and ratio-1 decoder layers).
+   if (topk == 128 && topk_length_ptr == nullptr && topk_length_extra_ptr == nullptr &&
+-      topk_extra % BI == 0 && (extra_page_block_size == 64 || extra_page_block_size == 2)) {
++      topk_extra % BI == 0 &&
++      (extra_page_block_size == 64 || extra_page_block_size == 128 ||
++       extra_page_block_size == 256 || extra_page_block_size == 2)) {
+ #define DISPATCH_DUAL_MG_FULLTILE(NH, TK, PBSX, NHG)                                         \
+   launch_prefill_mg_dual_fulltile<ModelType::DSV4, NH, TK, 64, PBSX, NHG>(                   \
+       Q, KV, indices, KV_extra, idx_extra, attn_sink, output, out_lse, sm_scale, num_tokens, \
+@@ -353,6 +361,10 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
+ 
+     if (extra_page_block_size == 64) {
+       DISPATCH_FULLTILE_BY_NH_PBSX(64);
++    } else if (extra_page_block_size == 128) {
++      DISPATCH_FULLTILE_BY_NH_PBSX(128);
++    } else if (extra_page_block_size == 256) {
++      DISPATCH_FULLTILE_BY_NH_PBSX(256);
+     } else {
+       DISPATCH_FULLTILE_BY_NH_PBSX(2);
+     }
+@@ -394,6 +406,10 @@ inline bool dispatch_dsv4_dual(int num_heads, int topk, int topk_extra, int extr
+   if (topk != 128) return false;
+   if (extra_page_block_size == 64) {
+     DISPATCH_BY_NH_PBSX(64);
++  } else if (extra_page_block_size == 128) {
++    DISPATCH_BY_NH_PBSX(128);
++  } else if (extra_page_block_size == 256) {
++    DISPATCH_BY_NH_PBSX(256);
+   } else if (extra_page_block_size == 2) {
+     DISPATCH_BY_NH_PBSX(2);
+   }
+diff --git a/data/include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh b/data/include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh
+index 9b0e8ac..786c9e1 100644
+--- a/data/include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh
++++ b/data/include/flashinfer/attention/sparse_mla_sm120/prefill_kernel.cuh
+@@ -58,6 +58,8 @@
+ //   NUM_HEADS:       8, 16, 32, 64, 128 (NUM_HEADS < HPB=16 zero-pads + gates)
+ //   TOPK:            128, 192, 256, 512, 1024, 2048
+ //   PAGE_BLOCK_SIZE: 64 (DSV3_2 and DSV4 both use the 64-token page layout)
++//   PAGE_BLOCK_SIZE_EXTRA (dual-cache MG only): 64, 128, 256, or 2. Enters only the
++//                    extra-cache page addressing; no smem/register impact.
+ // ============================================================================
+ 
+ struct PrefillColdParams {
