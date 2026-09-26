@@ -3618,7 +3618,11 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = (
+            _cache_base_sizes(prompt_cache)
+            if boundary_enabled or getattr(request, "_ds41_prefix_plan", None) is not None
+            else 0
+        )
         # Sanity check: base_size from cache offsets should match the number
         # of tokens actually cached. A mismatch indicates stale meta_state
         # in a restored RotatingKVCache (e.g. shared layer_meta_states from
@@ -3836,6 +3840,11 @@ class Scheduler:
                     **model_kwargs,
                 )
                 mx.eval([c.state for c in prompt_cache])
+                exact = getattr(self.model, "_omlx_exact_prefix_cache", None)
+                if exact is not None and embeds_array is None:
+                    exact.record(getattr(request, "_ds41_prefix_plan", None),
+                                 prompt_cache, request.cached_tokens + processed_tokens,
+                                 n_to_process)
                 input_arr = input_arr[:, n_to_process:]
                 if embeds_array is not None:
                     embeds_array = embeds_array[:, n_to_process:]
@@ -5495,7 +5504,11 @@ class Scheduler:
         if getattr(request, "benchmark_trace", False):
             request.benchmark_boundary_enabled = boundary_enabled
             request.benchmark_cache_block_size = block_size if boundary_enabled else 0
-        base_size = _cache_base_sizes(prompt_cache) if boundary_enabled else 0
+        base_size = (
+            _cache_base_sizes(prompt_cache)
+            if boundary_enabled or getattr(request, "_ds41_prefix_plan", None) is not None
+            else 0
+        )
         if (
             boundary_enabled
             and hasattr(request, "cached_tokens")
@@ -5669,6 +5682,10 @@ class Scheduler:
             else:
                 prefill_model(chunk, cache=state.cache)
             mx.eval([c.state for c in state.cache])
+            exact = getattr(self.model, "_omlx_exact_prefix_cache", None)
+            if exact is not None:
+                exact.record(getattr(state.request, "_ds41_prefix_plan", None),
+                             state.cache, state.request.cached_tokens + state.tokens_processed, n)
         _trace_model_ms = (time.perf_counter() - _trace_model_start) * 1000.0
         _throttle_post = get_phys_footprint()
         actual_gathered_core = gathered_core
@@ -8866,6 +8883,23 @@ class Scheduler:
 
     def _prepare_prefix_cache_for_request(self, request: Request) -> None:
         if request.request_id in self._prefix_cache_prepared:
+            return
+
+        # DS41 snapshots preserve the exact CED chunk program and its DSpark
+        # prime ring. Keep generic paged caching off: it uses other boundaries.
+        exact = getattr(self.model, "_omlx_exact_prefix_cache", None)
+        if (exact is not None and self.block_aware_cache is None
+                and not self._prefill_memory_guard
+                and request.vlm_inputs_embeds is None
+                and not request.vlm_extra_keys_for_cache):
+            cache, count, plan = exact.prepare(
+                request.prompt_token_ids, self.config.prefill_step_size
+            )
+            request._ds41_prefix_plan = plan
+            request.prompt_cache = cache
+            request.cached_tokens = count
+            request.remaining_tokens = request.prompt_token_ids[count:]
+            self._prefix_cache_prepared.add(request.request_id)
             return
 
         prefix_hook = getattr(self.model, "minimum_prefill_prefix", None)

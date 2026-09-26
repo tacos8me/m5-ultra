@@ -1,0 +1,3 @@
+split-nv (RTX box engine, own code): head c75a0a2 (branch og-moe, deployed as systemd unit split-nv-engine)
+sglang-split.patch: SGLang DeepSeek-V4.1 port 757e8f3 (private port, not public) -> a618602
+License: sglang-split.patch modifies SGLang (https://github.com/sgl-project/sglang), Apache-2.0 (LICENSE).

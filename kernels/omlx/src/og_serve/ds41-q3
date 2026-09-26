@@ -1,0 +1,11 @@
+#!/bin/bash
+# q3 fallback child of the ds41-og supervisor: exactly ~/llm/ds41/serve/ds41-server (same env, same
+# ds41_serve.py, same served tree via DS41_TREE) plus og_resume's inert resume hook (q3_server.py).
+set -euo pipefail
+export MLX_ENABLE_TF32=0 OMLX_BONJOUR=0 OMLX_DISCOVERY=0 \
+  DS41_NATIVE_VERIFY=0 DS41_MHC=1 DS41_GROWTH=1 DS41_GATHER=1 DS41_INDEX_NAX=1 DS41_SPARSE=1 \
+  DS41_NATIVE_DECODE=1 DS41_PREFILL_CHUNK=8192 DS41_PREFILL_POOL_GIB=${DS41_PREFILL_POOL_GIB:-3}
+S="$HOME/llm/ds41/serve"
+exec "$HOME/llm/.venv-ds41-omlx-tiles/bin/python" -u "$(dirname "$0")/q3_server.py" serve \
+  --base-path "$S/profile" --model-dir "$HOME/llm/ds41/resume/models" \
+  --no-hf-cache --no-cache --max-concurrent-requests 1 "$@"

@@ -1,0 +1,8 @@
+#!/bin/bash
+# ds41-og for llama-swap: DeepSeek-V4.1-Flash ORIGINAL FP4/FP8 weights, split over the direct 10GbE link:
+# RTX box (10.10.10.1:10052) = layers 0-19 for prefill and every decode step; Mac = layers 20-39 + head + DSpark.
+# This is the CPU supervisor (no gpu-exec here): it starts the GPU worker itself (under gpu-exec) and falls back
+# to the unchanged q3 ds41-server when the box is unreachable. llama-swap passes --host/--port.
+set -euo pipefail
+export DS41_TREE=${DS41_TREE:-$HOME/src/wt/ds41-og}
+exec "$HOME/llm/.venv-ds41-omlx-tiles/bin/python" -u "$DS41_TREE/og_serve/ds41_og.py" "$@"

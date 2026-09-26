@@ -1,0 +1,72 @@
+Applies on top of deepseek-v41.patch (head ef88391e):
+base: ef88391e
+head: f56f7ffa (branch ds41-og, served as llama-swap ds41)
+
+5b17cbbc perf: keep DeepSeek V4.1 decode KV growth in place across extract and rollback
+88cfffd9 perf: score DeepSeek V4.1 decode index keys in one lazy tile
+bf37869b perf: score DeepSeek V4.1 index keys once for all DSpark verify rows
+47b6ef11 perf: keep per-request KV storage when DeepSeek V4.1 batches requests
+af6b1537 perf: exact radix selection for DeepSeek V4.1 decode index top-k
+7c0c8e0e Checkpoint exact CED chunk state for bounded DS41 prefix reuse
+73e84a80 Release evicted snapshot before allocating its replacement
+a9cb6996 Detach empty compressor tails from prefill storage
+4f2fe53f Format prefix cache implementation and ownership tests
+42c58704 Verify prefix cache isolation across models and draft modes
+076a3fc4 perf(wip): DeepSeek V4.1 prefill index at depth: 2x128 dense score tile and batched CED-midpoint selection
+a1178dd5 Pipeline two bounded DeepSeek prefill index score groups
+d433faed Reuse exact index key tiles across CED midpoint queries
+853077c0 Keep bounded prefill index groups aligned to query tiles
+cf7ad4b3 test: read DSpark priming context from the owning request cache
+58145805 Cache bounded immutable Engram rows for the first prefill chunk
+e7687ec3 Preserve warm prefill rows across short prefix-cache suffixes
+088cbed3 Cache immutable Engram rows across requests with bounded frequency admission
+8fb74bb2 Keep invalid Engram row IDs from matching empty cache slots
+7542bf03 feat: context-copy drafts beside DSpark in the DeepSeek V4.1 MTP loop
+a03e7b39 perf: row-tiled DSpark verification keeps long drafts on the k=4 kernels
+3a8e1743 fix: cap context-copy drafts at 4 rows and keep the tiled verify opt-in
+b393af8b Add opt-in cost-aware DSpark draft selection
+1f3137bb Record exactness and warm-server draft policy validation
+8b5d073f Extract original decoder weights with lossless CPU repacking
+563ca140 Add decoder-half sessions and guarded private pipeline harness
+e8fff422 Align pipeline protocol and gates with shared phase-three fixtures
+148a76ae Preserve original router metadata in decoder checkpoints
+98787451 Record successful original decoder load and replay smoke
+89b062b0 Record sprint-three headroom and feasibility gates
+96b8703f Add optional schema and hidden-state draft sources
+bd94a080 Record warm-server tool drafting gains and exact-output gates
+cc5ea699 Record phase-three box gate rejection and stop pipeline work
+376af181 Prepare original encoder trace and align pipeline quality verify path
+413fc75d perf: overlap box steps with Mac work and profile the original decoder half
+a7f252c7 Merge served bd94a080 (tool/hidden-state draft sources) into ds41-og
+c1dbf5e4 feat: serve the original-weight split pipeline through omlx (ds41-og)
+bf778ef2 perf: per-request verify with pre-sent box rows; supervisor probe loop
+68a350c7 fix: supervisor readiness, bounded child stop, orphan reaper
+8f1ab521 perf: pipeline C(L) for the 7.8 ms box step (box 1f592ea)
+a720f0ab perf: read the BF16 vocabulary head once for all 2-5 query rows
+27767f6c perf: cache the router FP32 weight; greedy targets in the verify command buffer
+57b0f02b perf: MXFP4 routed experts in two cache-friendly launches; DSpark attention on the shared kernels
+e2e12af1 perf: pipeline C(L) re-profiled for the one-pass head and MoE launches
+8184743f feat: survive box loss mid-stream (session rebuild, resume on q3) and isolate failed OPENs
+b301351c test: API parity suite, GPU leg driver, 2 h soak harness, through-API bench
+4b18995b perf: one-pass MoE combine (routed sum + shared) for decode rows
+fd46dd75 chore: draft calibration log (DS41_PIPE_CALIB), Mac-only lab leases
+47a29801 fix: ride out a box engine restart on og; retryable box ERR; harness fixes
+a010b65c perf: earlier verify submit, async drafter stages, radix top-k for candidate indexer layers
+7fab3214 fix: MoE combine kernel only for decode/verify row counts (<= 8)
+27a9b621 perf: no host sync in the API path rollback (next forward consumes it)
+25b78e2f merge og-speed through e2e12af1 (ogs-b2: c1 94.5/88.1/92.0, c2 138/125, bit-identical)
+f3a0b642 perf: one row per lane in the short-M MXFP8 GEMV (bitwise, -0.6 ms per verify)
+a7c2aad5 merge og-speed f3a0b642 (c1 97.6/90.5/92.7, c2 147.9/132.9, bit-identical)
+feb92a0d fix: default DS41_INDEX_RADIX_CAND off (radix candidate top-k aborts on small candidate sets; ~0.08 ms gain)
+45ef51f8 feat: ds41-og prefix reuse, Mac side (rebased onto ds41-og feb92a0d)
+643b143b fix: never show the internal resume marker on non-resumable paths (/v1/messages, /v1/responses)
+9f15352d test: supervisor tests on 12190-12199 (12171-12179 is og-speed's range); SUP_TEST_PORT overrides
+3e1ea5a8 fix: import a streamed zero-row delta (exact repeat of a stored prompt)
+080c5a38 fix: a failed box-state import retries once with a plain full OPEN, never a local prefill
+84bf9fb5 docs(cutover): final gates and blocker list (none open; merge 080c5a38 first)
+ed603994 docs(cutover): regenerate the target llama-swap.yaml from the live file (keeps the Icculus name + alias)
+2cec49d6 fix: image requests are served by the q3 child, never by the text-only og worker
+edb5c44e feat(ds41-og): native image input: the box runs the vision tower (OPEN images = patches + spans), tail replay routes image rows through bias_vl, prefix keys (row store, delta digest, reopen) carry image content
+76bd014a feat(ds41-og): supervisor serves images on og (DS41_OG_VISION=og default; never q3: box down -> retryable 503, no q3 resume for images); reject message without ds41-q3; tests
+7c72a52f test(ds41-og): vision leg: objective image QA (official two-image example, OCR, count, color), cache repeats, text identity vs the production tree; no q3
+f56f7ffa feat: og only by default (DS41_OG_Q3=off): never start q3; clean 503/SSE errors; real model on keepalives

@@ -1,0 +1,64 @@
+split-nv:
+d667959 feat(split-nv): DS-V4.1 encoder prefill service on the RTX pair (SGLang hooks, Mac packing port, server, tools)
+1dc438d docs(split-nv): phase 1 results note
+80bb5af feat(split-nv): phase-3 session engine (WIP), step API draft, step client, shared state packing
+211f578 feat(split-nv): target-verify step runner (eager + CUDA graphs per width), engine integration, self-test
+b57c781 fix(split-nv): copy step outputs to host inside the GPU job
+a60150e chore(split-nv): swap and Mac latency scripts
+415978a docs(split-nv): phase 3 handoff note
+453ad70 Disable core dumps in both split encoder launchers
+0132f5b Recover phase-three graph gate and record latency and correctness rejection
+39c9e73 Make original encoder steps agree with prefill across rollback and page boundaries
+c889811 feat(split-nv): serve steps between prefill chunks; dev exec hook; step timing breakdown
+06f4004 test(split-nv): cross-backend numerics analysis (chaos probes, official-arithmetic emulation)
+7847db8 perf(split-nv): trim layer 20 to its cache writes, skip LM head, pipe commands to rank 1
+7c1d8e4 test(split-nv): og_diff compares perturbed Mac traces too
+9fae785 perf(split-nv): MXFP8 dense GEMMs on FlashInfer b12x instead of CUTLASS
+7b67841 docs(split-nv): og-box cross-backend chaos finding and engine speedups
+1f592ea perf(split-nv): bitwise-equal fixed-linear tiles chosen by M
+2256aec docs(split-nv): final og-box engine numbers
+0b55e87 test(split-nv): byte-exact live-engine gate (state tensors + step payloads) and OPEN client with stream/cache options
+51e0456 feat(split-nv): streamed OPEN (TENS per chunk), box prefix cache (host-RAM snapshots, byte-identical resume), 10051 in-engine, drain/watchdog/health, 3M-token pool + 8 sessions, user unit
+05f79c9 perf(split-nv): overlap a resumed prefix's row transfer with the first new chunk
+ad8680c feat(split-nv): og-cache API: lean state, delta_from, numerics og-s4.1 (no 1-row prefill chunks, 8K-grid chunk plan), fixed_linear runtime M (no per-length JIT)
+33ac9fc test(split-nv): gate prefix mode, cache clear endpoint
+c841637 test(split-nv): s4 restart and gate scripts, http prefill check
+51844e2 test(split-nv): decode-stall and multi-session capacity tools
+ec66e06 fix(split-nv): cache OPEN holds the prefill lock through reply+snapshot (back-to-back resume); prefill JIT warm-up at start
+aed164a feat(split-nv): prefix cache in /dev/shm (survives restarts), 8K grid entries with shared page blocks, admin restart/crash endpoints
+90acd6b fix(split-nv): register cache entries after a barrier (both ranks' files complete)
+4e445fa fix(split-nv): batch-invariant dsv41 RMSNorm (torch reduction at every M); numerics og-s4.2
+adf8cdb fix(split-nv): write every 8K grid block a chunk passes (1-row fix can move chunk ends off the grid)
+a6b6252 perf(split-nv): split prefill chunks into 1024-row pieces while another session decodes (bounded decode stall); one pinned D2H for the STEP payload
+3d7de79 chore(split-nv): run the engine from a pinned deploy worktree (SPLIT_NV_ROOT); unit uses /home/ian/split-nv-deploy
+afdf0e4 fix(split-nv): numerics og-s4.3 (deterministic top-k ties: nested sglang a618602); tie and RMSNorm invariance tests
+cd61b6b chore(split-nv): deploy + post-deploy gate scripts
+bd8e3ef docs(split-nv): og-s4.3, scheduling and deploy notes in STEP_API.md
+e125e37 fix(split-nv): reject steps past the context length, clamp padded step positions, exit on sticky CUDA errors
+56a256c test(split-nv): capacity tool steps within the context length
+b789b61 perf(split-nv): 2048-row prefill pieces under contention (step wait 146 ms vs 450 ms unsplit; concurrent 128K prefill 9.4 s vs 6.8 s)
+9c34b66 test(split-nv): combined cache/stream/lean/delta_from check
+e245093 chore(split-nv): unit retries forever after boot; mark pipe1_gate.py legacy
+d11dccf chore(split-nv): pinned deploy: every mount from the deploy clone (own sglang/encoder-model/ref), SPLIT_NV_DEV=0, /health reports running + tree commit, sglang, numerics
+866b3c3 feat(split-nv): vision: images in OPEN (patches + spans, versioned), ViT on the box (fork's DS-V4.1 tower, bias_vl routing, Engram image masking), image-content prefix keys; encoder-model-vl view; start-up vision check; gates
+f1b5ebe fix(split-nv): image patches cross the rank pipe as bytes; ignore encoder-model-vl
+1d1954c test(split-nv): image gate loads bf16 patches via torch; resume gates can use a nonce instead of clearing the cache; ViT noise-floor tool
+fb536a1 docs(split-nv): image OPEN fields, wire layout, keys, fidelity in STEP_API.md
+9d1d4d0 wip(og-moe): v1 decode + prefill kernels (bit-identical, official promotion arithmetic), dev tools
+128b676 wip(og-moe): grouped promotion (4 k-blocks), decode v2 (B via cp.async ring, per-group intermediate quant), prefill 128x128 swizzled
+50e8100 wip(og-moe): bf16 per-pair partials, vectorized epilogue, P_TW option
+69eaa09 wip(og-moe): default 8-warp prefill CTA
+645022b wip(og-moe): install() for the engine (layout checks vs checkpoint), masked-id handling, SGLang-level TP2 test
+5d7c4d7 feat(split-nv): og-moe in the engine: install after consistent (SPLIT_NV_OG_MOE=1, default on in run_engine.sh), numerics og-s4.4, step padding rows skip the MoE
+c462860 perf(split-nv): fixed_linear small-M config BK=256/4 stages (bitwise equal, router ~19 -> ~7 us); og-moe TP2 SGLang-level test with vision routing and timing
+a21854e perf(og-moe): GPU routing (no torch glue), shared-expert GEMMs on a side stream during prefill
+ff1558a chore(og-moe): import a prebuilt extension for the exact source hash
+0a206bc test(og-moe): bitwise rows inside prefill chunks up to 8192
+e1d1ec4 chore(og-moe): post-deploy gate script; deploy fetches every dev branch
+985ef3e chore(og-moe): post-deploy gate script (strict validate, prefix, resume, HTTP, image, og-s4.4 reference + determinism, latency)
+c75a0a2 fix(split-nv): og_valid set after StepRunner's local os import
+
+sglang (757e8f3..a618602):
+fca050c feat(split-nv): optional prompt-state capture hooks for encoder prefill
+8a44ef1 fix(split-nv): explicit os import for hook gate
+a618602 fix(dsv4 topk): radix tie select picks exactly equal values lowest index first (was atomic arrival order: nondeterministic prefill/step selections)

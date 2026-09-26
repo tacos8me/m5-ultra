@@ -202,19 +202,31 @@ class QuantizedProjection(QuantizedSwitchLinear):
     def project_quantized(self, x, indices=None, sorted_indices=False, block_plan=None):
         """Project an input whose activation quantization is already complete."""
         if indices is None:
-            if fast_qmv.supported(self, x):
-                return fast_qmv.mxfp8_qmv(x, self.weight, self.scales)
-            return mx.quantized_matmul(
-                x,
-                self.weight,
-                self.scales,
-                self.get("biases"),
-                group_size=self.group_size,
-                bits=self.bits,
-                mode=self.mode,
-            )
+            from .language import row_tiles, verify_tile
+
+            tile = verify_tile()
+            if tile and x.ndim == 3 and x.shape[0] == 1 and x.shape[1] > 5:
+                # Each tile keeps the short-M GEMV reduction of an L=2..5 verify.
+                return mx.concatenate(
+                    [self._project_rows(x[:, b:e]) for b, e in row_tiles(x.shape[1], tile)],
+                    axis=1,
+                )
+            return self._project_rows(x)
         return super().__call__(
             x, indices, sorted_indices=sorted_indices, block_plan=block_plan
+        )
+
+    def _project_rows(self, x):
+        if fast_qmv.supported(self, x):
+            return fast_qmv.mxfp8_qmv(x, self.weight, self.scales)
+        return mx.quantized_matmul(
+            x,
+            self.weight,
+            self.scales,
+            self.get("biases"),
+            group_size=self.group_size,
+            bits=self.bits,
+            mode=self.mode,
         )
 
 

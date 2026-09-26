@@ -6,6 +6,7 @@ shared_attn and module buffers, all persistent state belongs to request caches.
 Batch rows are evaluated independently so late admission cannot share history.
 """
 
+import contextlib
 import functools
 import logging
 import math
@@ -34,7 +35,7 @@ from .kernels import packed_index_scores, packed_index_topk, packed_sparse_atten
 from .mtp import DSparkMixin
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
-from . import decode_fusions, growth, affine_gather, fast_rope
+from . import decode_fusions, decode_topk, growth, affine_gather, fast_rope, moe_decode
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,44 @@ DS41_PREFILL_PIPELINE = os.environ.get("DS41_PREFILL_PIPELINE", "1") == "1"
 # Decode/verify forwards submit every N layers so the GPU starts on finished
 # layers while Python builds the rest (0 keeps one lazy graph).
 DS41_DECODE_ASYNC = int(os.environ.get("DS41_DECODE_ASYNC", "4"))
+# DSpark verification of more than 5 rows (context-copy drafts) keeps every
+# row on the kernels the served k=4 loop uses: MXFP8 projections, the head,
+# wo_a and attention/index run in tiles of at most this many rows, so each
+# row's arithmetic is the same as in an L=2..5 verify. Opt-in (0 = off):
+# served exactness is only established for L<=5, which never enters a tile.
+VERIFY_TILE = int(os.environ.get("DS41_VERIFY_TILE", "0"))
+# Candidate-layer top-k for decode rows by exact radix select instead of a full argsort.
+DS41_INDEX_RADIX_CAND = os.environ.get("DS41_INDEX_RADIX_CAND", "0") == "1"  # off: aborts on tiny candidate sets (test_official_prefill_decode), gain ~0.08 ms
+_verify_scope_depth = [0]
+
+
+@contextlib.contextmanager
+def _verify_scope(active):
+    if not active:
+        yield
+        return
+    _verify_scope_depth[0] += 1
+    try:
+        yield
+    finally:
+        _verify_scope_depth[0] -= 1
+
+
+def verify_tile():
+    """Row tile for the current DSpark verify forward, 0 outside one."""
+    return VERIFY_TILE if _verify_scope_depth[0] else 0
+
+
+def row_tiles(n, cap):
+    """Split n rows into at most-cap tiles of nearly equal size, none below 2."""
+    tiles = -(-n // cap)
+    base, extra = divmod(n, tiles)
+    bounds, begin = [], 0
+    for i in range(tiles):
+        size = base + (1 if i < extra else 0)
+        bounds.append((begin, begin + size))
+        begin += size
+    return bounds
 
 
 @contextmanager
@@ -261,7 +300,10 @@ class Indexer(nn.Module):
             self.k_norm = RMSNorm(c.index_head_dim, c.norm_eps)
         self._config, self._layer = c, layer
 
-    def __call__(self, x, qr, latent, cache, shared, start, ratio, latent_start=None):
+    def __call__(
+        self, x, qr, latent, cache, shared, start, ratio, latent_start=None,
+        prebuilt=False,
+    ):
         c, layer = self._config, self._layer
         end = start + x.shape[1]
         if layer in c.kv_source_layers:
@@ -295,7 +337,9 @@ class Indexer(nn.Module):
                     bits=4,
                 )
                 previous = growth.append(cache, 3, previous, key, kv_start // ratio)
-            shared["index_k"] = cache[3] = previous
+            shared["index_k"] = previous
+            if not prebuilt:
+                cache[3] = previous
         key = shared["index_k"]
         q = self.wq_b(qr).reshape(1, x.shape[1], c.index_n_heads, c.index_head_dim)
         q = quantize_activation(rope_range(q, start, end - start, c, True), bits=4)
@@ -312,23 +356,42 @@ class Indexer(nn.Module):
                 1, x.shape[1], blocks.shape[-1] * c.candidate_block_size
             )
         if candidates is None:
-            idx, blocks = packed_index_topk(
-                q,
-                key,
-                weights,
-                start,
-                ratio,
-                c.index_topk,
-                block_count=(
-                    c.candidate_topk_blocks if layer == c.candidate_source_layer else 0
-                ),
-                block_size=c.candidate_block_size,
-            )
+            tile = verify_tile()
+            parts = [
+                packed_index_topk(
+                    q[:, b:e],
+                    key,
+                    weights[:, b:e],
+                    start + b,
+                    ratio,
+                    c.index_topk,
+                    block_count=(
+                        c.candidate_topk_blocks
+                        if layer == c.candidate_source_layer
+                        else 0
+                    ),
+                    block_size=c.candidate_block_size,
+                )
+                for b, e in (
+                    row_tiles(x.shape[1], tile)
+                    if tile and x.shape[1] > 8
+                    else [(0, x.shape[1])]
+                )
+            ]
+            idx = mx.concatenate([p[0] for p in parts], 1)
+            blocks = mx.concatenate([p[1] for p in parts], 1)
             if layer == c.candidate_source_layer:
                 shared["candidates"] = blocks
             return idx
         scores = packed_index_scores(q, key, weights, start, ratio, candidates)
         count = min(c.index_topk, scores.shape[-1])
+        if DS41_INDEX_RADIX_CAND and x.shape[1] <= 8 and not verify_tile():
+            # Same selected set as the stable argsort below (score desc, id
+            # asc; -0 == +0), and the result is that set in ascending order.
+            order = decode_topk.radix_ids(scores, count).astype(mx.int32)
+            valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
+            idx = mx.take_along_axis(candidates, order, -1)
+            return mx.sort(mx.where(valid, idx, -1), axis=-1)
         order = mx.argsort(-scores, axis=-1)[..., :count].astype(mx.int32)
         valid = mx.take_along_axis(scores, order, axis=-1) > -float("inf")
         idx = mx.take_along_axis(candidates, order, -1)
@@ -387,7 +450,7 @@ class Attention(nn.Module):
 
     def __call__(
         self, x, cache, shared, start, ced_kv=None, ced_kv_start=None,
-        *, projections=None, return_projected=False,
+        *, projections=None, return_projected=False, prebuilt_end=None,
     ):
         c, layer = self._config, self._layer
         ratio, length = c.compress_ratios[layer], x.shape[1]
@@ -411,7 +474,7 @@ class Attention(nn.Module):
         rotated = rope_range(self.kv_norm(kv_input), start, length, c, bool(ratio))
         if (
             decode_fusions.DS41_DECODE_KERNELS_V2
-            and length <= 8
+            and (length <= 8 or verify_tile())
             and rotated.shape[-1] % 32 == 0
             and rotated.dtype in (mx.bfloat16, mx.float16, mx.float32)
             and mx.default_device() == mx.gpu
@@ -435,7 +498,11 @@ class Attention(nn.Module):
             ci = mx.zeros((1, length, 0), mx.int32)
         if ratio:
             latent = None
-            if layer in c.kv_source_layers:
+            if layer in c.kv_source_layers and prebuilt_end is not None:
+                # Encoder replay: the global rows up to prebuilt_end already
+                # exist (remote prefill); only the queries run here.
+                shared["kv"] = cache[2][:, : int(prebuilt_end) // ratio]
+            elif layer in c.kv_source_layers:
                 # CED: global KV projects the full encoder-final hidden state
                 # (ced_kv) even though queries only attend from the tail.
                 kv_x = x if ced_kv is None else ced_kv
@@ -458,7 +525,10 @@ class Attention(nn.Module):
                     shared,
                     start,
                     ratio,
-                    latent_start=ced_kv_start,
+                    latent_start=(
+                        ced_kv_start if prebuilt_end is None else int(prebuilt_end)
+                    ),
+                    prebuilt=prebuilt_end is not None,
                 )
             if latent is not None:
                 first = kv_start // ratio
@@ -475,7 +545,19 @@ class Attention(nn.Module):
                 )
                 shared["kv"] = cache[2] = growth.append(cache, 2, shared["kv"], compressed, kv_start // ratio)
             ci, pooled = shared["idx"], shared["kv"]
-        if (
+        tile = verify_tile()
+        if tile and length > 8:
+            out = mx.concatenate(
+                [
+                    packed_sparse_attention(
+                        q[:, b:e], kv, pooled, idx[:, b:e], ci[:, b:e],
+                        self.attn_sink, c.head_dim**-0.5,
+                    )
+                    for b, e in row_tiles(length, tile)
+                ],
+                axis=1,
+            )
+        elif (
             (length > 8 or (DS41_SPARSE and DS41_NATIVE_VERIFY and length > 1)
              or (DS41_NATIVE_DECODE and length == 1 and ci.shape[-1] == 0))
             and c.n_heads == 64
@@ -501,7 +583,19 @@ class Attention(nn.Module):
         out = rope_range(out, start, length, c, bool(ratio), inverse=True)
         grouped = out.reshape(1, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
-        if decode_fusions.grouped_gemv_supported(grouped, weight):
+        if (
+            tile
+            and length > 5
+            and decode_fusions.grouped_gemv_supported(grouped[:, :2], weight)
+        ):
+            projected = mx.concatenate(
+                [
+                    decode_fusions.grouped_gemv(grouped[:, b:e], weight)
+                    for b, e in row_tiles(length, tile)
+                ],
+                axis=1,
+            )
+        elif decode_fusions.grouped_gemv_supported(grouped, weight):
             projected = decode_fusions.grouped_gemv(grouped, weight)
         else:
             projected = mx.einsum("bsgd,grd->bsgr", grouped, weight)
@@ -587,6 +681,15 @@ class Expert(nn.Module):
                 -1, 1, self.w1.input_dims
             )
             ids = indices.reshape(-1).astype(mx.uint32)
+            if moe_decode.supported(self, x, indices):
+                # Bitwise the gather_qmm path below, in fewer, cache-friendly launches.
+                gate, up = moe_decode.gate_up(inp, self.w1, self.w3, ids, indices.shape[-1])
+                y = quantize_swiglu_activation(
+                    gate, up, weights.reshape(-1), x.dtype, self._limit
+                )
+                return moe_decode.down(y, self.w2, ids).reshape(
+                    *indices.shape, 1, x.shape[-1]
+                )
             lhs, rows = _route_rows(ids.size, indices.shape[-1])
 
             def gather(value, projection, left):
@@ -741,12 +844,23 @@ class Gate(nn.Module):
             self.bias_vl = mx.zeros((c.n_routed_experts,))
         self._config = c
 
+    def _weight_f32(self):
+        # The exact FP32 copy the router multiplies by, kept instead of
+        # re-casting the BF16 weight on every call (same values, same GEMM).
+        cached = self.__dict__.get("_ds41_w32")
+        if cached is None or cached[0] is not self.weight:
+            w32 = self.weight.astype(mx.float32)
+            if self.weight.dtype != mx.float32:
+                mx.eval(w32)
+            cached = self.__dict__["_ds41_w32"] = (self.weight, w32)
+        return cached[1]
+
     def __call__(self, x, image_mask):
         c = self._config
-        raw = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
+        raw = x.astype(mx.float32) @ self._weight_f32().T
         if c.gate_temp != 1:
             raw = raw / c.gate_temp
-        if (DS41_MHC and x.shape[1] <= 8 and image_mask is None
+        if (DS41_MHC and (x.shape[1] <= 8 or verify_tile()) and image_mask is None
                 and c.n_routed_experts == 384 and c.n_activated_experts == 6
                 and c.norm_topk_prob and c.score_func not in ("sigmoid", "softmax")
                 and mx.default_device() == mx.gpu):
@@ -790,7 +904,7 @@ class MoE(nn.Module):
             quantize_activation(x) if routed_quantized or shared_quantized else x
         )
         routed_input = quantized if routed_quantized else x
-        if x.shape[1] >= 32 and idx.size >= 64:
+        if x.shape[1] >= 32 and idx.size >= 64 and not verify_tile():
             shape = idx.shape
             flat = idx.reshape(-1)
             order = mx.argsort(flat)
@@ -822,6 +936,10 @@ class MoE(nn.Module):
             shared = self.shared_experts(
                 quantized if shared_quantized else x, input_quantized=shared_quantized
             )
+            if x.dtype == mx.bfloat16:
+                combined = moe_decode.combine(routed, shared)
+                if combined is not None:
+                    return combined
         return (routed.astype(mx.float32).sum(-2) + shared.astype(mx.float32)).astype(
             x.dtype
         )
@@ -845,15 +963,18 @@ def _hc_mixes(x, fn, scale, base, n, norm_eps, hc_eps, iters):
     return _hc_mix_weights(mixes, scale, base, n, hc_eps, iters)
 
 
-def hc_mixes(x, fn, scale, base, c):
-    if (DS41_MHC and x.dtype == mx.bfloat16 and x.ndim == 4 and 1 <= x.shape[1] <= 8
+def hc_mixes(x, fn, scale, base, c, rows=None):
+    # rows: pick the kernel path as if x had this many rows (encoder replay).
+    n = x.shape[1] if rows is None else rows
+    if (DS41_MHC and x.dtype == mx.bfloat16 and x.ndim == 4
+            and (1 <= n <= 8 or (verify_tile() and n <= 64))
             and x.shape[-2] == c.hc_mult == 4 and fn.dtype == mx.float32
             and fn.shape == (24, 4*x.shape[-1]) and mx.default_device() == mx.gpu):
         mixes = decode_fusions.hc_project(x, fn, c.norm_eps)
         return decode_fusions.mix_sinkhorn(mixes, scale, base, c.hc_eps, c.hc_sinkhorn_iters)
     if (
         x.ndim == 4
-        and x.shape[1] >= 256
+        and n >= 256
         and x.shape[-2] == c.hc_mult == 4
         and x.shape[-1] > 0
         and x.dtype == mx.bfloat16
@@ -861,7 +982,7 @@ def hc_mixes(x, fn, scale, base, c):
         and fn.shape == (24, 4 * x.shape[-1])
         and mx.default_device() == mx.gpu
     ):
-        mixes = fused_hc_projection(x, fn, c.norm_eps)
+        mixes = fused_hc_projection(x, fn, c.norm_eps, rows_hint=rows)
         return _hc_mix_weights(
             mixes, scale, base, c.hc_mult, c.hc_eps, c.hc_sinkhorn_iters
         )
@@ -934,7 +1055,12 @@ class Block(nn.Module):
         if layer in c.engram_layer_ids:
             self.engram = Engram(c, list(c.engram_layer_ids).index(layer))
 
-    def __call__(self, h, pre, cache, shared, start, image_mask, ced_tail=None):
+    def __call__(
+        self, h, pre, cache, shared, start, image_mask, ced_tail=None,
+        prebuilt_end=None, hc_rows=None,
+    ):
+        # prebuilt_end/hc_rows: encoder replay over a chunk's tail rows whose
+        # global KV/index rows (up to prebuilt_end) already exist in the cache.
         ced_kv = ced_kv_start = None
         if ced_tail is not None:
             # CED bounded replay: queries, SWA KV and MoE run on the tail
@@ -972,12 +1098,14 @@ class Block(nn.Module):
             start = start + full_len - tail
         else:
             ap, ao, ac = hc_mixes(
-                h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self._config
+                h, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base, self._config,
+                rows=hc_rows,
             )
             x = hc_pre_norm(h, pre, self.attn_norm.weight, self.attn_norm.eps)
         h = hc_post(
             self.attn(
-                x, cache, shared, start, ced_kv=ced_kv, ced_kv_start=ced_kv_start
+                x, cache, shared, start, ced_kv=ced_kv, ced_kv_start=ced_kv_start,
+                prebuilt_end=prebuilt_end,
             ),
             h,
             ao,
@@ -1069,6 +1197,9 @@ class LanguageModel(DSparkMixin, nn.Module):
                     self.layers[layer_id].engram.embed,
                     hashes[:, :, ix],
                     lookahead=True,
+                    # A cache hit may leave only a tiny prompt suffix. Keep
+                    # that suffix from replacing the useful full-chunk rows.
+                    warm_rows=not current.shape[1] and upcoming.shape[1] >= 256,
                 )
             if not getattr(self, "_engram_lookahead_logged", False):
                 self._engram_lookahead_logged = True
@@ -1090,6 +1221,23 @@ class LanguageModel(DSparkMixin, nn.Module):
         ]
 
     def _forward(
+        self, input_ids, cache=None, inputs_embeds=None, token_types=None, **kwargs
+    ):
+        tiled = (
+            VERIFY_TILE > 0
+            and kwargs.get("mtp_verify_states") is not None
+            and input_ids.shape[1] > 5
+        )
+        with _verify_scope(tiled):
+            return self._forward_rows(
+                input_ids,
+                cache=cache,
+                inputs_embeds=inputs_embeds,
+                token_types=token_types,
+                **kwargs,
+            )
+
+    def _forward_rows(
         self, input_ids, cache=None, inputs_embeds=None, token_types=None, **kwargs
     ):
         c = self._config
@@ -1282,8 +1430,7 @@ class LanguageModel(DSparkMixin, nn.Module):
                 )
             )
         for i, item in enumerate(cache):
-            merged = DeepseekV41Cache.merge(rows[i])
-            item.cache = merged.cache
+            item.adopt(DeepseekV41Cache.merge(rows[i]))
             item.advance(input_ids.shape[1])
         logits = mx.concatenate(results, 0)
         if capture:

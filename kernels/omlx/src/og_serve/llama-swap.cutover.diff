@@ -1,0 +1,69 @@
+--- now-llama-swap.yaml	2026-09-25 20:36:44.380610684 +0000
++++ llama-swap.cutover.yaml	2026-09-25 20:36:56.461573175 +0000
+@@ -4,9 +4,10 @@
+ #                  decode attention, fused MXFP4 MoE, MTP draft k=2, prefill chunk 8192) — default
+ #   mimo-nomtp   : same kernels, no draft — best aggregate throughput under heavy concurrency
+ #   mimo-stock   : pip MLX 0.32.2 + mlx-lm PR#1219 — known-good fallback
+-#   ds41         : DeepSeek-V4.1-Flash LSQ q3 + DSpark k=4, 2 concurrent requests (tree ~/src/wt/ds41-serve-c2), 512K — preloaded
+-#   ds41-og      : DeepSeek-V4.1-Flash ORIGINAL weights, RTX box layers 0-19 + Mac 20-39 over 10GbE, q3 fallback
+-#   ds41-c1      : same model, one request at a time (tree ~/src/wt/ds41-serve) — fallback
++#   ds41         : DeepSeek-V4.1-Flash ORIGINAL FP4/FP8 weights (Icculus), RTX box layers 0-19 + Mac 20-39 over 10GbE
++#                  (tree ~/src/wt/ds41-og), 1M; CPU supervisor falls back to the q3 build (and back) — preloaded
++#   ds41-q3      : DeepSeek-V4.1-Flash LSQ q3 + DSpark k=4, 2 concurrent requests (tree ~/src/wt/ds41-serve-c2), Mac only
++#   ds41-c1      : q3, one request at a time (tree ~/src/wt/ds41-serve) — fallback
+ #   qwen38-27b   : Qwen3.8-27B dense (hybrid attention), Jundot oQ8e + MTP, stock oMLX, 1M window
+ #   qwen38       : Qwen3.8-Flash-Next (180B MoE, 512 experts top-10, hybrid attention), oQ8e + MTP, 1M wrapper + layered prefill, c4, 1M (qwen38-classic = old prefill)
+ #   glm53        : GLM-5.3-Flash (320B MoE, 288 experts top-8, hybrid attention), vogel61 oQ5e + grafted native MTP, stock oMLX, 1M
+@@ -88,8 +89,23 @@
+           temperature: 0
+ 
+   ds41:
++    name: Icculus · DeepSeek-V4.1-Flash ORIGINAL FP4/FP8 (RTX box layers 0-19 + Mac 20-39) + DSpark
++    description: original weights over the 10GbE link; box prefills and runs layers 0-19 each step, Mac layers 20-39 + head + DSpark k=4; box prefix cache; survives box loss mid-stream (reconnect, else continues on q3); 1M context, text only
++    cmd: |
++      ${env.HOME}/llm/ds41/og/ds41-og --host 127.0.0.1 --port ${PORT}
++    env:
++      - DS41_TREE=/Users/ian/src/wt/ds41-og
++    useModelName: ds41-og
++    ttl: 0
++    aliases: [icculus, deepseek-v4.1-flash, ds41-og, deepseek-v4.1-flash-og]
++    filters:
++      setParamsByID:
++        "${MODEL_ID}:think":
++          chat_template_kwargs: {enable_thinking: true}
++
++  ds41-q3:
+     name: DeepSeek-V4.1-Flash · LSQ q3 + DSpark
+-    description: best build — CED prefill, fused sparse attention + indexer, Engram SSD lookahead, exact decode kernels, DSpark k=4, two requests decode together (exact); 512K context
++    description: Mac-only q3 build (pre-og default) — CED prefill, fused sparse attention + indexer, Engram SSD lookahead, exact decode kernels, DSpark k=4, two requests decode together (exact); 512K context
+     cmd: |
+       ${gpu} ${env.HOME}/llm/ds41/serve/ds41-server --host 127.0.0.1 --port ${PORT}
+       --base-path ${env.HOME}/llm/ds41/serve/profile-c2 --max-concurrent-requests 2
+@@ -100,26 +116,12 @@
+       - DS41_EXTRA_DRAFT=1
+     useModelName: ds41-q3g128
+     ttl: 0
+-    aliases: [deepseek-v4.1-flash, ds41-q3g128, ds41-c2, deepseek-v4.1-flash-c2]
++    aliases: [ds41-q3g128, ds41-c2, deepseek-v4.1-flash-c2, deepseek-v4.1-flash-q3]
+     filters:
+       setParamsByID:
+         "${MODEL_ID}:think":
+           chat_template_kwargs: {enable_thinking: true}
+ 
+-  ds41-og:
+-    name: Icculus · DeepSeek-V4.1-Flash ORIGINAL FP4/FP8 (RTX box layers 0-19 + Mac 20-39) + DSpark
+-    description: original weights over the 10GbE link; box prefills and runs layers 0-19 each step, Mac layers 20-39 + head + DSpark k=4; falls back to the q3 build when the box is down; 1M context, text only, no prefix cache yet
+-    cmd: |
+-      ${env.HOME}/llm/ds41/og/ds41-og --host 127.0.0.1 --port ${PORT}
+-    env:
+-      - DS41_TREE=/Users/ian/src/wt/ds41-og
+-    useModelName: ds41-og
+-    ttl: 0
+-    aliases: [icculus, deepseek-v4.1-flash-og]
+-    filters:
+-      setParamsByID:
+-        "${MODEL_ID}:think":
+-          chat_template_kwargs: {enable_thinking: true}
+   ds41-c1:
+     name: DeepSeek-V4.1-Flash · one request at a time (fallback)
+     description: previous served build (tree ~/src/wt/ds41-serve), no cross-request batching

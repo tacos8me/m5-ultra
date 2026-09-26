@@ -3,8 +3,9 @@
 
 fp_qmv_wide (group 32, k_lanes 16, one x tile of 4-5 vectors): every output
 keeps the same 16 K lanes, per-lane group order, expressions and
-shuffle-down reduction, but each lane serves two consecutive rows, so the
-activation chunks it loads per quantization group feed both rows.
+shuffle-down reduction; each lane serves ROWS_PER_LANE consecutive rows.
+One row per lane (twice the simdgroups of two) is bitwise the same and
+0.55-0.65 ms faster per L=4-5 verify of layers 20-39.
 
 fp_qmv_fast (M == 1): each lane keeps its 8-value slice of every 256-value
 block and the same qdot/accumulation order, but a simdgroup serves one row
@@ -95,7 +96,7 @@ _SOURCE = r"""
                 for (int v = 0; v < M; v++) y[v * N + row0 + r] = static_cast<T>(result[r][v]);
 """
 
-ROWS_PER_LANE = 2
+ROWS_PER_LANE = 1
 
 # fp_qmv_fast (M == 1) replica: each lane keeps its 8-value slice of every
 # 256-value block and the same qdot/accumulation order, but a simdgroup

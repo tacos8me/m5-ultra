@@ -15,10 +15,14 @@ DS41_SPARSE = os.environ.get("DS41_SPARSE", "0") == "1"
 
 DS41_INDEX_NAX = os.environ.get("DS41_INDEX_NAX", "0") == "1"
 DS41_PREFILL_INDEX = int(os.environ.get("DS41_PREFILL_INDEX", "2"))
+DS41_DECODE_SINGLE_TILE = os.environ.get("DS41_DECODE_SINGLE_TILE", "1") == "1"
+DS41_INDEX_ROWS = os.environ.get("DS41_INDEX_ROWS", "1") == "1"
+DS41_DECODE_RADIX = os.environ.get("DS41_DECODE_RADIX", "1") == "1"
+DS41_PREFILL_MID_INDEX = int(os.environ.get("DS41_PREFILL_MID_INDEX", "1"))
 
 import mlx.core as mx
 
-from . import decode_fusions
+from . import decode_fusions, decode_topk
 from .packed_attention import rounded_packed_attention
 
 _HEADER = r"""
@@ -388,6 +392,84 @@ _INDEX_MMA = r"""
     }
 """
 
+# Bitwise-equal _INDEX_MMA (HEAD_SPLIT, no candidates) for short query blocks:
+# one threadgroup scores 32 keys for every query row, so each key tile is read
+# and decoded once instead of once per row, and each simdgroup keeps its eight
+# keys' B fragments in registers. Per (query, head, key) the MMA sequence over
+# D, the ReLU/weight, the three-step butterfly over each 8-head block and the
+# block order ((0 + B0) + B16) + ((0 + B8) + B24) are those of _INDEX_MMA.
+# Keys decode as fp4 * 2^(e-127); a multiply equals ldexp while 2^(e-127) and
+# every product stay normal (3 <= e <= 254), and ldexp covers the rest.
+_INDEX_MMA_ROWS = r"""
+    const uint tid = thread_index_in_threadgroup;
+    const uint lane = tid % 32, sg = tid / 32;
+    const uint block = threadgroup_position_in_grid.x * 32;
+    const int H = HEADS, N = meta[1], M = meta[2], start = meta[3], ratio = RATIO;
+    const int L = meta[6];
+    const uint fm = ((lane >> 2) & 4) + ((lane >> 1) & 3);
+    const uint fn = (((lane >> 2) & 2) << 1) + ((lane & 1) << 1);
+    threadgroup float tile[D * 32];
+    for (uint i = tid; i < 32 * (D / 8); i += 128) {
+        const uint col = i / (D / 8), word = i % (D / 8);
+        const int row = int(block + col);
+        if (row < N) {
+            const size_t base = size_t(row) * (D / 2 + D / 32);
+            const uint bits = *((const device uint*)(keys + base) + word);
+            const int e = int(keys[base + D / 2 + word / 4]);
+            const bool fast = e >= 3 && e <= 254;
+            const float scale = as_type<float>(uint(e) << 23);
+            for (uint k = 0; k < 8; ++k) {
+                const float x = v41_fp4((bits >> (4 * k)) & 15);
+                tile[(word * 8 + k) * 32 + col] = fast ? x * scale : ldexp(x, e - 127);
+            }
+        } else {
+            for (uint k = 0; k < 8; ++k) tile[(word * 8 + k) * 32 + col] = 0.0f;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint col = sg * 8 + fn;
+    float2 key[D / 8];
+    for (uint s = 0; s < D / 8; ++s)
+        key[s] = float2(tile[(s * 8 + fm) * 32 + col], tile[(s * 8 + fm) * 32 + col + 1]);
+    for (int query = 0; query < L; ++query) {
+        float2 first = 0.0f, second = 0.0f;
+        for (int hb = 0; hb < 4; ++hb) {
+            const int h = hb == 0 ? 0 : (hb == 1 ? 16 : (hb == 2 ? 8 : 24));
+            simdgroup_matrix<float, 8, 8> acc, a, b;
+            acc.thread_elements()[0] = 0.0f;
+            acc.thread_elements()[1] = 0.0f;
+            auto qrow = q + (size_t(query) * H + h + fm) * D + fn;
+            #pragma clang loop unroll(full)
+            for (uint s = 0; s < D / 8; ++s) {
+                a.thread_elements()[0] = float(qrow[s * 8]);
+                a.thread_elements()[1] = float(qrow[s * 8 + 1]);
+                b.thread_elements()[0] = key[s].x;
+                b.thread_elements()[1] = key[s].y;
+                simdgroup_multiply_accumulate(acc, a, b, acc);
+            }
+            const float weight = weights[query * H + h + fm];
+            float v0 = max(acc.thread_elements()[0], 0.0f) * weight;
+            float v1 = max(acc.thread_elements()[1], 0.0f) * weight;
+            for (uint i = 0; i < 3; ++i) {
+                const uint mask = i == 0 ? 2 : (i == 1 ? 4 : 16);
+                v0 += simd_shuffle_xor(v0, mask);
+                v1 += simd_shuffle_xor(v1, mask);
+            }
+            if (hb < 2) { first.x += v0; first.y += v1; }
+            else { second.x += v0; second.y += v1; }
+        }
+        if (fm == 0) {
+            const int limit = (start + query + 1) / ratio;
+            for (uint j = 0; j < 2; ++j) {
+                const uint pos = block + col + j;
+                if (pos >= uint(M)) continue;
+                const bool valid = int(pos) < N && int(pos) + meta[5] < limit;
+                scores[size_t(query) * M + pos] = valid ? first[j] + second[j] : -INFINITY;
+            }
+        }
+    }
+"""
+
 _MERGE = r"""
     const uint lane = thread_index_in_threadgroup % 32;
     const uint head = threadgroup_position_in_grid.x * 4
@@ -429,6 +511,9 @@ def _kernel(kind):
     elif kind == "merge":
         inputs = ["partial", "sink", "meta"]
         outputs, source = ["out"], _MERGE
+    elif kind == "index_mma_rows":
+        inputs = ["q", "keys", "weights", "meta"]
+        outputs, source = ["scores"], _INDEX_MMA_ROWS
     else:
         inputs = ["q", "keys", "weights", "candidates", "meta"]
         outputs, source = ["scores"], _INDEX_MMA if kind == "index_mma" else _INDEX
@@ -533,6 +618,32 @@ def packed_index_scores(
         return packed_scores(
             q, keys, weights, start, ratio, candidates, key_start=key_start
         )
+    if (
+        DS41_INDEX_ROWS
+        and candidates is None
+        # CED midpoint batches use the same per-row reductions as verify.
+        # Keep their key tile in registers across the bounded 128-query tail.
+        and 2 <= length <= (128 if DS41_PREFILL_MID_INDEX else 8)
+        and heads == 32
+        and dim == 128
+        and q.dtype == mx.bfloat16
+    ):
+        return _kernel("index_mma_rows")(
+            inputs=[
+                q,
+                keys,
+                weights.astype(mx.float32),
+                mx.array(
+                    [heads, keys.shape[1], width, start, ratio, key_start, length],
+                    mx.int32,
+                ),
+            ],
+            template=[("D", dim), ("HEADS", heads), ("RATIO", ratio)],
+            grid=((width + 31) // 32 * 128, 1, 1),
+            threadgroup=(128, 1, 1),
+            output_shapes=[(1, length, width)],
+            output_dtypes=[mx.float32],
+        )[0]
     mma = dim <= 128 and heads >= 8
     head_split = mma and heads >= 32
     cols = 16 if head_split else 32
@@ -983,6 +1094,19 @@ def packed_index_topk(
     submitting another, and the final batch is drained before returning.
     Returns chronological IDs, with -1 padding.
     """
+    if (
+        DS41_PREFILL_MID_INDEX
+        and block_count
+        and query_chunk_size is None
+        and chunk_size is None
+        and 8 < q.shape[1] <= 128
+    ):
+        # CED midpoint prefill: the 128 tail queries against every key. Score
+        # all of them per batch over 256K keys (128 MiB of scores) instead of
+        # 16 queries over 64K keys, so a 1M-token chunk drains 2 GPU batches
+        # instead of 64. The tile top-k and rank merges are batch-invariant.
+        query_chunk_size = q.shape[1]
+        chunk_size = 262144
     if query_chunk_size is None:
         # Fill the score budget with queries when the key prefix is short.
         # A fixed 16-query tile creates many unnecessary submission barriers.
@@ -994,6 +1118,13 @@ def packed_index_topk(
             524288 if q.shape[1] == 1 else 262144,
             1048576 // max(1, min(q.shape[1], query_chunk_size)),
         )
+        if DS41_DECODE_SINGLE_TILE and q.shape[1] <= 8:
+            # Decode and DSpark verification: one lazy tile over every key
+            # (scores stay <= 8 x keys FP32). Chunked scans evaluated each
+            # batch mid-forward, idling the GPU while Python rebuilt the graph.
+            # Tile boundaries stay multiples of 64 and the rank order is
+            # total, so the selection is unchanged.
+            chunk_size = max(chunk_size, (keys.shape[1] + 63) // 64 * 64)
     if chunk_size <= 0:
         raise ValueError("Invalid index selection budget")
     if block_count and block_size <= 0:
@@ -1028,6 +1159,7 @@ def packed_index_topk(
             mx.full((1, end - begin, block_count), 2147483647, mx.int32),
         )
         visible = min(width, (start + end) // ratio)
+        selected = None
         for first in range(0, visible, chunk_size):
             stop = min(first + chunk_size, visible)
             scores = packed_index_scores(
@@ -1038,12 +1170,22 @@ def packed_index_topk(
                 ratio,
                 key_start=first,
             )
-            values, ids = _tile_topk(scores, count, offset=first)
-            running = (
-                (values, ids)
-                if first == 0 and values.shape[-1] == count
-                else _merge_topk(running, (values, ids), count)
-            )
+            if (
+                DS41_DECODE_RADIX
+                and single_tile
+                and q.shape[1] <= 8
+                and scores.shape[-1] >= max(count, 32768)
+            ):
+                # Decode/verify rows: exact multi-threadgroup radix selection
+                # of the same ids (score desc, id asc) as the tile sort.
+                selected = decode_topk.selection(scores, count)
+            else:
+                values, ids = _tile_topk(scores, count, offset=first)
+                running = (
+                    (values, ids)
+                    if first == 0 and values.shape[-1] == count
+                    else _merge_topk(running, (values, ids), count)
+                )
             if block_count:
                 values, ids = _tile_topk(
                     scores,
@@ -1069,7 +1211,9 @@ def packed_index_topk(
                 pending = (*running, *blocks)
                 mx.async_eval(*pending)
         results.append(
-            mx.sort(mx.where(running[0] > -float("inf"), running[1], -1), axis=-1)
+            selected
+            if selected is not None
+            else mx.sort(mx.where(running[0] > -float("inf"), running[1], -1), axis=-1)
         )
         block_results.append(
             mx.sort(mx.where(blocks[0] > -float("inf"), blocks[1], -1), axis=-1)

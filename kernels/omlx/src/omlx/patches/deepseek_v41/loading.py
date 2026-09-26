@@ -319,6 +319,7 @@ def load(
         tokenizer.tool_call_end = tool_call_end
         tokenizer.tool_parser = parse_tool_call
         processor = Processor(tokenizer, model.config)
+        model.language_model._ds41_draft_tokenizer = tokenizer
         if model.config.engram_layer_ids:
             model.language_model.set_tokenizer(tokenizer)
         # Load the backbone before reserving RAM for large Engram tables.

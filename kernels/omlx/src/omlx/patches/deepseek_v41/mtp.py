@@ -1,7 +1,11 @@
 # SPDX-License-Identifier: MIT
 """DSpark integration with oMLX's shared speculative acceptance loop."""
 
+import os
+
 import mlx.core as mx
+
+from . import growth
 
 
 class AcceptanceDepthController:
@@ -15,6 +19,10 @@ class AcceptanceDepthController:
 
     def __init__(self, depth):
         self.max_depth = max(1, int(depth))
+        self.cost_policy = (
+            os.environ.get("DS41_MTP_COST_POLICY", "0") == "1"
+            and self.max_depth <= 4
+        )
         self.cur = self.max_depth
         self._warmup = False
         self.exit_streak = 0
@@ -23,6 +31,33 @@ class AcceptanceDepthController:
     def observe(self, used, accepted, cycle_ms, time_sample=True):
         accepted = max(0, min(int(accepted), int(used)))
         self.cur = min(self.max_depth, accepted + 1)
+
+    def choose_cost_depth(self, probabilities, context):
+        """Maximize predicted committed tokens per profiled verify cycle.
+
+        Costs are offline measurements, not runtime timing. Below 1024 tokens
+        the front-padded index layout depends on verify width, so preserve the
+        served acceptance-only rule. Always retain a draft (verify L >= 2).
+        """
+        if not self.cost_policy or context < 1024:
+            return self.cur
+        # Warm verify C(L), L=2..5, plus 5 ms drafter/loop allowance.
+        # Fixed profiles keep decisions independent of machine load and batch
+        # scheduling. C2 has the same rising marginal-cost shape.
+        if context >= 524288:
+            costs = (33.39, 38.61, 41.48, 45.72)
+        elif context >= 131072:
+            costs = (32.03, 36.64, 39.65, 43.28)
+        else:
+            costs = (31.72, 36.06, 38.84, 42.28)
+        cumulative, expected, best, best_utility = 1.0, 1.0, 1, -1.0
+        for index, probability in enumerate(probabilities[: self.max_depth]):
+            cumulative *= max(0.0, min(1.0, float(probability)))
+            expected += cumulative
+            utility = expected / costs[index]
+            if utility > best_utility:
+                best, best_utility = index + 1, utility
+        return best
 
     def should_exit(self):
         # Timing-based handoff would also change the subsequent numeric path.
@@ -135,8 +170,8 @@ class DSparkMixin:
             ]
             ratio = item.compress_ratio
             if ratio:
-                item[2] = item[2][:, : end // ratio]
-                item[3] = item[3][:, : end // ratio]
+                growth.truncate(item, 2, end // ratio)
+                growth.truncate(item, 3, end // ratio)
                 if ratio > 1:
                     kv, gate = state["compressor"]
                     projected_end = before % ratio + count

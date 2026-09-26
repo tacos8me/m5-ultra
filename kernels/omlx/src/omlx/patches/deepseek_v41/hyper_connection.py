@@ -242,12 +242,16 @@ def _projection_kernel(warp=False):
     )
 
 
-def fused_hc_projection(x, fn, eps):
-    """Project BF16 residual streams with FP32 weights and accumulators."""
+def fused_hc_projection(x, fn, eps, rows_hint=None):
+    """Project BF16 residual streams with FP32 weights and accumulators.
+
+    ``rows_hint`` selects the kernel variant as if that many rows were present
+    (the encoder replay recomputes a chunk's tail rows on their own).
+    """
     width = x.shape[-1] * 4
     rows = x.size // width
     # Small batches need more warps to occupy the GPU.
-    threads = 32 if rows >= 1024 else 256
+    threads = 32 if (rows if rows_hint is None else rows_hint) >= 1024 else 256
     return _projection_kernel(warp=threads == 32)(
         inputs=[x, fn, mx.array([eps], mx.float32)],
         template=[("D", width)],

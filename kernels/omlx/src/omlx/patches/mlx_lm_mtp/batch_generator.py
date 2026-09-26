@@ -24,6 +24,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
 from omlx.prefill_progress import get_prefill_tracker
 
 from . import cache_rollback as _rollback_mod
+from . import copy_draft as _copy_draft
 from . import prompt_priming as _prompt_priming
 
 logger = logging.getLogger(__name__)
@@ -255,6 +256,15 @@ def apply() -> bool:
 
         def patched_filter(self, keep, *args, **kwargs):
             old_uids = list(getattr(self, "uids", []) or [])
+            group = getattr(self, "_omlx_mtp_batch_state", None)
+            states = dict(group.states) if group is not None else {}
+            single = getattr(self, "_omlx_mtp_state", None)
+            if single is not None:
+                states[single.uid] = single
+            for index, uid in enumerate(old_uids):
+                tracker = getattr(states.get(uid), "extra_source_tracker", None)
+                if index not in keep and tracker is not None:
+                    tracker.finish(self._num_tokens[index], tool_filter=True)
             result = original_filter(self, keep, *args, **kwargs)
             _prompt_priming.release_uids(self.model, set(old_uids) - set(self.uids))
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
@@ -683,6 +693,10 @@ class _MtpStats:
     mtp_head_ms: float = 0.0  # cumulative time inside MTP-head forwards
     sample_ms: float = 0.0  # cumulative time in sampling + acceptance check
     cache_ops_ms: float = 0.0  # cumulative time in trim / rollback restore
+    # Cycles whose draft came from the context-copy index (DeepSeek DSpark).
+    copy_cycles: int = 0
+    copy_drafted: int = 0
+    copy_accepted: int = 0
 
 
 @dataclass
@@ -753,6 +767,9 @@ class _MtpState:
     # Adaptive depth controller (None = fixed depth). Chooses how many
     # drafts the next chain builds from rolling accept/latency estimates.
     controller: Optional[Any] = None
+    # Context-copy drafter (greedy DSpark requests without processors).
+    copy_index: Optional[Any] = None
+    draft_source: str = "head"
 
     # True while this state is a bounded re-entry probe after a performance
     # handoff. Correctness fallbacks and late-join handoffs do not set it.
@@ -2359,6 +2376,44 @@ def _dspark_next_drafts(
     depth = state.controller.cur if state.controller is not None else state.depth
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
     n = int(committed.shape[0])
+    copy = state.copy_index
+    tracker = None
+    if copy is not None and state.hist_offset >= 1024:
+        from omlx.patches.deepseek_v41 import draft_sources
+
+        if not hasattr(state, "extra_source_tracker"):
+            state.extra_source_tracker = draft_sources.create(host, copy)
+        tracker = state.extra_source_tracker
+        if tracker is not None:
+            tracker.append(committed.tolist(), hidden_rows)
+    if copy is not None:
+        copy.append(committed.tolist())
+        budget = (
+            int(gen_batch.max_tokens[0])
+            - int(gen_batch._num_tokens[0])
+            - len(state.queue)
+            - 1
+        )
+        draft, source = (
+            tracker.propose(
+                copy._buf[max(0, copy.n - 64) : copy.n].tolist(), budget
+            )
+            if tracker is not None
+            else (None, None)
+        )
+        if not draft:
+            draft, source = copy.propose(budget), "copy"
+        if draft:
+            # Keep the committed target taps; this proposal avoids a drafter
+            # forward and every proposed token is still verified by the target.
+            host.dspark_append_context(hidden_rows, state.mtp_cache)
+            state.hist_offset += n
+            state.drafts = mx.array(draft, dtype=mx.uint32)
+            state.draft_lps = [None] * len(draft)
+            state.draft_accept_lps = [None] * len(draft)
+            state.draft_source = source
+            return
+    state.draft_source = "dspark"
     if depth <= 0:
         host.dspark_append_context(hidden_rows, state.mtp_cache)
         state.hist_offset += n
@@ -2367,12 +2422,17 @@ def _dspark_next_drafts(
         state.draft_accept_lps = []
         return
 
+    cost_policy = (
+        bool(getattr(state.controller, "cost_policy", False))
+        and state.hist_offset >= 1024
+    )
+    width = state.controller.max_depth if cost_policy else depth
     anchor = committed[-1:].reshape(1, 1)
     logits, _ = host.dspark_forward(
         hidden_rows,
         anchor,
         state.mtp_cache,
-        draft_length=depth,
+        draft_length=width,
     )
     state.hist_offset += n
 
@@ -2389,7 +2449,7 @@ def _dspark_next_drafts(
     # before the loop and rewind after.
     snap = _snap_snapshotable(procs)
 
-    for idx in range(depth):
+    for idx in range(width):
         bias, _ = host.dspark_markov(previous)
         logits_2d = logits[:, idx, :] + bias
         if procs is not None and prev_buf is not None:
@@ -2407,6 +2467,12 @@ def _dspark_next_drafts(
 
     _restore_snapshotable(procs, snap)
 
+    if cost_policy:
+        probabilities = mx.exp(mx.stack([mx.max(lp) for lp in draft_lps])).tolist()
+        depth = state.controller.choose_cost_depth(probabilities, state.hist_offset)
+        draft_toks = draft_toks[:depth]
+        draft_lps = draft_lps[:depth]
+        draft_accept_lps = draft_accept_lps[:depth]
     state.drafts = mx.concatenate(draft_toks)
     state.draft_lps = draft_lps
     state.draft_accept_lps = draft_accept_lps
@@ -2646,10 +2712,22 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
         else:
             state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
-        state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+        main_id = int(main_tok.tolist()[0])
+        state.queue.append((main_id, main_lp, "init"))
         state.queue.append(
             (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
         )
+        if (
+            _copy_draft.ENABLED
+            and _dspark_host(gen_batch.model) is not None
+            and _is_greedy(gen_batch)
+            and procs is None
+        ):
+            # tokens[0] holds every prompt token in the cache; main_tok was
+            # forwarded above and is emitted from the queue.
+            state.copy_index = _copy_draft.CopyIndex(
+                list(gen_batch.tokens[0]) + [main_id]
+            )
         _chain_next_drafts(
             gen_batch,
             state,
@@ -2849,6 +2927,9 @@ def _emit_ragged_responses(
                     )
                 )
                 if state is not None:
+                    tracker = getattr(state, "extra_source_tracker", None)
+                    if tracker is not None:
+                        tracker.finish(gen_batch._num_tokens[idx])
                     _log_mtp_stats(uid, state.stats, finish_reason)
                 finished_uids.append(uid)
                 row_finished = True
@@ -3087,6 +3168,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
         depth_str = ""
     if stats.zero_cycles:
         depth_str += f" d0={stats.zero_cycles}"
+    if stats.copy_cycles:
+        depth_str += (
+            f" copy[cycles={stats.copy_cycles}"
+            f" accept={stats.copy_accepted}/{stats.copy_drafted}]"
+        )
     tpc = total_emits / stats.cycles if stats.cycles else 0.0
     logger.info(
         "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
@@ -3365,8 +3451,8 @@ def _run_verify_cycle_chain(
 
     # --- stats ---
     state.stats.cycles += 1
-    if len(state.stats.depth_drafted) < state.depth:
-        pad = state.depth - len(state.stats.depth_drafted)
+    if len(state.stats.depth_drafted) < max(state.depth, k):
+        pad = max(state.depth, k) - len(state.stats.depth_drafted)
         state.stats.depth_drafted.extend([0] * pad)
         state.stats.depth_accepted.extend([0] * pad)
     for j in range(k):
@@ -3378,6 +3464,12 @@ def _run_verify_cycle_chain(
     state.stats.accepts += m
     if m < k:
         state.stats.rejects += 1
+    if state.draft_source == "copy":
+        state.stats.copy_cycles += 1
+        state.stats.copy_drafted += k
+        state.stats.copy_accepted += m
+        if state.copy_index is not None:
+            state.copy_index.observe(m)
     state.stats.sample_ms += (time.perf_counter() - t0) * 1000
 
     accept_ms = (time.perf_counter() - cycle_t0) * 1000
@@ -3387,7 +3479,10 @@ def _run_verify_cycle_chain(
         # --- commit: queue emits + cache rollback ---
         t0 = time.perf_counter()
         for j in range(m):
-            state.queue.append((int(draft_ids[j]), state.draft_lps[j], "draft"))
+            lp = state.draft_lps[j]
+            state.queue.append(
+                (int(draft_ids[j]), combined_lp[j] if lp is None else lp, "draft")
+            )
         state.queue.append(
             (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
         )
@@ -3838,6 +3933,10 @@ def _emit_response(
         finish_reason = "stop"
 
     if finish_reason is not None:
+        mtp_state = getattr(gen_batch, "_omlx_mtp_state", None)
+        tracker = getattr(mtp_state, "extra_source_tracker", None)
+        if tracker is not None:
+            tracker.finish(gen_batch._num_tokens[0])
         prompt_cache = gen_batch.extract_cache(0)
         all_tokens = gen_batch.tokens[0]
         response = Response(

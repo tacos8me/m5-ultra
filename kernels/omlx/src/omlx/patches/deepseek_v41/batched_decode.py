@@ -94,8 +94,7 @@ def forward(model, input_ids, cache):
             rc[0] = mx.array([starts[row] + 1], mx.int32)
             if i == 0 and histories[row] is not None:
                 rc[6] = mx.array(histories[row], mx.int64)
-        merged = DeepseekV41Cache.merge(rows[i])
-        cache[i].cache = merged.cache
+        cache[i].adopt(DeepseekV41Cache.merge(rows[i]))
         cache[i].advance(1)
     final = model.norm(hc_pre(h, pre))
     return project_logits(final, model.head)

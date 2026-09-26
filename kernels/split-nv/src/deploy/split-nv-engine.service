@@ -1,0 +1,24 @@
+# User unit (loginctl linger is on for ian, so it starts at boot; no sudo).
+# Code runs from the pinned deploy clone /home/ian/split-nv-deploy (own sglang/, encoder-model/, ref/ copies);
+# move it only with tools/s4_deploy.sh <commit> <label> (checkout + restart together). No exec hook (SPLIT_NV_DEV=0).
+# Install: cp deploy/split-nv-engine.service ~/.config/systemd/user/ && systemctl --user daemon-reload
+#          systemctl --user enable --now split-nv-engine
+# Stop for maintenance: systemctl --user stop split-nv-engine (drains up to 30 s; plain `docker stop` would be restarted).
+[Unit]
+Description=split-nv DS41 box engine (layers 0-20: step API :10052, prefill/health :10051)
+# Retries forever (15 s apart): a slow docker/NVIDIA init after a reboot must not exhaust a start limit.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=SPLIT_NV_DEV=0 SPLIT_NV_ROOT=/home/ian/split-nv-deploy
+ExecStartPre=-/usr/bin/docker rm -f split-nv-encoder
+ExecStart=/home/ian/split-nv-deploy/run_engine.sh
+ExecStop=/usr/bin/docker stop -t 45 split-nv-encoder
+Restart=always
+RestartSec=15
+TimeoutStopSec=90
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

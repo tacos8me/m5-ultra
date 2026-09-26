@@ -1,0 +1,191 @@
+# llama-swap on :8080 — MiMo-V2.6-Flash on M5 Ultra. One ~170 GB model owns the GPU at a time
+# (every backend runs under ~/llm/bin/gpu-exec, same lock as `lockf -k ~/llm/locks/gpu.lock`).
+#   mimo         : M5-tuned stack (fused qk192/v128 NAX attention incl. SWA+sinks, split-KV multi-query
+#                  decode attention, fused MXFP4 MoE, MTP draft k=2, prefill chunk 8192) — default
+#   mimo-nomtp   : same kernels, no draft — best aggregate throughput under heavy concurrency
+#   mimo-stock   : pip MLX 0.32.2 + mlx-lm PR#1219 — known-good fallback
+#   ds41         : DeepSeek-V4.1-Flash ORIGINAL FP4/FP8 weights (Icculus), RTX box layers 0-19 + Mac 20-39 over 10GbE
+#                  (tree ~/src/wt/ds41-og), 1M; CPU supervisor falls back to the q3 build (and back) — preloaded
+#   ds41-q3      : DeepSeek-V4.1-Flash LSQ q3 + DSpark k=4, 2 concurrent requests (tree ~/src/wt/ds41-serve-c2), Mac only
+#   ds41-c1      : q3, one request at a time (tree ~/src/wt/ds41-serve) — fallback
+#   qwen38-27b   : Qwen3.8-27B dense (hybrid attention), Jundot oQ8e + MTP, stock oMLX, 1M window
+#   qwen38       : Qwen3.8-Flash-Next (180B MoE, 512 experts top-10, hybrid attention), oQ8e + MTP, 1M wrapper + layered prefill, c4, 1M (qwen38-classic = old prefill)
+#   glm53        : GLM-5.3-Flash (320B MoE, 288 experts top-8, hybrid attention), vogel61 oQ5e + grafted native MTP, stock oMLX, 1M
+# Variants on the same loaded model (no reload): <id>:nothink, <id>:greedy (mimo:greedy also drafts k=3)
+# Docs: ~/llm/README.md, numbers: ~/llm/BENCHMARKS.md
+healthCheckTimeout: 900  # > gpu-exec GPU_LOCK_WAIT (600s) + model load
+logLevel: info
+logToStdout: both
+startPort: 10001
+sendLoadingState: true
+
+hooks:
+  on_startup:
+    preload:
+      - ds41
+
+macros:
+  models: ${env.HOME}/models
+  gpu: ${env.HOME}/llm/bin/gpu-exec
+  common: >
+    --host 127.0.0.1 --port ${PORT}
+    --max-tokens 32768 --prompt-cache-bytes 17179869184
+    --temp 1.0 --top-p 0.95
+  fast-server: >
+    ${gpu} ${env.HOME}/llm/.venv-fast/bin/mlx_lm.server ${common}
+    --prefill-step-size 8192
+  stock-server: >
+    ${gpu} ${env.HOME}/llm/bin/mlx-server ${env.HOME}/llm/.venv/bin/python ${common}
+    --prefill-step-size 2048
+
+models:
+  mimo:
+    name: MiMo-V2.6-Flash · M5-tuned + MTP
+    description: fused NAX attention (qk192/v128, SWA+sinks) + fused MXFP4 MoE decode + 3-layer MTP draft (k=2)
+    cmd: |
+      ${fast-server}
+      --model ${models}/MiMo-V2.6-Flash-mtp-mlx
+      --draft-model mtp --num-draft-tokens 2
+    useModelName: default_model
+    concurrencyLimit: 32
+    ttl: 0
+    aliases: [mimo-v2.6-flash, mimo-mtp]
+    filters:
+      setParamsByID:
+        "${MODEL_ID}:nothink":
+          chat_template_kwargs: {enable_thinking: false}
+        "${MODEL_ID}:greedy":
+          temperature: 0
+          num_draft_tokens: 3
+
+  mimo-nomtp:
+    name: MiMo-V2.6-Flash · M5-tuned (no draft)
+    cmd: |
+      ${fast-server}
+      --model ${models}/MiMo-V2.6-Flash-RL-mxfp4-q8
+    useModelName: default_model
+    concurrencyLimit: 32
+    ttl: 0
+    filters:
+      setParamsByID:
+        "${MODEL_ID}:nothink":
+          chat_template_kwargs: {enable_thinking: false}
+        "${MODEL_ID}:greedy":
+          temperature: 0
+
+  mimo-stock:
+    name: MiMo-V2.6-Flash · stock MLX (fallback)
+    cmd: |
+      ${stock-server}
+      --model ${models}/MiMo-V2.6-Flash-RL-mxfp4-q8
+    useModelName: default_model
+    concurrencyLimit: 32
+    ttl: 0
+    filters:
+      setParamsByID:
+        "${MODEL_ID}:nothink":
+          chat_template_kwargs: {enable_thinking: false}
+        "${MODEL_ID}:greedy":
+          temperature: 0
+
+  ds41:
+    name: Icculus · DeepSeek-V4.1-Flash ORIGINAL FP4/FP8 (RTX box layers 0-19 + Mac 20-39) + DSpark
+    description: original weights over the 10GbE link; box prefills and runs layers 0-19 each step, Mac layers 20-39 + head + DSpark k=4; box prefix cache; survives box loss mid-stream (reconnect, else continues on q3); 1M context, text only
+    cmd: |
+      ${env.HOME}/llm/ds41/og/ds41-og --host 127.0.0.1 --port ${PORT}
+    env:
+      - DS41_TREE=/Users/ian/src/wt/ds41-og
+    useModelName: ds41-og
+    ttl: 0
+    aliases: [icculus, deepseek-v4.1-flash, ds41-og, deepseek-v4.1-flash-og]
+    filters:
+      setParamsByID:
+        "${MODEL_ID}:think":
+          chat_template_kwargs: {enable_thinking: true}
+
+  ds41-q3:
+    name: DeepSeek-V4.1-Flash · LSQ q3 + DSpark
+    description: Mac-only q3 build (pre-og default) — CED prefill, fused sparse attention + indexer, Engram SSD lookahead, exact decode kernels, DSpark k=4, two requests decode together (exact); 512K context
+    cmd: |
+      ${gpu} ${env.HOME}/llm/ds41/serve/ds41-server --host 127.0.0.1 --port ${PORT}
+      --base-path ${env.HOME}/llm/ds41/serve/profile-c2 --max-concurrent-requests 2
+    env:
+      - DS41_TREE=/Users/ian/src/wt/ds41-serve-c2
+      - DS41_PREFIX_CACHE_GIB=2
+      - DS41_MTP_COST_POLICY=1
+      - DS41_EXTRA_DRAFT=1
+    useModelName: ds41-q3g128
+    ttl: 0
+    aliases: [ds41-q3g128, ds41-c2, deepseek-v4.1-flash-c2, deepseek-v4.1-flash-q3]
+    filters:
+      setParamsByID:
+        "${MODEL_ID}:think":
+          chat_template_kwargs: {enable_thinking: true}
+
+  ds41-c1:
+    name: DeepSeek-V4.1-Flash · one request at a time (fallback)
+    description: previous served build (tree ~/src/wt/ds41-serve), no cross-request batching
+    cmd: |
+      ${gpu} ${env.HOME}/llm/ds41/serve/ds41-server --host 127.0.0.1 --port ${PORT}
+    useModelName: ds41-q3g128
+    ttl: 0
+    filters:
+      setParamsByID:
+        "${MODEL_ID}:think":
+          chat_template_kwargs: {enable_thinking: true}
+
+  qwen38-27b:
+    name: Qwen3.8-27B · oQ8e + MTP (oMLX)
+    description: 27B dense, hybrid linear/full attention, 262K native (1M window, no YaRN past 262K); Jundot oQ8e 8-bit with MTP; stock oMLX 0.7.0.dev4
+    cmd: |
+      ${gpu} ${env.HOME}/llm/.venv-omlx/bin/omlx serve --host 127.0.0.1 --port ${PORT}
+      --base-path ${env.HOME}/llm/qwen38-27b/profile --model-dir ${env.HOME}/llm/qwen38-27b/models
+      --no-cache --max-concurrent-requests 4
+    env:
+      - OMLX_BONJOUR=0
+      - OMLX_DISCOVERY=0
+    useModelName: qwen3.8-27b
+    ttl: 0
+    aliases: [qwen3.8-27b]
+  qwen38-classic:
+    name: Qwen3.8-Flash-Next · classic prefill (pre-layered fallback)
+    description: 180B MoE (512 experts, top-10), hybrid linear/full attention, 1M context (no YaRN past 262K); mlx-community oQ8e 8-bit with MTP; oMLX 0.7.0.dev4 via qwen38_serve.py (KV sized once, MTP priming evaluated per chunk, 245 GiB stop)
+    cmd: |
+      ${gpu} ${env.HOME}/llm/.venv-omlx/bin/python ${env.HOME}/llm/qwen38/qwen38_serve.py serve --host 127.0.0.1 --port ${PORT}
+      --base-path ${env.HOME}/llm/qwen38/profile --model-dir ${env.HOME}/llm/qwen38/models
+      --no-cache --max-concurrent-requests 4
+    env:
+      - OMLX_BONJOUR=0
+      - OMLX_DISCOVERY=0
+    useModelName: qwen3.8-flash-next
+    ttl: 0
+    aliases: [qwen3.8-next-classic]
+  qwen38:
+    name: Qwen3.8-Flash-Next · oQ8e + MTP + layered prefill (oMLX)
+    description: 180B MoE (512 experts top-10), hybrid attention, 1M; oQ8e + MTP; qwen38_serve.py 1M memory fixes + layered MoE prefill (8192-row layer groups, 2048-row attention; hyb1 e6116ee), +12-16% prefill to 512K, decode unchanged; not bit-exact (quality-gated); 245 GiB stop
+    cmd: |
+      ${gpu} ${env.HOME}/llm/.venv-omlx/bin/python ${env.HOME}/llm/ds41/hyb1-c4-1m/qwen_layered_serve.py serve --host 127.0.0.1 --port ${PORT}
+      --base-path ${env.HOME}/llm/ds41/hyb1-c4-1m/serve-profile --model-dir ${env.HOME}/llm/qwen38/models
+      --no-cache --max-concurrent-requests 4
+    env:
+      - QWEN_LAYERED_PREFILL=1
+      - MLX_ENABLE_TF32=0
+      - QWEN_FOOTPRINT_STOP_GIB=245
+      - OMLX_BONJOUR=0
+      - OMLX_DISCOVERY=0
+    useModelName: qwen3.8-flash-next
+    ttl: 0
+    aliases: [qwen3.8-flash-next, qwen3.8-next, qwen3.8-next-layered]
+  glm53:
+    name: GLM-5.3-Flash · oQ5e + MTP (oMLX)
+    description: 320B MoE (288 experts, top-8), 34 linear-attention + 11 sparse MLA layers, 1M context; vogel61 oQ5e 5-bit + Vontra native MTP head (grafted); stock oMLX 0.7.0.dev4
+    cmd: |
+      ${gpu} ${env.HOME}/llm/.venv-omlx/bin/omlx serve --host 127.0.0.1 --port ${PORT}
+      --base-path ${env.HOME}/llm/glm53/profile --model-dir ${env.HOME}/llm/glm53/models
+      --no-cache --max-concurrent-requests 4
+    env:
+      - OMLX_BONJOUR=0
+      - OMLX_DISCOVERY=0
+    useModelName: glm-5.3-flash
+    ttl: 0
+    aliases: [glm-5.3-flash, glm5.3-flash]

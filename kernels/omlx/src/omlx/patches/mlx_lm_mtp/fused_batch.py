@@ -58,28 +58,32 @@ def _advance_dspark(batch, batch_state, host):
     """One ragged target call, followed by each UID's existing acceptance loop."""
     import os
 
-    row_caches = host.mtp_extract_request_caches(batch.prompt_cache)
-    rows = []
-    for index, uid in enumerate(batch.uids):
-        state = batch_state.states[uid]
-        if not state.queue:
-            rows.append(
-                (
-                    index,
-                    bg._make_row_batch(
-                        batch, index, prompt_cache=row_caches[index], state=state
-                    ),
-                    state,
-                )
-            )
-    if len(rows) < 2 or os.environ.get("DS41_BATCH_VERIFY", "1") == "0":
+    pending = [
+        (index, batch_state.states[uid])
+        for index, uid in enumerate(batch.uids)
+        if not batch_state.states[uid].queue
+    ]
+    if len(pending) < 2 or os.environ.get("DS41_BATCH_VERIFY", "1") == "0":
         return False
+    # Bounded workspace; longer drafts (context-copy) and larger batches
+    # retain the exact independent path. Checked before any cache extraction.
+    lengths = [1 + int(state.drafts.shape[0]) for _, state in pending]
+    if any(length > 8 for length in lengths) or sum(lengths) > 32:
+        return False
+    row_caches = host.mtp_extract_request_caches(batch.prompt_cache)
+    rows = [
+        (
+            index,
+            bg._make_row_batch(
+                batch, index, prompt_cache=row_caches[index], state=state
+            ),
+            state,
+        )
+        for index, state in pending
+    ]
     inputs = [
         mx.concatenate([state.next_main, state.drafts])[None, :] for _, _, state in rows
     ]
-    # Bounded workspace; larger batches retain the exact independent path.
-    if any(x.shape[1] > 8 for x in inputs) or sum(x.shape[1] for x in inputs) > 32:
-        return False
     started = time.perf_counter()
     results = host.mtp_verify_requests(inputs, [row.prompt_cache for _, row, _ in rows])
     mx.eval([result[:2] for result in results])

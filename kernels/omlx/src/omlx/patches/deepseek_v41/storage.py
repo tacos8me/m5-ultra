@@ -27,6 +27,8 @@ import mlx.core as mx
 import mlx.nn as nn
 import numpy as np
 
+from .hot_rows import HotRows
+
 RESIDENT_READ_BYTES = 8 * 1024 * 1024
 # safetensors dtype tag -> numpy transport dtype (bf16 travels as raw uint16).
 SAFETENSORS_NUMPY_DTYPES = {
@@ -62,6 +64,19 @@ NATIVE_THREADS = int(os.environ.get("DS41_ENGRAM_IO_THREADS", "64"))
 # rows still cost only a copy.
 DECODE_NATIVE = os.environ.get("DS41_ENGRAM_DECODE_NATIVE", "1") == "1"
 DECODE_THREADS = int(os.environ.get("DS41_ENGRAM_DECODE_THREADS", "16"))
+# Retain only the first prefill chunk's compact, immutable SSD rows. Later
+# chunks already have GPU compute to hide their reads behind. Two released
+# model tables use at most 128 MiB total; 0 restores uncached row reads.
+WARM_ROWS_BYTES = int(
+    max(0, min(64, float(os.environ.get("DS41_ENGRAM_WARM_ROWS_MIB", "64"))))
+    * 1024**2
+)
+# Two released tables: at most 2.5 GiB total, including cache metadata.
+# Set 0 to retain the original first-chunk snapshot behavior.
+HOT_ROWS_BYTES = int(
+    max(0, min(1280, float(os.environ.get("DS41_ENGRAM_HOT_ROWS_MIB", "1280"))))
+    * 1024**2
+)
 NATIVE_ALIGN = 4096
 _F_RDAHEAD = getattr(fcntl, "F_RDAHEAD", 45)
 _native_lib = None
@@ -407,6 +422,30 @@ class _PendingGathers:
         )
 
 
+class _WarmRows:
+    """One immutable sorted row snapshot, outside the MLX parameter tree."""
+
+    def __init__(self):
+        self.lock = Lock()
+        self.snapshot = None
+
+    def remember(self, rows, data):
+        row_bytes = 8 + sum(raw[0].nbytes for raw, _ in data)
+        count = min(len(rows), WARM_ROWS_BYTES // row_bytes)
+        if count <= 0:
+            return
+        # Own the bounded slice; retaining a view would retain its whole base.
+        snapshot = (
+            rows if count == len(rows) else rows[:count].copy(),
+            tuple(
+                (raw if count == len(rows) else raw[:count].copy(), dtype)
+                for raw, dtype in data
+            ),
+        )
+        with self.lock:
+            self.snapshot = snapshot
+
+
 class DiskEngramEmbedding(nn.Module):
     def __init__(
         self,
@@ -443,6 +482,8 @@ class DiskEngramEmbedding(nn.Module):
         self._resident = None
         # Gathers started ahead of use; a plain object, not a Module child.
         self._queue = _PendingGathers()
+        self._warm_rows = _WarmRows()
+        self._hot_rows = HotRows(HOT_ROWS_BYTES)
 
     def make_resident(self):
         """Keep packed tensors in Metal-managed RAM with shared CPU views."""
@@ -500,7 +541,7 @@ class DiskEngramEmbedding(nn.Module):
                     result.append((raw[rows], dtype))
             return result
 
-    def gather(self, host):
+    def gather(self, host, *, warm_rows=False):
         """Raw row bytes for ``host`` ids, as ``_read_rows`` returns them.
 
         Large requests are deduplicated and sorted, read natively, and expanded
@@ -510,7 +551,23 @@ class DiskEngramEmbedding(nn.Module):
         cached = flat.size < NATIVE_MIN_ROWS
         if self._resident is not None or (cached and not DECODE_NATIVE) or not flat.size:
             return self._read_rows(flat)
-        rows, inverse = np.unique(flat, return_inverse=True)
+        rows, inverse, counts = np.unique(flat, return_inverse=True, return_counts=True)
+        # The table is immutable and IDs, not prompt positions, are the key.
+        # Decode keeps its existing tiny cached-pread path. Snapshot references
+        # are immutable, so current/lookahead lanes may read concurrently.
+        with self._warm_rows.lock:
+            snapshot = (
+                self._warm_rows.snapshot if WARM_ROWS_BYTES and not cached and not HOT_ROWS_BYTES else None
+            )
+        hits = np.zeros(rows.size, dtype=bool)
+        hot = HOT_ROWS_BYTES and not cached
+        if hot:
+            hits, hot_data = self._hot_rows.lookup(rows)
+        if snapshot is not None:
+            saved, data = snapshot
+            at = np.minimum(np.searchsorted(saved, rows), len(saved) - 1)
+            hits = saved[at] == rows
+        missing = rows[~hits]
         sources = [
             (reader, key)
             for reader, key in (
@@ -526,18 +583,33 @@ class DiskEngramEmbedding(nn.Module):
             # Decode reads are SSD-latency bound: fetch the weight and scale
             # rows concurrently (the native reader releases the GIL).
             futures = [
-                _PAGE_IO_POOL.submit(reader.gather_rows, key, rows, cached=True)
+                _PAGE_IO_POOL.submit(reader.gather_rows, key, missing, cached=True)
                 for reader, key in sources
             ]
             gathered = [future.result() for future in futures]
         else:
             gathered = []
             for reader, key in sources:
-                gathered.append(reader.gather_rows(key, rows, cached=cached))
+                gathered.append(reader.gather_rows(key, missing, cached=cached))
                 if gathered[-1] is None:
                     break
         if any(got is None for got in gathered):
             return self._read_rows(flat)
+        if np.any(hits):
+            merged = []
+            for (raw, dtype), (saved_raw, saved_dtype) in zip(
+                gathered, hot_data if hot else data
+            ):
+                assert dtype == saved_dtype
+                full = np.empty((len(rows), *raw.shape[1:]), dtype=raw.dtype)
+                full[hits] = saved_raw if hot else saved_raw[at[hits]]
+                full[~hits] = raw
+                merged.append((full, dtype))
+            gathered = merged
+        if hot:
+            self._hot_rows.remember(rows, counts, gathered)
+        elif warm_rows and WARM_ROWS_BYTES and not cached:
+            self._warm_rows.remember(rows, gathered)
         return [(raw[inverse], dtype) for raw, dtype in gathered]
 
     def _locate(self, host):
@@ -592,7 +664,7 @@ class DiskEngramEmbedding(nn.Module):
         for old in stale:
             old.future.cancel()
 
-    def plan(self, host, lane, *, max_bytes=None):
+    def plan(self, host, lane, *, max_bytes=None, warm_rows=False):
         """Queue a gather of ``host`` on ``lane``, reusing queued windows.
 
         Leading positions already queued are copied from that window when it
@@ -628,7 +700,7 @@ class DiskEngramEmbedding(nn.Module):
                     pass
             if kept is None:
                 stats["read_ahead"] += rows.size
-                return self.gather(rows)
+                return self.gather(rows, warm_rows=warm_rows)
             stats["reused"] += length * rows.shape[1]
             span = slice(offset * rows.shape[1], (offset + length) * rows.shape[1])
             kept = [(raw[span], dtype) for raw, dtype in kept]
@@ -726,6 +798,9 @@ class DiskEngramEmbedding(nn.Module):
 
     def close(self):
         self.discard_pending()
+        with self._warm_rows.lock:
+            self._warm_rows.snapshot = None
+        self._hot_rows.clear()
         with self._lock:
             self._closed = True
             self._resident = None
@@ -760,14 +835,19 @@ class EngramPrefetch:
         self._embeds = []
         self._closed = False
 
-    def submit(self, embed, ids, *, lookahead=False):
+    def submit(self, embed, ids, *, lookahead=False, warm_rows=False):
         if self._closed:
             raise RuntimeError("Engram prefetch is closed")
         if not isinstance(embed, DiskEngramEmbedding) or embed._resident is not None:
             return
         host = np.asarray(ids, dtype=np.int64)
         lane = self._lanes["lookahead" if lookahead else "current"]
-        embed.plan(host, lane, max_bytes=LOOKAHEAD_MAX_BYTES if lookahead else None)
+        embed.plan(
+            host,
+            lane,
+            max_bytes=LOOKAHEAD_MAX_BYTES if lookahead else None,
+            warm_rows=warm_rows,
+        )
         if embed not in self._embeds:
             self._embeds.append(embed)
 

@@ -9,6 +9,7 @@ was merged only with bit-identical greedy output, caches and logits.
 | [`mlx/`](mlx/) | [ml-explore/mlx](https://github.com/ml-explore/mlx) @ `59d600b` | Metal kernels used by both models |
 | [`mlx-lm/`](mlx-lm/) | [ml-explore/mlx-lm](https://github.com/ml-explore/mlx-lm) + PR #1219 (MiMo) | MiMo-V2.6-Flash |
 | [`omlx/`](omlx/) | [jundot/omlx](https://github.com/jundot/omlx) @ `d4298ad` | DeepSeek-V4.1-Flash |
+| [`split-nv/`](split-nv/) | SGLang DeepSeek-V4.1 port | DeepSeek-V4.1-Flash, RTX half of the [Mac + RTX split](https://tacos8me.github.io/m5-ultra/split/) |
 
 Each directory has `BASE.txt` (exact commits), `COMMITS.txt` (commit list), the patch file(s), `src/` and the
 upstream `LICENSE`.
@@ -77,3 +78,15 @@ The same applies to `mlx-lm/` (check out `kernelpool/add-mimo-v2` at the commit 
 `mlx/` and `mlx-lm/` are modified MIT-licensed code (© Apple Inc.). `omlx/` is modified Apache-2.0 code from
 jundot/omlx. The files under `omlx/src/` were changed from the originals, and `deepseek-v41.patch` shows every change.
 Each directory keeps its upstream license.
+
+## DeepSeek-V4.1-Flash, Mac + RTX split
+
+Results: [tacos8me.github.io/m5-ultra/split](https://tacos8me.github.io/m5-ultra/split/) · design notes: [`../split/README.md`](../split/README.md).
+
+- `omlx/deepseek-v41-split.patch` (applies on top of `deepseek-v41.patch`, `ef88391e..f56f7ffa`, commit list in
+  `omlx/COMMITS-split.txt`): the Mac half. Original-precision layers 20-39 + head + DSpark, the pipeline decode loop,
+  prefix reuse, image input, verify-cost-aware draft depth, extra draft sources, and the `og_serve/` supervisor
+  (OpenAI-compatible server, failover that never swaps models, parity/soak/bench harnesses). `src/` holds the changed files.
+- `split-nv/`: the RTX half. `src/` is the engine (SGLang hooks, step API server, prefix cache, streamed state,
+  fused MoE decode kernel, deploy and gate tools); `sglang-split.patch` is the three-commit change to the SGLang
+  DeepSeek-V4.1 port it runs on (prompt-state capture hooks, deterministic top-k tie order). `BASE.txt`, `COMMITS.txt`.

@@ -54,9 +54,53 @@ class DeepseekV41Cache(ArraysCache):
         self.left_padding = None
         self.lengths = mx.array(lengths) if lengths is not None else None
 
+    def _registry(self):
+        buffers = getattr(self, "_ds41_buffers", None)
+        if buffers is None:
+            buffers = self._ds41_buffers = {}
+        return buffers
+
+    def _row_states(self):
+        """(arrays, growth registry) per row whose own storage backs this cache.
+
+        A batch-1 cache is its own row. merge()/extend() record the rows they
+        concatenate; the batched arrays stay lazy and extract() hands the row
+        arrays back, so batching requests copies no KV. Replacing any slot
+        invalidates the record (the batched arrays are then the truth).
+        """
+        if self.batch_size == 1:
+            return [(list(self.cache), self._registry())]
+        rows = getattr(self, "_rows", None)
+        if (
+            rows is not None
+            and len(rows[0]) == self.batch_size
+            and len(rows[1]) == len(self.cache)
+            and all(a is b for a, b in zip(self.cache, rows[1]))
+        ):
+            return rows[0]
+        return None
+
+    def adopt(self, other):
+        """Take another cache's arrays (and its row record) in place."""
+        self.cache = other.cache
+        self._rows = getattr(other, "_rows", None)
+
     def extract(self, idx, *, offset=None):
         result = type(self)(self.compress_ratio)
-        result.cache = [x[idx : idx + 1] if x is not None else None for x in self.cache]
+        rows = self._row_states() if self.batch_size > 1 else None
+        if self.batch_size == 1 and idx in (0, -1):
+            # The row is the whole cache: keep its arrays and share the growth
+            # registry, so the next append extends the same storage.
+            result.cache = list(self.cache)
+            result._ds41_buffers = self._registry()
+        elif rows is not None:
+            arrays, buffers = rows[idx]
+            result.cache = list(arrays)
+            result._ds41_buffers = buffers
+        else:
+            result.cache = [
+                x[idx : idx + 1] if x is not None else None for x in self.cache
+            ]
         contexts = getattr(self, "_dspark_prime_rows", None)
         if self.batch_size == 1:
             result._omlx_mtp_prime_ctx = getattr(self, "_omlx_mtp_prime_ctx", None)
@@ -94,10 +138,15 @@ class DeepseekV41Cache(ArraysCache):
         result = cls(caches[0].compress_ratio if caches else 0)
         for other in caches:
             if result.cache[0] is None and result.left_padding is None:
+                rows = other._row_states()
                 result.cache = list(other.cache)
                 result._dspark_prime_rows = other._prime_rows()
                 result._omlx_mtp_prime_ctx = getattr(other, "_omlx_mtp_prime_ctx", None)
                 result.left_padding = mx.zeros((other.batch_size,), mx.int32)
+                if other.batch_size == 1:
+                    result._ds41_buffers = other._registry()
+                elif rows is not None:
+                    result._rows = (rows, list(result.cache))
             else:
                 result.extend(other)
         return result
@@ -112,16 +161,27 @@ class DeepseekV41Cache(ArraysCache):
 
     def filter(self, batch_indices):
         contexts = self._prime_rows()
+        rows = self._row_states()
         super().filter(batch_indices)
         self._dspark_prime_rows = [contexts[i] for i in batch_indices]
         self._omlx_mtp_prime_ctx = (
             self._dspark_prime_rows[0] if len(batch_indices) == 1 else None
         )
+        self._rows = None
+        if rows is not None:
+            kept = [rows[int(i)] for i in batch_indices]
+            if len(kept) == 1:
+                # Back to one request: hold its own unpadded row storage.
+                self.cache = list(kept[0][0])
+                self._ds41_buffers = kept[0][1]
+            else:
+                self._rows = (kept, list(self.cache))
 
     def extend(self, other):
         if self.compress_ratio != other.compress_ratio:
             raise ValueError("Cannot batch different V4.1 compression ratios")
         contexts = self._prime_rows() + other._prime_rows()
+        mine, theirs = self._row_states(), other._row_states()
         a_batch, b_batch = self.batch_size, other.batch_size
         states = []
         for i, (a, b) in enumerate(zip(self.cache, other.cache)):
@@ -148,6 +208,11 @@ class DeepseekV41Cache(ArraysCache):
                 )
             states.append(mx.concatenate([a, b], 0))
         self.cache = states
+        self._rows = (
+            (mine + theirs, list(states))
+            if mine is not None and theirs is not None
+            else None
+        )
         self._dspark_prime_rows = contexts
         self._omlx_mtp_prime_ctx = None
         self.left_padding = mx.concatenate(

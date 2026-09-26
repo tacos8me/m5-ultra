@@ -6,14 +6,36 @@ never enter that ring. Server acceptance/rollback is a separate integration.
 """
 
 from dataclasses import replace
+import os
 
 import mlx.core as mx
 import mlx.nn as nn
 
 from ..mlx_lm_mtp.deepseek_v4_dspark import DSparkContextCache
 from .head import project_logits
+from . import decode_fusions
 from .language import Attention, Block, RMSNorm, hc_mixes, hc_post, hc_pre, rope
 from .quantization import quantize_activation
+
+
+DRAFT_ASYNC = os.environ.get("DS41_DRAFT_ASYNC", "1") == "1"
+# Opt-in: draft logits from an MXFP8 copy of the BF16 vocabulary head (half
+# the bytes). Drafts only steer speculation; verified tokens never change.
+DRAFT_HEAD = os.environ.get("DS41_DRAFT_HEAD", "bf16")
+
+
+def draft_logits(model, x):
+    if DRAFT_HEAD != "mxfp8" or x.ndim != 3 or not 1 <= x.shape[1] <= 8:
+        return project_logits(x, model.head)
+    cached = model.__dict__.get("_ds41_draft_head")
+    if cached is None or cached[0] is not model.head.weight:
+        w, scales = mx.quantize(model.head.weight, group_size=32, bits=8, mode="mxfp8")
+        mx.eval(w, scales)
+        cached = model.__dict__["_ds41_draft_head"] = (model.head.weight, w, scales)
+    _, w, scales = cached
+    return mx.quantized_matmul(
+        x, w, scales, transpose=True, group_size=32, bits=8, mode="mxfp8"
+    ).astype(mx.float32)
 
 
 class DSparkAttention(Attention):
@@ -30,8 +52,10 @@ class DSparkAttention(Attention):
         c = self._config
         batch, length, _ = x.shape
         positions = mx.arange(cache.offset, cache.offset + length)
+        # One activation quantization feeds wq_a and wkv (as in the target).
+        query, kv_input = self._input_projections(x)
         q = rope(
-            self.wq_b(self.q_norm(self.wq_a(x))).reshape(
+            self.wq_b(self.q_norm(query)).reshape(
                 batch, length, c.n_heads, c.head_dim
             ),
             positions,
@@ -39,7 +63,7 @@ class DSparkAttention(Attention):
             False,
         )
         draft_kv = quantize_activation(
-            rope(self.kv_norm(self.wkv(x)), positions, c, False)
+            rope(self.kv_norm(kv_input), positions, c, False)
         )
         kv = mx.concatenate([cache.keys[:, 0], draft_kv], axis=1)
         # V4.1 does not apply V4's per-head query RMS normalization.
@@ -60,7 +84,12 @@ class DSparkAttention(Attention):
         out = rope(out, positions, c, False, inverse=True)
         grouped = out.reshape(batch, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
-        return self.wo_b(mx.einsum("bsgd,grd->bsgr", grouped, weight).flatten(-2))
+        projected = (
+            decode_fusions.grouped_gemv(grouped, weight)
+            if decode_fusions.grouped_gemv_supported(grouped, weight)
+            else mx.einsum("bsgd,grd->bsgr", grouped, weight)
+        )
+        return self.wo_b(projected.flatten(-2))
 
 
 class MarkovHead(nn.Module):
@@ -205,9 +234,12 @@ def proposal_forward(model, input_ids, cache, draft_length=None):
     )
     h = mx.repeat(model.embed(ids)[..., None, :], c.hc_mult, -2)
     pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
-    for stage, item in zip(model.mtp, cache):
+    for index, (stage, item) in enumerate(zip(model.mtp, cache)):
         h, pre = stage(h, pre, item)
+        if DRAFT_ASYNC and index + 1 < len(model.mtp):
+            # Start the GPU on this stage while Python builds the next one.
+            mx.async_eval(h, pre)
     final = model.mtp[-1]
     h = hc_pre(h, pre)
-    logits = project_logits(final.norm(h), model.head)
+    logits = draft_logits(model, final.norm(h))
     return logits, h
