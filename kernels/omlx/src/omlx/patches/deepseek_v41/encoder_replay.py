@@ -26,9 +26,10 @@ from ..mlx_lm_mtp.deepseek_v4_dspark import capture_prompt
 
 FORMAT = "ds41-encoder-state-v1"
 CHUNK = 8192
-# Host syncs in the replay: 1 = wait for every layer (as before); N > 1 = submit each layer
-# asynchronously and wait every N layers (same kernels on the same inputs, fewer idle gaps).
-EVAL_EVERY = max(1, int(os.environ.get("DS41_OG_REPLAY_EVAL_EVERY", "1")))
+# Host syncs in the replay: 1 = wait for every layer; N > 1 = submit each layer asynchronously and
+# wait every N layers (same kernels on the same inputs, fewer idle gaps). Default 20 = one wait per
+# segment (layers 20-39); ds41-fe window C/D and ds41-ttft: identical outputs and state digests.
+EVAL_EVERY = max(1, int(os.environ.get("DS41_OG_REPLAY_EVAL_EVERY", "20")))
 
 
 def segments(prefilled, chunk=CHUNK, window=128):

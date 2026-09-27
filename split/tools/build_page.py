@@ -201,7 +201,7 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
   <h1>DeepSeek-V4.1-Flash on a Mac and two RTX PRO 6000s</h1>
   <p class="meta"><b>DeepSeek-V4.1-Flash</b> on its original FP4/FP8 weights, served as one model across a
   <b>Mac Studio M5 Ultra</b> (256&nbsp;GB) and <b>two RTX PRO 6000 Blackwell</b> GPUs over a 10GbE cable.
-  Measured through the production API, September 26, 2026.<br>
+  Measured through the production API, September 27, 2026.<br>
   <span class="links"><a href="https://github.com/tacos8me/m5-ultra/tree/main/kernels">Code on GitHub</a> · <a href="../">All M5 Ultra results</a></span></p>
 
   <div class="figs">
@@ -301,7 +301,7 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
     load. Prefill at 8K–128K is the mean of three fresh prompts, longer points single runs that repeat within 1%. Decode
     samples swing about ±15% with speculative acceptance.</p>
     <p>The 3-bit baseline is the previous production build (Mac only, LSQ 3-bit experts), measured earlier with a similar
-    harness; ratios are indicative, not a controlled A/B. Box engine {S["deployment"]["box_engine"]}, numerics {S["deployment"]["numerics"]}; Mac build 51233501.</p>
+    harness; ratios are indicative, not a controlled A/B. Box engine {S["deployment"]["box_engine"]}, numerics {S["deployment"]["numerics"]}; Mac build 3339e76d.</p>
     <p>Hardware: Mac Studio M5 Ultra, 80-core GPU, 256&nbsp;GB · 2× NVIDIA RTX PRO 6000 Blackwell, 96&nbsp;GB each ·
     direct 10GbE. Model: <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">deepseek-ai/DeepSeek-V4.1-Flash</a>, original weights.</p>
   </footer>

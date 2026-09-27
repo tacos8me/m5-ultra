@@ -110,8 +110,13 @@ if os.environ.get('DS41_FE_TRACE', '0') == '1':
             encoder_replay.EVAL_EVERY = max(1, int(body['replay_eval_every']))
         if 'profile' in body:
             fe_trace.PROFILE[0] = bool(body['profile'])
+        if 'early_first' in body:
+            og_model.OgLanguageModel._omlx_mtp_early_first = bool(body['early_first'])
+        if 'copy_prebuild' in body:
+            og_model.COPY_PREBUILD = bool(body['copy_prebuild'])
         return dict(encode_cache=fast_encode.ACTIVE[0], kickoff=og_model.KICKOFF, wake=og_model.WAKE,
-                    replay_eval_every=encoder_replay.EVAL_EVERY, profile=fe_trace.PROFILE[0])
+                    replay_eval_every=encoder_replay.EVAL_EVERY, profile=fe_trace.PROFILE[0],
+                    early_first=og_model.OgLanguageModel._omlx_mtp_early_first, copy_prebuild=og_model.COPY_PREBUILD)
 
 
 sys.path.insert(0, str(HERE))

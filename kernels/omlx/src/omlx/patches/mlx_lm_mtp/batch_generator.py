@@ -53,7 +53,11 @@ def _extend_preserving_mtp(original_extend, batch, donor, *args, **kwargs):
         single = getattr(source, "_omlx_mtp_state", None)
         if single is not None:
             states[single.uid] = single
+    early = dict(getattr(batch, "_omlx_mtp_early", None) or {})
+    early.update(getattr(donor, "_omlx_mtp_early", None) or {})
     result = original_extend(batch, donor, *args, **kwargs)
+    if early:
+        batch._omlx_mtp_early = early
     for source in (batch, donor):
         for attr in ("_omlx_mtp_state", "_omlx_mtp_batch_state"):
             if hasattr(source, attr):
@@ -181,6 +185,9 @@ def apply() -> bool:
                     # boundary so the late join merges this very call (#2515).
                     handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
                 if not handed_off:
+                    early = _early_first_emit(self)
+                    if early is not None:
+                        return early
                     try:
                         state = _prepare_mtp_state_for_next(self)
                         if state is not None:
@@ -201,6 +208,7 @@ def apply() -> bool:
                         _drop_mtp_state(self, "step-fallback")
             else:
                 _drop_mtp_state(self, "non-singleton-or-ineligible")
+            _refuse_standard_after_early(self)
             _log_multirow_mtp_inactive_once(self)
             _mark_standard_multirow_decode(self)
             tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
@@ -266,6 +274,10 @@ def apply() -> bool:
                 if index not in keep and tracker is not None:
                     tracker.finish(self._num_tokens[index], tool_filter=True)
             result = original_filter(self, keep, *args, **kwargs)
+            early = getattr(self, "_omlx_mtp_early", None)
+            if early:
+                for uid in set(early) - set(self.uids):
+                    del early[uid]
             _prompt_priming.release_uids(self.model, set(old_uids) - set(self.uids))
             _drop_invalid_mtp_state(self, "filter", log_empty=True)
             _drop_invalid_mtp_batch_state(
@@ -1218,19 +1230,24 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
             prompt_cache=gen_batch.prompt_cache if shared is not None else None,
         )
         _set_singleton_mrope_delta(row)
+        emitted = _early_emitted(gen_batch, uid)
+        extra = {"main_emitted": True} if emitted else {}
         if shared is None:
-            _post_init_mtp(row)
+            _post_init_mtp(row, **extra)
         else:
             logits, hidden, offsets = shared
             _post_init_mtp(
                 row,
                 verify_result=(logits[idx : idx + 1], hidden[idx : idx + 1], None),
                 priming_offset=offsets[idx],
+                **extra,
             )
         state = getattr(row, "_omlx_mtp_state", None)
         if not _mtp_state_valid_for_batch(row, state):
             _drop_mtp_batch_state(gen_batch, "batch-post-init-invalid")
             return None
+        if emitted:
+            gen_batch._omlx_mtp_early.pop(uid, None)
         states[uid] = state
         if shared is None:
             replacements[idx] = row.prompt_cache
@@ -1326,11 +1343,15 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
 
     park_state = _mtp_park_state_for_batch(gen_batch)
     _set_singleton_mrope_delta(gen_batch)
-    _post_init_mtp(gen_batch)
+    uid = gen_batch.uids[0]
+    emitted = _early_emitted(gen_batch, uid)
+    _post_init_mtp(gen_batch, **({"main_emitted": True} if emitted else {}))
     state = getattr(gen_batch, "_omlx_mtp_state", None)
     if not _mtp_state_valid_for_batch(gen_batch, state):
         _drop_mtp_state(gen_batch, "post-init-invalid")
         return None
+    if emitted:
+        gen_batch._omlx_mtp_early.pop(uid, None)
 
     # Eligibility already admitted this parked singleton. Mark the fresh
     # state unconditionally so a prefill arriving between the two checks
@@ -2718,7 +2739,67 @@ def _chain_next_drafts(
 # ---------------------------------------------------------------------------
 
 
-def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -> None:
+def _early_first_emit(gen_batch: Any) -> Optional[List[Any]]:
+    """Emit a fresh singleton's first token (main_tok) before its post-init.
+
+    Only for hosts that opt in (``_omlx_mtp_early_first``, ds41-og): the
+    post-init's second forward and first draft then run on the next call,
+    exactly as they would have, and the queue no longer carries main_tok
+    (``main_emitted``). The emitted token, its logprobs, the stop/length
+    checks and every later token are unchanged; the host may pre-send the
+    post-init forward (``mtp_first_presend``) so it overlaps the emission.
+    """
+    model = gen_batch.model
+    host = next(
+        (
+            h
+            for h in (model, getattr(model, "language_model", None), getattr(model, "_language_model", None))
+            if h is not None and getattr(h, "_omlx_mtp_early_first", False)
+        ),
+        None,
+    )
+    # Request-preserving hosts only: their joins keep each uid's MTP state (and this marker),
+    # so no standard step can replay main_tok.
+    if host is None or not _preserves_mtp_requests(model):
+        return None
+    if getattr(gen_batch, "_omlx_mtp_state", None) is not None:
+        return None
+    if gen_batch._next_tokens is None or len(gen_batch.uids) != 1:
+        return None
+    uid = gen_batch.uids[0]
+    early = getattr(gen_batch, "_omlx_mtp_early", None)
+    if early is None:
+        early = gen_batch._omlx_mtp_early = {}
+    if uid in early:
+        return None
+    main_id = int(_ensure_uint32(gen_batch._next_tokens).tolist()[0])
+    early[uid] = main_id
+    result = _emit_response(gen_batch, main_id, gen_batch._next_logprobs[0])
+    if result[0].finish_reason is None:
+        presend = getattr(host, "mtp_first_presend", None)
+        if presend is not None:
+            presend(gen_batch, main_id)
+    return result
+
+
+def _early_emitted(gen_batch: Any, uid: Any) -> bool:
+    """True while this uid's main_tok is emitted but its post-init has not run yet."""
+    early = getattr(gen_batch, "_omlx_mtp_early", None)
+    return bool(early) and uid in early
+
+
+def _refuse_standard_after_early(gen_batch: Any) -> None:
+    """The standard step would emit main_tok a second time: fail the step instead."""
+    early = getattr(gen_batch, "_omlx_mtp_early", None)
+    if early and any(uid in early for uid in getattr(gen_batch, "uids", ()) or ()):
+        raise RuntimeError(
+            "Lightning MTP post-init failed after the first token was emitted"
+        )
+
+
+def _post_init_mtp(
+    gen_batch: Any, *, verify_result=None, priming_offset=None, main_emitted=False
+) -> None:
     """Bridge from standard ``__init__``'s ``_step()`` into PR 990's cycle 1.
 
     State on entry (after standard ``__init__``):
@@ -2811,7 +2892,11 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
             state.mtp_cache = gen_batch.model.make_mtp_cache()
         state.next_main = _ensure_uint32(next_main_tok)
         main_id = int(main_tok.tolist()[0])
-        state.queue.append((main_id, main_lp, "init"))
+        if main_emitted:
+            # _early_first_emit already sent main_tok (and appended it to tokens[0]).
+            _bump_emit_stat(state, "init")
+        else:
+            state.queue.append((main_id, main_lp, "init"))
         state.queue.append(
             (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
         )
@@ -2822,9 +2907,10 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
             and procs is None
         ):
             # tokens[0] holds every prompt token in the cache; main_tok was
-            # forwarded above and is emitted from the queue.
-            state.copy_index = _copy_draft.CopyIndex(
-                list(gen_batch.tokens[0]) + [main_id]
+            # forwarded above and is emitted from the queue (or already was).
+            tokens = gen_batch.tokens[0]
+            state.copy_index = _copy_index(
+                gen_batch, tokens, len(tokens) - bool(main_emitted), main_id
             )
         _chain_next_drafts(
             gen_batch,
@@ -2873,12 +2959,26 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
     state.draft_lp = draft_lp_2d.squeeze(0)
     state.draft_accept_lp = draft_accept_lp_2d.squeeze(0)
     state.draft_id = int(draft_tok.tolist()[0])
-    state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+    if main_emitted:
+        _bump_emit_stat(state, "init")
+    else:
+        state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
     state.queue.append(
         (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
     )
 
     gen_batch._omlx_mtp_state = state
+
+
+def _copy_index(gen_batch: Any, tokens: List[int], n: int, main_id: int) -> Any:
+    """CopyIndex(tokens[:n] + [main_id]), from the host's prebuilt prompt index when it has one."""
+    hook = getattr(_dspark_host(gen_batch.model), "mtp_copy_prompt_index", None)
+    pre = hook(gen_batch.prompt_cache) if hook is not None else None
+    if pre is not None and pre.matches(tokens, n):
+        index = _copy_draft.CopyIndex.from_prompt(pre, [main_id])
+        if index is not None:
+            return index
+    return _copy_draft.CopyIndex(list(tokens[:n]) + [main_id])
 
 
 # ---------------------------------------------------------------------------

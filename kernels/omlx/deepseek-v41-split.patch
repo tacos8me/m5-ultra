@@ -5173,6 +5173,78 @@ index 00000000..7abdfbe6
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/benchmarks/og/ttft_ab.sh b/benchmarks/og/ttft_ab.sh
+new file mode 100755
+index 00000000..919455fe
+--- /dev/null
++++ b/benchmarks/og/ttft_ab.sh
+@@ -0,0 +1,43 @@
++#!/bin/zsh
++# One partial-load TTFT leg (ds41-ttft): this tree's supervisor on :12698 with a host_server.py partial worker
++# (~31 GB, no gpu.lock) as its og child, both traced (DS41_FE_TRACE/DIGEST), then fe_bench (TTFT/resume/identity,
++# one box session at a time) and optionally batch_identity (groups <= 2 box sessions). Production idle only.
++# usage: ttft_ab.sh <tree-name> <window> <phase> "<fe_bench args>" [env...]
++#   TTFT_GROUPS="1,2": also run batch_identity (alone vs 2 concurrent) after fe_bench.
++#   TTFT_GAP="131072 524288": also run ttft_gap.py (one-message doc + new question follow-ups) at those sizes.
++# Output: ~/llm/ds41/fe/<window>/{supervisor,og-child}.log + ~/llm/ds41/fe/<window>-<phase>.jsonl (fe_report.py layout).
++unsetopt BG_NICE
++tree=$1; window=$2; phase=$3; bench=$4; shift 4
++PY=~/llm/.venv-ds41-omlx-tiles/bin/python
++HERE=~/src/wt/ds41-ttft
++logs=~/llm/ds41/fe/$window
++pidf=~/llm/ds41/ttft/sup.pid
++mkdir -p $logs ~/llm/ds41/ttft
++if [[ -f $pidf ]] && ps -p $(cat $pidf) >/dev/null; then echo "supervisor $(cat $pidf) still running"; exit 1; fi
++python3 ~/src/wt/ds41-prof/benchmarks/og/prof_idle.py || { echo NOT_IDLE; exit 1; }
++cd ~/llm/ds41/ttft
++start=$(cat $logs/og-child.log 2>/dev/null | wc -l)
++env "$@" DS41_TREE=$HOME/src/wt/$tree DS41_FE_TRACE=1 DS41_FE_DIGEST=1 HS_DRAFTS=1 DS41_OG_GPU_EXEC= \
++  DS41_OG_WORKER_PORT=12697 DS41_OG_LOGS=$logs DS41_OG_HOME=$HOME/llm/ds41/ttft/og DS41_OG_CONCURRENCY=4 \
++  DS41_OG_CHILD_OG="$PY -u $HERE/benchmarks/og/host_server.py --host 127.0.0.1 --port {port}" \
++  nohup $PY -u $HOME/src/wt/$tree/og_serve/ds41_og.py --host 127.0.0.1 --port 12698 >> $logs/supervisor.log 2>&1 &
++echo $! > $pidf
++echo "$(date -u +%FT%TZ) leg $window-$phase tree=$tree env=$* sup=$(cat $pidf)"
++for i in $(seq 1 150); do sleep 2; [[ $(curl -s -m 2 -o /dev/null -w '%{http_code}' localhost:12698/health) == 200 ]] && break; done
++curl -s -m 2 localhost:12697/og/stats >/dev/null || { echo WORKER_NOT_READY; kill $(cat $pidf); exit 1; }
++if [[ -n $bench ]]; then
++  FE_DOC_TREE=$HOME/src/wt/ds41-og $PY -u $HERE/og_serve/fe_bench.py --base http://127.0.0.1:12698 --model ds41-og \
++    --label $window-$phase ${=bench} 2>&1 | tail -1
++fi
++for n in ${=TTFT_GAP}; do  # bench-leg2-shaped follow-ups (doc + a new question in one message)
++  FE_DOC_TREE=$HOME/src/wt/ds41-og $PY -u $HERE/benchmarks/og/ttft_gap.py http://127.0.0.1:12698 $window-$phase $n 2>&1 | grep rep
++done
++if [[ -n $TTFT_GROUPS ]]; then
++  DS41_TREE=$HERE $PY -u $HERE/benchmarks/og/batch_identity.py http://127.0.0.1:12697 $window-$phase $TTFT_GROUPS ${TTFT_TOKENS:-128} 2>&1 | grep '"label"'
++fi
++curl -s -m 3 localhost:12697/og/stats; echo
++tail -n +$((start + 1)) $logs/og-child.log | grep '"event": "drafts"' > $logs/drafts-$phase.jsonl
++pid=$(cat $pidf); kill $pid
++for i in $(seq 1 90); do ps -p $pid >/dev/null || break; sleep 1; done
++ps -p $pid >/dev/null && echo "supervisor $pid still alive" || echo "supervisor $pid stopped"
++lsof -t -iTCP:12697 -sTCP:LISTEN && echo "WORKER STILL LISTENING" || echo "worker stopped"
+diff --git a/benchmarks/og/ttft_gap.py b/benchmarks/og/ttft_gap.py
+new file mode 100644
+index 00000000..9aa5a383
+--- /dev/null
++++ b/benchmarks/og/ttft_gap.py
+@@ -0,0 +1,17 @@
++"""Bench-leg2-shaped follow-ups: one user message = the same doc + a different question (the doc piece is new text
++each time for the piece cache). Writes fe_bench-format records (kind 'ttft') for fe_report.py."""
++import json, os, sys, time
++from pathlib import Path
++sys.path.insert(0, str(Path(__file__).resolve().parents[2]/"og_serve"))
++import fe_bench
++base, label, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
++from transformers import AutoTokenizer
++tok = AutoTokenizer.from_pretrained(str(Path.home()/'models/DeepSeek-V4.1-Flash-pipe1-mlx'))
++doc = fe_bench.document(tok, n, '[gap doc]\n')
++out = (fe_bench.LOGS/f'{label}.jsonl').open('a')
++for i, q in enumerate(fe_bench.QUESTIONS):
++    r = fe_bench.stream(base, '/v1/chat/completions', dict(model='ds41-og', messages=[{'role': 'user', 'content': doc + '\n\n' + q}],
++                                                        max_tokens=8, temperature=0))
++    rec = dict(t=time.time(), label=label, kind='ttft', n=n, rep=i, ttft_s=r['ttft_s'], t0=r['t0'], usage=r['usage'])
++    out.write(json.dumps(rec) + '\n'); out.flush()
++    print(json.dumps(dict(rep=i, ttft_s=round(r['ttft_s'], 3), srv=(r['usage'] or {}).get('time_to_first_token'))), flush=True)
 diff --git a/benchmarks/og/twin_fresh.py b/benchmarks/og/twin_fresh.py
 new file mode 100644
 index 00000000..47d92fa8
@@ -9209,6 +9281,118 @@ index 00000000..fa3ae885
 +- The kernel is bandwidth-bound per distinct expert. What remains is per-pair work that the union forms cannot overlap better.
 +
 +Raw data: `~/llm/ds41/moe/dev*.jsonl`. The union and NAX sources are in the session scratchpad and can be provided on request. They are not committed (YAGNI).
+diff --git a/og_serve/TTFT-MERGE-READY.md b/og_serve/TTFT-MERGE-READY.md
+new file mode 100644
+index 00000000..3b780646
+--- /dev/null
++++ b/og_serve/TTFT-MERGE-READY.md
+@@ -0,0 +1,106 @@
++# ds41-ttft: time to first token quick wins (ENHANCEMENTS #2) — MERGE-READY
++
++Branch `ds41-ttft` on `51233501` (the served ds41-draft tree). Worktree `~/src/wt/ds41-ttft`, with the 16
++gitignored compiled kernels copied from ds41-draft (`cp -p`, `cmp` clean). Not deployed.
++Box during all runs: `4dd01ac` (og-s4.4).
++
++## Changes
++
++1. **First token before the MTP post-init** (`omlx/patches/mlx_lm_mtp/batch_generator.py`, `og_model.py`).
++   Before, the first sampled token (main_tok) went out only after `_post_init_mtp`: a second 1-row forward
++   (box STEP + wire + Mac k=1), the first DSpark draft and the CopyIndex build. Now a fresh singleton on a
++   host that opts in (`_omlx_mtp_early_first`, ds41-og only, request-preserving hosts only) emits main_tok at
++   once through the normal `_emit_response` (same token, logprobs, length/stop checks). The og host pre-sends
++   the post-init forward's STEP right away (`mtp_first_presend`; `ensure_step` finds it in flight). The next
++   call runs the unchanged post-init with `main_emitted`: the queue holds only next_main, the draft budget
++   (`max_tokens - num_tokens - len(queue) - 1`) and the copy index come out the same. Early markers travel with
++   `extend` and are dropped by `filter`. If a post-init ever failed after an early emission, the standard step
++   raises instead of emitting main_tok twice. A join between the early emission and the post-init (c2 start)
++   goes through the batch post-init, which honours the marker.
++2. **Copy-draft index built while the box prefills** (`copy_draft.PromptIndex`, `CopyIndex.from_prompt`,
++   `og_model.CopyPrompt`). A side thread started with the box OPEN hashes and sorts the prompt n-grams; the
++   post-init inserts the one new n-gram (the stable argsort puts it after equal keys), which gives exactly the
++   `CopyIndex(prompt + [main])` arrays. Critical path at 1M: 96 ms -> 2 ms (512K 44 -> 1 ms, 128K 9 -> 0.3 ms).
++   Checked against the request's tokens (length, first/last 256); any mismatch builds it locally as before.
++3. **Replay host syncs**: `DS41_OG_REPLAY_EVAL_EVERY` default 1 -> 20 (one wait per replay segment instead of
++   one per layer; same kernels on the same inputs).
++
++Flags (default on): `DS41_OG_EARLY_FIRST=1`, `DS41_OG_COPY_PREBUILD=1`, `DS41_OG_REPLAY_EVAL_EVERY=20`.
++In trace mode `/og/fe` also switches `early_first`, `copy_prebuild` at runtime (fe_window phases).
++
++## Measured per stage (ms, medians; fe_report.py joins client, supervisor and worker stamps)
++
++**Full model, window `ttft-w1`** (one worker, phase A = all three off = the served behaviour, B = on;
++`--ttft 8192:3 --resume 8192:3,131072:3,524288:2 --identity`):
++
++| stage | 8K fresh A | B | resume 8K A | B | resume 128K A | B | resume 512K A | B |
++|---|---|---|---|---|---|---|---|---|
++| box ack + prefill/state (box, noise ±30) | 490 | 518 | 93 | 138 | 171 | 187 | 369 | 374 |
++| replay seg0 | 236 | 218 | 224 | 212 | 235 | 220 | 256 | 247 |
++| replay seg1 | 85 | 79 | 185 | 178 | 198 | 188 | 216 | 206 |
++| first step -> first output | **51** | **26** | **50** | **26** | **61** | **26** | **100** | **26** |
++| TTFT (client) | 908 | 895 | 581 | 584 | 722 | 675 | 1070 | 1010 |
++| TTFT minus box stages | 418 | 377 | 488 | 446 | 551 | 488 | 701 | 636 |
++
++Short prompts (8 identity cases < 2K tokens): TTFT 215 -> 181. conv60k: 373 -> 329.
++The Mac-side saving is -41 ms (8K), -42 (resume 8K), -63 (128K), -65 (512K); client medians move less
++where the box stages happened to be slower in B (B ran after A; same box, same code on the box).
++1M (not run: window time / partial memory): first step -> output grows ~+0.1 s per 1M before (CopyIndex), flat
++26 ms after, so about -0.15 s there.
++
++**Partial load (31-33 GB, production idle, one box session at a time), legs ttft-p1 A (51233501) vs B:**
++first step -> output 51/51/63/100 -> 26/26/26/27 ms (8K fresh / resume 8K / 128K / 512K); replay segments
++-10..-45 ms; TTFT 956/653/789/1033 -> 837/539/651/990 ms.
++
++## Identity
++
++- Full model, window ttft-w1: `fe_cmp.py prod-id2 ttft-w1-A ttft-w1-B` -> **12/12 identical** (all API shapes,
++  image, 60K tools conversation, 8K doc + turn 2); prompt-id and imported-state digests equal A/B for all 12
++  cases (EVAL_EVERY 20 bitwise), 40 prompts each with one state digest.
++- Partial load, base tree vs new tree: identity suite 12/12 identical, imported-state digests 12/12 equal;
++  DSpark draft fingerprints (sha over every draft block) equal for all 20 deterministic requests
++  (the copy index from the prebuilt path proposes the same blocks); `batch_identity.py` groups 1 and 2:
++  each prompt alone == 2 concurrent (4/4) in both trees, and texts equal across trees.
++- c3/c4 (fused pairs) not run here (<= 2 box sessions rule); fused verify itself is untouched (rows with a
++  queued token skip verify exactly as before), but it is part of the coordinator's final check.
++- Tests: `tests/test_deepseek_v41_og_ttft.py` (12: PromptIndex == constructor state and behaviour on 24
++  random prompts incl. 2-token vocab and NGRAM-edge lengths; tiny qwen3_5 MTP model through a real
++  GenerationBatch: same token stream, first token one forward earlier, max_tokens 1/2/3, stop on the first and
++  second token; extend carries markers; standard step refused after an early emission). Related suites
++  (mlx_lm_mtp_patch, mtp_prompt_priming, og_cache, og_fused, og_wake, dspark, thinking_budget, og_images):
++  same failure set as 51233501 (49 pre-existing, 439 pass). og_serve `test_import_fallback` 8/8,
++  `test_wire_failover` all pass.
++
++## The ~1 s/1M client-vs-server TTFT gap (item 4): found, not changed
++
++Reproduced with bench-leg2-shaped requests (one user message = the same doc + a different question;
++`benchmarks/og/ttft_gap.py`): 512K client 1.75-1.90 s vs server `time_to_first_token` 1.32-1.46 s.
++Stage trace: **`count tokens` 404 ms at 512K (92 ms at 128K), ~0.77 µs/token**. The FE piece cache cuts at
++template tokens, so a changed message is one new piece and `count_chat_tokens` re-encodes it single-threaded
++before the handler starts the server clock. HTTP is not it: a private llama-swap -> supervisor -> fake worker
++chain adds 10 ms at a 4.3 MB body (direct 1.8 ms). Multi-message conversations (turn N+1 = old pieces + new
++ones) do not pay it (fe_bench resume: pre-admission 37 ms at 512K).
++Fix (not quick, identity-sensitive): split large pieces at provable pre-tokenizer boundaries (newline followed
++by non-whitespace, no added token spanning or lstrip-eating the cut) and encode the parts in parallel
++(encode_batch), with the FE delimiter-safety checks extended to those cuts; est. 1M -0.6..-0.7 s.
++Same requests also show the box re-prefilling up to one snapshot chunk (box prefill+state 639 ms at 512K vs
++96 ms for an appended turn): box-side, for the box agent.
++
++## Deploy (coordinator)
++
++1. `~/llm/llama-swap.yaml`, model `ds41`, env `DS41_TREE=/Users/ian/src/wt/ds41-ttft` (keep
++   `DS41_OG_CACHE_GIB=16`); reload ds41. Kernels are already in the tree.
++2. Gates: `cd ~/src/wt/ds41-ttft && ~/llm/.venv-ds41-omlx-tiles/bin/python og_serve/fe_bench.py --base
++   http://127.0.0.1:8080 --model ds41 --label post-ttft --identity && og_serve/fe_cmp.py prod-id2 post-ttft`
++   -> 12/12; c2/c4 fixed-prompt identity as for ds41-draft. `/og/stats`: `first_presend` ~ requests,
++   `copy_prebuilt` ~ greedy requests >= 64 tokens, `presend_errors` 0.
++3. Rollback: `DS41_TREE=/Users/ian/src/wt/ds41-draft`. Per feature: `DS41_OG_EARLY_FIRST=0`,
++   `DS41_OG_COPY_PREBUILD=0`, `DS41_OG_REPLAY_EVAL_EVERY=1`.
++
++## Runs and windows
++
++- Partial loads (`benchmarks/og/ttft_ab.sh`: this tree's supervisor on :12698 with a `host_server.py` partial
++  worker on :12697, no gpu.lock, 33 GB RSS): ttft-p1 A/B 23:43-23:47 UTC, ttft-p2 (gap) 23:48, switch smoke
++  test. Logs `~/llm/ds41/fe/ttft-p{1,2}/`, `~/llm/ds41/fe/ttft-p*-*.jsonl`.
++- One Mac window `ttft-w1`, 23:53:11-23:54:49 UTC (announced in PROGRESS.md, ds41 unloaded via llama-swap, restored by a chat
++  request and verified). Logs `~/llm/ds41/fe/ttft-w1/`, `~/llm/ds41/ttft/window-w1.log`.
 diff --git a/og_serve/api_bench.py b/og_serve/api_bench.py
 new file mode 100644
 index 00000000..c850f97c
@@ -11502,10 +11686,10 @@ index 00000000..49aa5184
 +    main()
 diff --git a/og_serve/fe_window.py b/og_serve/fe_window.py
 new file mode 100644
-index 00000000..8eb6b003
+index 00000000..23caa3fe
 --- /dev/null
 +++ b/og_serve/fe_window.py
-@@ -0,0 +1,256 @@
+@@ -0,0 +1,258 @@
 +"""One guarded Mac maintenance window for front-end A/B runs of this tree (<= 15 min).
 +
 +Checks that no other window is open (PROGRESS.md), that ds41 is the only llama-swap model and is
@@ -11538,6 +11722,7 @@ index 00000000..8eb6b003
 +LOCK = HOME/'llm/locks/gpu.lock'
 +SWAP = 'http://127.0.0.1:8080'
 +SUP_PORT, WORKER_PORT = 12648, 12647
++WHO = os.environ.get('FE_WHO', 'Opus ds41-fe')  # who announces the window in PROGRESS.md
 +
 +
 +def get(url, timeout=5):
@@ -11665,7 +11850,7 @@ index 00000000..8eb6b003
 +    if args.dry_run:
 +        print('preflight ok: production pids', prod_pids, 'lock holders', lock_holders(), 'last window line:', line)
 +        return
-+    announce(f'MAC WINDOW OPEN (Opus ds41-fe): front-end A/B `{args.label}` of ~/src/wt/ds41-fe on :{SUP_PORT}; '
++    announce(f'MAC WINDOW OPEN ({WHO}): front-end A/B `{args.label}` of ~/src/wt/{HERE.parent.name} on :{SUP_PORT}; '
 +             f'ds41 unloaded via llama-swap, restored by a chat request at the end; <= {args.minutes:.0f} min.')
 +    sup = None
 +    summary = {}
@@ -11708,7 +11893,8 @@ index 00000000..8eb6b003
 +            name, _, flags = spec.partition(':')
 +            switches = {k: (int(v) if k == 'replay_eval_every' else bool(int(v)))
 +                        for k, _, v in (f.partition('=') for f in flags.split(',') if f)}
-+            defaults = dict(encode_cache=True, kickoff=True, wake=True, replay_eval_every=1, profile=False)
++            defaults = dict(encode_cache=True, kickoff=True, wake=True, replay_eval_every=20, profile=False,
++                            early_first=True, copy_prebuild=True)
 +            state = post(f'http://127.0.0.1:{WORKER_PORT}/og/fe', dict(defaults, **switches))
 +            left = args.minutes * 60 - (time.monotonic() - t_start) - 120
 +            if left < 60:
@@ -11756,7 +11942,7 @@ index 00000000..8eb6b003
 +        except Exception as exc:  # noqa: BLE001
 +            print('restore failed:', repr(exc), flush=True)
 +        (logs/'summary.json').write_text(json.dumps(summary, indent=1))
-+        announce(f'MAC WINDOW CLOSED (Opus ds41-fe): `{args.label}` done in {(time.monotonic() - t_start) / 60:.1f} min; '
++        announce(f'MAC WINDOW CLOSED ({WHO}): `{args.label}` done in {(time.monotonic() - t_start) / 60:.1f} min; '
 +                 f'ds41 {"restored and answering" if restored else "RESTORE NOT VERIFIED - check"}.')
 +
 +
@@ -12193,10 +12379,10 @@ index 00000000..3981468a
 +    logger.info('ds41 resume hook installed')
 diff --git a/og_serve/og_server.py b/og_serve/og_server.py
 new file mode 100644
-index 00000000..1a89a360
+index 00000000..d1086290
 --- /dev/null
 +++ b/og_serve/og_server.py
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,177 @@
 +"""ds41-og worker: omlx OpenAI server over the original-weight split pipeline.
 +
 +Run under ~/llm/bin/gpu-exec (this PID holds gpu.lock and owns ~150 GiB). The
@@ -12309,8 +12495,13 @@ index 00000000..1a89a360
 +            encoder_replay.EVAL_EVERY = max(1, int(body['replay_eval_every']))
 +        if 'profile' in body:
 +            fe_trace.PROFILE[0] = bool(body['profile'])
++        if 'early_first' in body:
++            og_model.OgLanguageModel._omlx_mtp_early_first = bool(body['early_first'])
++        if 'copy_prebuild' in body:
++            og_model.COPY_PREBUILD = bool(body['copy_prebuild'])
 +        return dict(encode_cache=fast_encode.ACTIVE[0], kickoff=og_model.KICKOFF, wake=og_model.WAKE,
-+                    replay_eval_every=encoder_replay.EVAL_EVERY, profile=fe_trace.PROFILE[0])
++                    replay_eval_every=encoder_replay.EVAL_EVERY, profile=fe_trace.PROFILE[0],
++                    early_first=og_model.OgLanguageModel._omlx_mtp_early_first, copy_prebuild=og_model.COPY_PREBUILD)
 +
 +
 +sys.path.insert(0, str(HERE))
@@ -15968,10 +16159,10 @@ index 4929a515..2454be64 100644
 +    return [logits[:, b:e] for b, e in bounds]
 diff --git a/omlx/patches/deepseek_v41/encoder_replay.py b/omlx/patches/deepseek_v41/encoder_replay.py
 new file mode 100644
-index 00000000..9b2812b7
+index 00000000..53e00b2d
 --- /dev/null
 +++ b/omlx/patches/deepseek_v41/encoder_replay.py
-@@ -0,0 +1,186 @@
+@@ -0,0 +1,187 @@
 +# SPDX-License-Identifier: MIT
 +"""Turn a ``ds41-encoder-state-v1`` state (encoder layers 0-20 + the residual
 +stream entering layer 20 for the last rows) into the full post-prefill state
@@ -16000,9 +16191,10 @@ index 00000000..9b2812b7
 +
 +FORMAT = "ds41-encoder-state-v1"
 +CHUNK = 8192
-+# Host syncs in the replay: 1 = wait for every layer (as before); N > 1 = submit each layer
-+# asynchronously and wait every N layers (same kernels on the same inputs, fewer idle gaps).
-+EVAL_EVERY = max(1, int(os.environ.get("DS41_OG_REPLAY_EVAL_EVERY", "1")))
++# Host syncs in the replay: 1 = wait for every layer; N > 1 = submit each layer asynchronously and
++# wait every N layers (same kernels on the same inputs, fewer idle gaps). Default 20 = one wait per
++# segment (layers 20-39); ds41-fe window C/D and ds41-ttft: identical outputs and state digests.
++EVAL_EVERY = max(1, int(os.environ.get("DS41_OG_REPLAY_EVAL_EVERY", "20")))
 +
 +
 +def segments(prefilled, chunk=CHUNK, window=128):
@@ -19739,10 +19931,10 @@ index 00000000..009eeb7f
 +REGISTRY = Registry()
 diff --git a/omlx/patches/deepseek_v41/og_model.py b/omlx/patches/deepseek_v41/og_model.py
 new file mode 100644
-index 00000000..704901c0
+index 00000000..7354802b
 --- /dev/null
 +++ b/omlx/patches/deepseek_v41/og_model.py
-@@ -0,0 +1,769 @@
+@@ -0,0 +1,826 @@
 +# SPDX-License-Identifier: MIT
 +"""ds41-og: the original-weight split pipeline behind omlx's unchanged scheduler.
 +
@@ -19818,6 +20010,10 @@ index 00000000..704901c0
 +# at least FUSE_MIN requests verify in a scheduler step. With 2 the lone pair waits for both box steps
 +# (per-request verify hides them), so pairs start at 3.
 +FUSE_MIN = int(os.environ.get('DS41_OG_FUSE_MIN', '3'))
++# TTFT: emit the first token before the MTP post-init (its second forward is pre-sent to the box
++# so it overlaps the emission), and build the copy-draft prompt index while the box prefills.
++EARLY_FIRST = os.environ.get('DS41_OG_EARLY_FIRST', '1') == '1'
++COPY_PREBUILD = os.environ.get('DS41_OG_COPY_PREBUILD', '1') == '1'
 +_lock = threading.Lock()
 +_ids = itertools.count(1)
 +
@@ -19909,6 +20105,31 @@ index 00000000..704901c0
 +
 +class OgLanguageModel(DecoderHalf):
 +    """Layers 20-39 + head + DSpark; layers 0-19 are remote placeholders."""
++
++    _omlx_mtp_early_first = EARLY_FIRST
++
++    def mtp_first_presend(self, gen_batch, token_id):
++        """The first token went out before the post-init: send its forward's STEP now (ensure_step finds it)."""
++        try:
++            cache = gen_batch.prompt_cache
++            encoder = session_of(cache)
++            if encoder._pending is None:
++                encoder.send_step([int(token_id)], cache[0].size())
++                STATS['first_presend'] = STATS.get('first_presend', 0) + 1
++        except Exception:  # noqa: BLE001 -- the post-init forward sends it itself
++            STATS['presend_errors'] += 1
++            logger.debug('ds41-og first presend skipped', exc_info=True)
++
++    def mtp_copy_prompt_index(self, cache):
++        """The request's prompt index built during its box OPEN (copy_draft.PromptIndex), once, or None."""
++        try:
++            prebuilt = session_of(cache).__dict__.pop('_og_copy_prompt', None)
++        except RuntimeError:
++            return None
++        index = prebuilt.get() if prebuilt is not None else None
++        STATS['copy_prebuilt' if index is not None else 'copy_local'] = STATS.get(
++            'copy_prebuilt' if index is not None else 'copy_local', 0) + 1
++        return index
 +
 +    def set_tokenizer(self, tokenizer):
 +        # Engram hashing runs on the box.
@@ -20163,6 +20384,26 @@ index 00000000..704901c0
 +    return model
 +
 +
++class CopyPrompt(threading.Thread):
++    """copy_draft.PromptIndex of a prompt, built beside the box OPEN (numpy drops the GIL for the heavy parts)."""
++
++    def __init__(self, request_id, tokens):
++        super().__init__(name=f'ds41-og-copy-{request_id}', daemon=True)
++        self.tokens, self.index = tokens, None
++
++    def run(self):
++        from ..mlx_lm_mtp import copy_draft
++        try:
++            self.index = copy_draft.PromptIndex(self.tokens)
++        except Exception:  # noqa: BLE001 -- the post-init builds the index itself
++            logger.debug('ds41-og copy prompt index failed', exc_info=True)
++        self.tokens = None
++
++    def get(self):
++        self.join()
++        return self.index
++
++
 +class Job(threading.Thread):
 +    """Box OPEN (prefill + state transfer) off the engine thread.
 +
@@ -20179,6 +20420,7 @@ index 00000000..704901c0
 +        # Prefix keys for the Mac row store: token ids, image-content keys inside image spans (og_images).
 +        self.keys = og_images.prompt_keys(self.tokens[:-1], self.images)
 +        self.encoder = self.result = self.error = self.base_rows = None
++        self.copy_prompt = None
 +        self.done = threading.Event()
 +        self.cancelled = False
 +
@@ -20222,6 +20464,11 @@ index 00000000..704901c0
 +    def run(self):
 +        since, failures = time.monotonic(), 0
 +        self.trace = dict(job_start=time.time())
++        if COPY_PREBUILD and len(self.tokens) >= 64:
++            from ..mlx_lm_mtp import copy_draft
++            if copy_draft.ENABLED:
++                self.copy_prompt = CopyPrompt(self.request_id, self.tokens)
++                self.copy_prompt.start()
 +        try:
 +            while True:
 +                try:
@@ -20333,6 +20580,8 @@ index 00000000..704901c0
 +                og_failover.import_failed(request, exc)
 +                return False
 +            STATS['import_fallbacks'] += 1
++        if job.copy_prompt is not None:
++            encoder._og_copy_prompt = job.copy_prompt
 +        sid = register(encoder)
 +        cache[SID_LAYER][6] = mx.array([[sid]], mx.int64)
 +        mx.eval(cache[SID_LAYER][6])
@@ -22091,7 +22340,7 @@ index f3be6adb..09d8d68a 100644
              self._embeds.append(embed)
  
 diff --git a/omlx/patches/mlx_lm_mtp/batch_generator.py b/omlx/patches/mlx_lm_mtp/batch_generator.py
-index 75f265ca..0350a4a2 100644
+index 75f265ca..6ea8a32c 100644
 --- a/omlx/patches/mlx_lm_mtp/batch_generator.py
 +++ b/omlx/patches/mlx_lm_mtp/batch_generator.py
 @@ -24,6 +24,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -22102,7 +22351,37 @@ index 75f265ca..0350a4a2 100644
  from . import prompt_priming as _prompt_priming
  
  logger = logging.getLogger(__name__)
-@@ -255,6 +256,15 @@ def apply() -> bool:
+@@ -52,7 +53,11 @@ def _extend_preserving_mtp(original_extend, batch, donor, *args, **kwargs):
+         single = getattr(source, "_omlx_mtp_state", None)
+         if single is not None:
+             states[single.uid] = single
++    early = dict(getattr(batch, "_omlx_mtp_early", None) or {})
++    early.update(getattr(donor, "_omlx_mtp_early", None) or {})
+     result = original_extend(batch, donor, *args, **kwargs)
++    if early:
++        batch._omlx_mtp_early = early
+     for source in (batch, donor):
+         for attr in ("_omlx_mtp_state", "_omlx_mtp_batch_state"):
+             if hasattr(source, attr):
+@@ -180,6 +185,9 @@ def apply() -> bool:
+                     # boundary so the late join merges this very call (#2515).
+                     handed_off = _handoff_mtp_for_late_join(self, self._omlx_mtp_state)
+                 if not handed_off:
++                    early = _early_first_emit(self)
++                    if early is not None:
++                        return early
+                     try:
+                         state = _prepare_mtp_state_for_next(self)
+                         if state is not None:
+@@ -200,6 +208,7 @@ def apply() -> bool:
+                         _drop_mtp_state(self, "step-fallback")
+             else:
+                 _drop_mtp_state(self, "non-singleton-or-ineligible")
++            _refuse_standard_after_early(self)
+             _log_multirow_mtp_inactive_once(self)
+             _mark_standard_multirow_decode(self)
+             tax_probe = getattr(self, "_omlx_mtp_tax_probe", None)
+@@ -255,7 +264,20 @@ def apply() -> bool:
  
          def patched_filter(self, keep, *args, **kwargs):
              old_uids = list(getattr(self, "uids", []) or [])
@@ -22116,9 +22395,14 @@ index 75f265ca..0350a4a2 100644
 +                if index not in keep and tracker is not None:
 +                    tracker.finish(self._num_tokens[index], tool_filter=True)
              result = original_filter(self, keep, *args, **kwargs)
++            early = getattr(self, "_omlx_mtp_early", None)
++            if early:
++                for uid in set(early) - set(self.uids):
++                    del early[uid]
              _prompt_priming.release_uids(self.model, set(old_uids) - set(self.uids))
              _drop_invalid_mtp_state(self, "filter", log_empty=True)
-@@ -683,6 +693,10 @@ class _MtpStats:
+             _drop_invalid_mtp_batch_state(
+@@ -683,6 +705,10 @@ class _MtpStats:
      mtp_head_ms: float = 0.0  # cumulative time inside MTP-head forwards
      sample_ms: float = 0.0  # cumulative time in sampling + acceptance check
      cache_ops_ms: float = 0.0  # cumulative time in trim / rollback restore
@@ -22129,7 +22413,7 @@ index 75f265ca..0350a4a2 100644
  
  
  @dataclass
-@@ -753,6 +767,9 @@ class _MtpState:
+@@ -753,6 +779,9 @@ class _MtpState:
      # Adaptive depth controller (None = fixed depth). Chooses how many
      # drafts the next chain builds from rolling accept/latency estimates.
      controller: Optional[Any] = None
@@ -22139,7 +22423,50 @@ index 75f265ca..0350a4a2 100644
  
      # True while this state is a bounded re-entry probe after a performance
      # handoff. Correctness fallbacks and late-join handoffs do not set it.
-@@ -2337,18 +2354,16 @@ def _dspark_host(model: Any) -> Optional[Any]:
+@@ -1201,19 +1230,24 @@ def _prepare_mtp_batch_state_for_next(gen_batch: Any) -> Optional[_MtpBatchState
+             prompt_cache=gen_batch.prompt_cache if shared is not None else None,
+         )
+         _set_singleton_mrope_delta(row)
++        emitted = _early_emitted(gen_batch, uid)
++        extra = {"main_emitted": True} if emitted else {}
+         if shared is None:
+-            _post_init_mtp(row)
++            _post_init_mtp(row, **extra)
+         else:
+             logits, hidden, offsets = shared
+             _post_init_mtp(
+                 row,
+                 verify_result=(logits[idx : idx + 1], hidden[idx : idx + 1], None),
+                 priming_offset=offsets[idx],
++                **extra,
+             )
+         state = getattr(row, "_omlx_mtp_state", None)
+         if not _mtp_state_valid_for_batch(row, state):
+             _drop_mtp_batch_state(gen_batch, "batch-post-init-invalid")
+             return None
++        if emitted:
++            gen_batch._omlx_mtp_early.pop(uid, None)
+         states[uid] = state
+         if shared is None:
+             replacements[idx] = row.prompt_cache
+@@ -1309,11 +1343,15 @@ def _prepare_mtp_state_for_next(gen_batch: Any) -> Optional[_MtpState]:
+ 
+     park_state = _mtp_park_state_for_batch(gen_batch)
+     _set_singleton_mrope_delta(gen_batch)
+-    _post_init_mtp(gen_batch)
++    uid = gen_batch.uids[0]
++    emitted = _early_emitted(gen_batch, uid)
++    _post_init_mtp(gen_batch, **({"main_emitted": True} if emitted else {}))
+     state = getattr(gen_batch, "_omlx_mtp_state", None)
+     if not _mtp_state_valid_for_batch(gen_batch, state):
+         _drop_mtp_state(gen_batch, "post-init-invalid")
+         return None
++    if emitted:
++        gen_batch._omlx_mtp_early.pop(uid, None)
+ 
+     # Eligibility already admitted this parked singleton. Mark the fresh
+     # state unconditionally so a prefill arriving between the two checks
+@@ -2337,18 +2375,16 @@ def _dspark_host(model: Any) -> Optional[Any]:
      return None
  
  
@@ -22163,7 +22490,7 @@ index 75f265ca..0350a4a2 100644
      """
      import mlx.core as mx
  
-@@ -2359,23 +2374,71 @@ def _dspark_next_drafts(
+@@ -2359,23 +2395,71 @@ def _dspark_next_drafts(
      depth = state.controller.cur if state.controller is not None else state.depth
      depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
      n = int(committed.shape[0])
@@ -22227,7 +22554,7 @@ index 75f265ca..0350a4a2 100644
 -    state.hist_offset += n
 +    width = state.controller.max_depth if cost_policy else depth
 +    return host, width, committed[-1:].reshape(1, 1), cost_policy
- 
++
 +
 +def _dspark_finish(
 +    gen_batch: Any,
@@ -22238,12 +22565,12 @@ index 75f265ca..0350a4a2 100644
 +) -> None:
 +    """Everything of _dspark_next_drafts after the DSpark decoder forward (Markov sampling)."""
 +    import mlx.core as mx
-+
+ 
 +    host, width, anchor, cost_policy = plan
      sampler = _resolve_sampler(gen_batch)
      procs = _proc_list(gen_batch)
      draft_toks: List[Any] = []
-@@ -2389,7 +2452,7 @@ def _dspark_next_drafts(
+@@ -2389,7 +2473,7 @@ def _dspark_next_drafts(
      # before the loop and rewind after.
      snap = _snap_snapshotable(procs)
  
@@ -22252,7 +22579,7 @@ index 75f265ca..0350a4a2 100644
          bias, _ = host.dspark_markov(previous)
          logits_2d = logits[:, idx, :] + bias
          if procs is not None and prev_buf is not None:
-@@ -2407,12 +2470,113 @@ def _dspark_next_drafts(
+@@ -2407,12 +2491,113 @@ def _dspark_next_drafts(
  
      _restore_snapshotable(procs, snap)
  
@@ -22367,13 +22694,86 @@ index 75f265ca..0350a4a2 100644
  def _chain_next_drafts(
      gen_batch: Any,
      state: _MtpState,
-@@ -2646,10 +2810,22 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
+@@ -2554,7 +2739,67 @@ def _chain_next_drafts(
+ # ---------------------------------------------------------------------------
+ 
+ 
+-def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -> None:
++def _early_first_emit(gen_batch: Any) -> Optional[List[Any]]:
++    """Emit a fresh singleton's first token (main_tok) before its post-init.
++
++    Only for hosts that opt in (``_omlx_mtp_early_first``, ds41-og): the
++    post-init's second forward and first draft then run on the next call,
++    exactly as they would have, and the queue no longer carries main_tok
++    (``main_emitted``). The emitted token, its logprobs, the stop/length
++    checks and every later token are unchanged; the host may pre-send the
++    post-init forward (``mtp_first_presend``) so it overlaps the emission.
++    """
++    model = gen_batch.model
++    host = next(
++        (
++            h
++            for h in (model, getattr(model, "language_model", None), getattr(model, "_language_model", None))
++            if h is not None and getattr(h, "_omlx_mtp_early_first", False)
++        ),
++        None,
++    )
++    # Request-preserving hosts only: their joins keep each uid's MTP state (and this marker),
++    # so no standard step can replay main_tok.
++    if host is None or not _preserves_mtp_requests(model):
++        return None
++    if getattr(gen_batch, "_omlx_mtp_state", None) is not None:
++        return None
++    if gen_batch._next_tokens is None or len(gen_batch.uids) != 1:
++        return None
++    uid = gen_batch.uids[0]
++    early = getattr(gen_batch, "_omlx_mtp_early", None)
++    if early is None:
++        early = gen_batch._omlx_mtp_early = {}
++    if uid in early:
++        return None
++    main_id = int(_ensure_uint32(gen_batch._next_tokens).tolist()[0])
++    early[uid] = main_id
++    result = _emit_response(gen_batch, main_id, gen_batch._next_logprobs[0])
++    if result[0].finish_reason is None:
++        presend = getattr(host, "mtp_first_presend", None)
++        if presend is not None:
++            presend(gen_batch, main_id)
++    return result
++
++
++def _early_emitted(gen_batch: Any, uid: Any) -> bool:
++    """True while this uid's main_tok is emitted but its post-init has not run yet."""
++    early = getattr(gen_batch, "_omlx_mtp_early", None)
++    return bool(early) and uid in early
++
++
++def _refuse_standard_after_early(gen_batch: Any) -> None:
++    """The standard step would emit main_tok a second time: fail the step instead."""
++    early = getattr(gen_batch, "_omlx_mtp_early", None)
++    if early and any(uid in early for uid in getattr(gen_batch, "uids", ()) or ()):
++        raise RuntimeError(
++            "Lightning MTP post-init failed after the first token was emitted"
++        )
++
++
++def _post_init_mtp(
++    gen_batch: Any, *, verify_result=None, priming_offset=None, main_emitted=False
++) -> None:
+     """Bridge from standard ``__init__``'s ``_step()`` into PR 990's cycle 1.
+ 
+     State on entry (after standard ``__init__``):
+@@ -2646,10 +2891,27 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
          else:
              state.mtp_cache = gen_batch.model.make_mtp_cache()
          state.next_main = _ensure_uint32(next_main_tok)
 -        state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
 +        main_id = int(main_tok.tolist()[0])
-+        state.queue.append((main_id, main_lp, "init"))
++        if main_emitted:
++            # _early_first_emit already sent main_tok (and appended it to tokens[0]).
++            _bump_emit_stat(state, "init")
++        else:
++            state.queue.append((main_id, main_lp, "init"))
          state.queue.append(
              (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
          )
@@ -22384,14 +22784,45 @@ index 75f265ca..0350a4a2 100644
 +            and procs is None
 +        ):
 +            # tokens[0] holds every prompt token in the cache; main_tok was
-+            # forwarded above and is emitted from the queue.
-+            state.copy_index = _copy_draft.CopyIndex(
-+                list(gen_batch.tokens[0]) + [main_id]
++            # forwarded above and is emitted from the queue (or already was).
++            tokens = gen_batch.tokens[0]
++            state.copy_index = _copy_index(
++                gen_batch, tokens, len(tokens) - bool(main_emitted), main_id
 +            )
          _chain_next_drafts(
              gen_batch,
              state,
-@@ -2849,6 +3025,9 @@ def _emit_ragged_responses(
+@@ -2697,7 +2959,10 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
+     state.draft_lp = draft_lp_2d.squeeze(0)
+     state.draft_accept_lp = draft_accept_lp_2d.squeeze(0)
+     state.draft_id = int(draft_tok.tolist()[0])
+-    state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
++    if main_emitted:
++        _bump_emit_stat(state, "init")
++    else:
++        state.queue.append((int(main_tok.tolist()[0]), main_lp, "init"))
+     state.queue.append(
+         (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
+     )
+@@ -2705,6 +2970,17 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
+     gen_batch._omlx_mtp_state = state
+ 
+ 
++def _copy_index(gen_batch: Any, tokens: List[int], n: int, main_id: int) -> Any:
++    """CopyIndex(tokens[:n] + [main_id]), from the host's prebuilt prompt index when it has one."""
++    hook = getattr(_dspark_host(gen_batch.model), "mtp_copy_prompt_index", None)
++    pre = hook(gen_batch.prompt_cache) if hook is not None else None
++    if pre is not None and pre.matches(tokens, n):
++        index = _copy_draft.CopyIndex.from_prompt(pre, [main_id])
++        if index is not None:
++            return index
++    return _copy_draft.CopyIndex(list(tokens[:n]) + [main_id])
++
++
+ # ---------------------------------------------------------------------------
+ # Shared target verification and request-local emission.
+ # ---------------------------------------------------------------------------
+@@ -2849,6 +3125,9 @@ def _emit_ragged_responses(
                      )
                  )
                  if state is not None:
@@ -22401,7 +22832,7 @@ index 75f265ca..0350a4a2 100644
                      _log_mtp_stats(uid, state.stats, finish_reason)
                  finished_uids.append(uid)
                  row_finished = True
-@@ -3087,6 +3266,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
+@@ -3087,6 +3366,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
          depth_str = ""
      if stats.zero_cycles:
          depth_str += f" d0={stats.zero_cycles}"
@@ -22413,7 +22844,7 @@ index 75f265ca..0350a4a2 100644
      tpc = total_emits / stats.cycles if stats.cycles else 0.0
      logger.info(
          "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
-@@ -3365,8 +3549,8 @@ def _run_verify_cycle_chain(
+@@ -3365,8 +3649,8 @@ def _run_verify_cycle_chain(
  
      # --- stats ---
      state.stats.cycles += 1
@@ -22424,7 +22855,7 @@ index 75f265ca..0350a4a2 100644
          state.stats.depth_drafted.extend([0] * pad)
          state.stats.depth_accepted.extend([0] * pad)
      for j in range(k):
-@@ -3378,6 +3562,12 @@ def _run_verify_cycle_chain(
+@@ -3378,6 +3662,12 @@ def _run_verify_cycle_chain(
      state.stats.accepts += m
      if m < k:
          state.stats.rejects += 1
@@ -22437,7 +22868,7 @@ index 75f265ca..0350a4a2 100644
      state.stats.sample_ms += (time.perf_counter() - t0) * 1000
  
      accept_ms = (time.perf_counter() - cycle_t0) * 1000
-@@ -3387,7 +3577,10 @@ def _run_verify_cycle_chain(
+@@ -3387,7 +3677,10 @@ def _run_verify_cycle_chain(
          # --- commit: queue emits + cache rollback ---
          t0 = time.perf_counter()
          for j in range(m):
@@ -22449,7 +22880,7 @@ index 75f265ca..0350a4a2 100644
          state.queue.append(
              (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
          )
-@@ -3412,7 +3605,8 @@ def _run_verify_cycle_chain(
+@@ -3412,7 +3705,8 @@ def _run_verify_cycle_chain(
          committed = mx.array(
              [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
          )
@@ -22459,7 +22890,7 @@ index 75f265ca..0350a4a2 100644
          hidden_rows = hidden[:, : m + 1]
          prev_buf = None
          if procs is not None:
-@@ -3838,6 +4032,10 @@ def _emit_response(
+@@ -3838,6 +4132,10 @@ def _emit_response(
          finish_reason = "stop"
  
      if finish_reason is not None:
@@ -22472,10 +22903,10 @@ index 75f265ca..0350a4a2 100644
          response = Response(
 diff --git a/omlx/patches/mlx_lm_mtp/copy_draft.py b/omlx/patches/mlx_lm_mtp/copy_draft.py
 new file mode 100644
-index 00000000..3533acde
+index 00000000..03c00c6b
 --- /dev/null
 +++ b/omlx/patches/mlx_lm_mtp/copy_draft.py
-@@ -0,0 +1,142 @@
+@@ -0,0 +1,208 @@
 +# SPDX-License-Identifier: MIT
 +"""Context-copy drafts for the DSpark verify loop.
 +
@@ -22525,6 +22956,43 @@ index 00000000..3533acde
 +    return h
 +
 +
++class PromptIndex:
++    """The prompt half of a CopyIndex, built ahead of time (ds41-og: while the box prefills).
++
++    ``CopyIndex.from_prompt(PromptIndex(prompt), extra)`` has exactly the state
++    ``CopyIndex(prompt + extra)`` builds, but only hashes and inserts the
++    ``len(extra)`` new n-grams on the critical path. The list conversion runs in
++    chunks so other threads get the GIL between them; hashing and the sort run
++    in numpy.
++    """
++
++    CHUNK = 1 << 16
++
++    def __init__(self, tokens: List[int], extra: int = 1):
++        n = len(tokens)
++        total = n + extra
++        self.buf = np.zeros(max(2 * total, total + 8192), np.int64)
++        for lo in range(0, n, self.CHUNK):
++            hi = min(n, lo + self.CHUNK)
++            self.buf[lo:hi] = tokens[lo:hi]
++        self.n, self.extra = n, extra
++        self.order = self.sorted = None
++        if n >= NGRAM:
++            h = _prompt_hashes(self.buf[:n], NGRAM)
++            self.order = np.argsort(h, kind="stable").astype(np.int64)
++            self.sorted = h[self.order]
++
++    def matches(self, tokens: List[int], n: int) -> bool:
++        """Cheap identity check against ``tokens[:n]`` (length, head and tail)."""
++        if n != self.n or len(tokens) < n:
++            return False
++        k = min(n, 256)
++        return (
++            self.buf[:k].tolist() == list(tokens[:k])
++            and self.buf[n - k : n].tolist() == list(tokens[n - k : n])
++        )
++
++
 +class CopyIndex:
 +    """n-gram index over the token stream plus the acceptance-only draft policy."""
 +
@@ -22540,6 +23008,35 @@ index 00000000..3533acde
 +        else:
 +            self._order = np.zeros(0, np.int64)
 +            self._sorted = np.zeros(0, np.uint64)
++        self._init_policy()
++
++    @classmethod
++    def from_prompt(cls, pre: PromptIndex, extra: List[int]) -> Optional["CopyIndex"]:
++        """``CopyIndex(prompt + extra)`` from a PromptIndex of ``prompt``, or None if it does not apply.
++
++        The stable argsort orders equal hashes by start position, and every new
++        n-gram starts after all prompt n-grams, so each one goes right after its
++        equal keys: the same ``_order``/``_sorted`` arrays, bit for bit. Consumes
++        ``pre`` (its buffer becomes this index's buffer).
++        """
++        m = len(extra)
++        if pre.order is None or m != pre.extra or pre.buf is None:
++            return None
++        self = cls.__new__(cls)
++        base, n = pre.n, pre.n + m
++        buf, pre.buf = pre.buf, None
++        buf[base:n] = extra
++        order, keys = pre.order, pre.sorted
++        new = _prompt_hashes(buf[base + 1 - NGRAM : n], NGRAM)
++        for j, key in enumerate(new):
++            at = int(np.searchsorted(keys, key, "right"))
++            keys = np.insert(keys, at, key)
++            order = np.insert(order, at, base + 1 - NGRAM + j)
++        self._buf, self.n, self._order, self._sorted = buf, n, order, keys
++        self._init_policy()
++        return self
++
++    def _init_policy(self) -> None:
 +        self._extra: dict[int, list[int]] = {}
 +        self.cur = MIN_DRAFT
 +        self.min_match = NGRAM
@@ -23992,6 +24489,220 @@ index 00000000..c952dae6
 +    assert not og_fused.eligible(None, [5])
 +    assert not og_fused.eligible(None, [1, 5])
 +    assert not og_fused.eligible(None, [5, 5, 5, 5])  # 20 rows > MAX_ROWS
+diff --git a/tests/test_deepseek_v41_og_ttft.py b/tests/test_deepseek_v41_og_ttft.py
+new file mode 100644
+index 00000000..6daebd23
+--- /dev/null
++++ b/tests/test_deepseek_v41_og_ttft.py
+@@ -0,0 +1,208 @@
++# SPDX-License-Identifier: MIT
++"""ds41-ttft: first token before the MTP post-init, prebuilt copy-draft prompt index."""
++
++import random
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++mx = pytest.importorskip("mlx.core")
++
++from omlx.patches.mlx_lm_mtp import copy_draft
++
++
++def _state(index):
++    return (
++        index.n,
++        index._buf[: index.n].tolist(),
++        len(index._buf),
++        index._order.tolist(),
++        index._sorted.tolist(),
++        index._order.dtype,
++        index._sorted.dtype,
++    )
++
++
++def _drive(index, rng, steps=40):
++    """Proposals, observations and appends: the policy's full observable behaviour."""
++    out = []
++    for _ in range(steps):
++        out.append(index.propose(rng.randint(0, 6)))
++        index.observe(rng.randint(0, 5))
++        index.append([rng.randint(0, 3) for _ in range(rng.randint(1, 5))])
++    return out
++
++
++@pytest.mark.parametrize("vocab", [2, 3, 7, 50000])
++def test_prompt_index_matches_constructor(vocab):
++    rng = random.Random(vocab)
++    lengths = [copy_draft.NGRAM, copy_draft.NGRAM + 1, 17, 300, 5000, 70000]
++    for n in lengths:
++        prompt = [rng.randrange(vocab) for _ in range(n)]
++        main = rng.randrange(vocab)
++        ref = copy_draft.CopyIndex(prompt + [main])
++        pre = copy_draft.PromptIndex(prompt)
++        assert pre.matches(prompt + [main], n)
++        got = copy_draft.CopyIndex.from_prompt(pre, [main])
++        assert got is not None
++        assert _state(got) == _state(ref)
++        a, b = random.Random(n), random.Random(n)
++        assert _drive(got, a) == _drive(ref, b)
++        assert _state(got) == _state(ref)
++        assert pre.buf is None  # consumed
++
++
++def test_prompt_index_refuses_short_or_mismatched():
++    short = copy_draft.PromptIndex([1, 2])
++    assert copy_draft.CopyIndex.from_prompt(short, [3]) is None
++    pre = copy_draft.PromptIndex(list(range(1000)))
++    assert not pre.matches(list(range(999)), 999)
++    other = list(range(1000))
++    other[-1] = 7
++    assert not pre.matches(other, 1000)
++    other = list(range(1000))
++    other[0] = 7
++    assert not pre.matches(other, 1000)
++    assert pre.matches(list(range(1000)) + [5], 1000)
++    assert copy_draft.CopyIndex.from_prompt(pre, [1, 2]) is None  # built for one extra token
++
++
++# ---------------------------------------------------------------------------
++# First token before the post-init (tiny qwen3_5 MTP model, real GenerationBatch)
++# ---------------------------------------------------------------------------
++
++TINY = {
++    "model_type": "qwen3_5", "hidden_size": 64, "intermediate_size": 128, "num_hidden_layers": 4,
++    "num_attention_heads": 4, "num_key_value_heads": 2, "vocab_size": 256, "linear_num_value_heads": 2,
++    "linear_num_key_heads": 2, "linear_key_head_dim": 16, "linear_value_head_dim": 16,
++    "linear_conv_kernel_dim": 3, "full_attention_interval": 2, "tie_word_embeddings": True,
++    "rms_norm_eps": 1e-5, "head_dim": 32, "rope_theta": 1000.0, "partial_rotary_factor": 0.5,
++    "max_position_embeddings": 256, "mtp_num_hidden_layers": 1,
++}
++
++
++@pytest.fixture()
++def tiny():
++    try:
++        from omlx.patches.mlx_lm_mtp import batch_generator, is_mtp_active, qwen35_model, set_mtp_active
++    except ImportError:
++        pytest.skip("omlx.patches.mlx_lm_mtp not importable")
++    if not qwen35_model.apply() or not batch_generator.apply():
++        pytest.skip("mlx_lm MTP patches refused to apply")
++    previous_device, previous = mx.default_device(), is_mtp_active()
++    mx.set_default_device(mx.cpu)
++    set_mtp_active(True)
++    try:
++        from mlx_lm.models.qwen3_5 import TextModel, TextModelArgs
++
++        mx.random.seed(3)
++        model = TextModel(TextModelArgs.from_dict(TINY))
++        mx.eval(model.parameters())
++        yield model
++    finally:
++        set_mtp_active(previous)
++        mx.set_default_device(previous_device)
++
++
++def _generate(model, prompt, *, early, max_tokens=24, stop=None):
++    """Tokens per next() call and the backbone forwards before the first emission."""
++    from mlx_lm.generate import GenerationBatch, StopSequences
++    from mlx_lm.models.cache import make_prompt_cache
++
++    model._omlx_mtp_early_first = early
++    model._omlx_mtp_preserve_requests = True
++    from mlx_lm.models.cache import ArraysCache, BatchKVCache, KVCache
++
++    cache = make_prompt_cache(model)
++    model(mx.array(prompt[:-1])[None], cache=cache)
++    mx.eval([c.state for c in cache])
++    batched = []
++    for c in cache:  # the per-row cache types BatchGenerator hands a GenerationBatch
++        if isinstance(c, KVCache):
++            c = BatchKVCache.merge([c])
++        elif isinstance(c, ArraysCache):
++            c.left_padding = mx.array([0])
++        batched.append(c)
++    cache = batched
++    calls = []
++    original = type(model).__call__
++
++    def counted(self, *a, **k):
++        calls.append(1)
++        return original(self, *a, **k)
++
++    type(model).__call__ = counted
++    try:
++        batch = GenerationBatch(
++            model, [0], mx.array(prompt[-1:]), cache, [list(prompt[:-1])], None,
++            lambda lp: mx.argmax(lp, axis=-1), [[]], [StopSequences(stop)], [max_tokens],
++        )
++        steps, forwards_before_first, start = [], None, len(calls)
++        while batch.uids:
++            out = batch.next()
++            if forwards_before_first is None and out:
++                forwards_before_first = len(calls) - start
++            steps.append([(r.token, r.finish_reason) for r in out])
++    finally:
++        type(model).__call__ = original
++        del model._omlx_mtp_early_first
++    return steps, forwards_before_first
++
++
++def _flat(steps):
++    return [t for step in steps for t in step]
++
++
++def test_early_first_token_same_stream(tiny):
++    prompt = list(range(5, 40))
++    ref, ref_forwards = _generate(tiny, prompt, early=False)
++    got, got_forwards = _generate(tiny, prompt, early=True)
++    assert _flat(got) == _flat(ref)
++    assert got[0] == ref[0]  # one token per call on the singleton path, the same first token
++    assert got_forwards == ref_forwards - 1  # emitted before the post-init forward
++
++
++@pytest.mark.parametrize("max_tokens", [1, 2, 3])
++def test_early_first_token_length_limits(tiny, max_tokens):
++    prompt = list(range(9, 30))
++    ref, _ = _generate(tiny, prompt, early=False, max_tokens=max_tokens)
++    got, _ = _generate(tiny, prompt, early=True, max_tokens=max_tokens)
++    assert _flat(got) == _flat(ref)
++    assert _flat(got)[-1][1] == "length"
++
++
++def test_early_first_token_stop_on_first(tiny):
++    prompt = list(range(9, 30))
++    ref, _ = _generate(tiny, prompt, early=False)
++    first = ref[0][0][0]
++    ref_stop, _ = _generate(tiny, prompt, early=False, stop=[[first]])
++    got_stop, _ = _generate(tiny, prompt, early=True, stop=[[first]])
++    assert _flat(got_stop) == _flat(ref_stop) == [(first, "stop")]
++    second = _flat(ref)[1][0]
++    ref_stop, _ = _generate(tiny, prompt, early=False, stop=[[second]])
++    got_stop, _ = _generate(tiny, prompt, early=True, stop=[[second]])
++    assert _flat(got_stop) == _flat(ref_stop)
++
++
++def test_standard_step_refused_after_early_emission(tiny):
++    from omlx.patches.mlx_lm_mtp import batch_generator as bg
++
++    batch = SimpleNamespace(uids=[4], _omlx_mtp_early={4: 11})
++    with pytest.raises(RuntimeError):
++        bg._refuse_standard_after_early(batch)
++    bg._refuse_standard_after_early(SimpleNamespace(uids=[5], _omlx_mtp_early={4: 11}))
++
++
++def test_extend_carries_early_markers():
++    from omlx.patches.mlx_lm_mtp import batch_generator as bg
++
++    host = SimpleNamespace(uids=[1], _omlx_mtp_early={1: 7})
++    donor = SimpleNamespace(uids=[2], _omlx_mtp_early={2: 9})
++
++    def extend(batch, other):
++        batch.uids += other.uids
++
++    bg._extend_preserving_mtp(extend, host, donor)
++    assert host._omlx_mtp_early == {1: 7, 2: 9} and host.uids == [1, 2]
++    assert bg._early_emitted(host, 2) and not bg._early_emitted(host, 3)
 diff --git a/tests/test_deepseek_v41_og_wake.py b/tests/test_deepseek_v41_og_wake.py
 new file mode 100644
 index 00000000..9b50b689

@@ -30,6 +30,7 @@ PROGRESS = HOME/'llm/ds41/PROGRESS.md'
 LOCK = HOME/'llm/locks/gpu.lock'
 SWAP = 'http://127.0.0.1:8080'
 SUP_PORT, WORKER_PORT = 12648, 12647
+WHO = os.environ.get('FE_WHO', 'Opus ds41-fe')  # who announces the window in PROGRESS.md
 
 
 def get(url, timeout=5):
@@ -157,7 +158,7 @@ def main():
     if args.dry_run:
         print('preflight ok: production pids', prod_pids, 'lock holders', lock_holders(), 'last window line:', line)
         return
-    announce(f'MAC WINDOW OPEN (Opus ds41-fe): front-end A/B `{args.label}` of ~/src/wt/ds41-fe on :{SUP_PORT}; '
+    announce(f'MAC WINDOW OPEN ({WHO}): front-end A/B `{args.label}` of ~/src/wt/{HERE.parent.name} on :{SUP_PORT}; '
              f'ds41 unloaded via llama-swap, restored by a chat request at the end; <= {args.minutes:.0f} min.')
     sup = None
     summary = {}
@@ -200,7 +201,8 @@ def main():
             name, _, flags = spec.partition(':')
             switches = {k: (int(v) if k == 'replay_eval_every' else bool(int(v)))
                         for k, _, v in (f.partition('=') for f in flags.split(',') if f)}
-            defaults = dict(encode_cache=True, kickoff=True, wake=True, replay_eval_every=1, profile=False)
+            defaults = dict(encode_cache=True, kickoff=True, wake=True, replay_eval_every=20, profile=False,
+                            early_first=True, copy_prebuild=True)
             state = post(f'http://127.0.0.1:{WORKER_PORT}/og/fe', dict(defaults, **switches))
             left = args.minutes * 60 - (time.monotonic() - t_start) - 120
             if left < 60:
@@ -248,7 +250,7 @@ def main():
         except Exception as exc:  # noqa: BLE001
             print('restore failed:', repr(exc), flush=True)
         (logs/'summary.json').write_text(json.dumps(summary, indent=1))
-        announce(f'MAC WINDOW CLOSED (Opus ds41-fe): `{args.label}` done in {(time.monotonic() - t_start) / 60:.1f} min; '
+        announce(f'MAC WINDOW CLOSED ({WHO}): `{args.label}` done in {(time.monotonic() - t_start) / 60:.1f} min; '
                  f'ds41 {"restored and answering" if restored else "RESTORE NOT VERIFIED - check"}.')
 
 

@@ -47,6 +47,43 @@ def _hash(values) -> int:
     return h
 
 
+class PromptIndex:
+    """The prompt half of a CopyIndex, built ahead of time (ds41-og: while the box prefills).
+
+    ``CopyIndex.from_prompt(PromptIndex(prompt), extra)`` has exactly the state
+    ``CopyIndex(prompt + extra)`` builds, but only hashes and inserts the
+    ``len(extra)`` new n-grams on the critical path. The list conversion runs in
+    chunks so other threads get the GIL between them; hashing and the sort run
+    in numpy.
+    """
+
+    CHUNK = 1 << 16
+
+    def __init__(self, tokens: List[int], extra: int = 1):
+        n = len(tokens)
+        total = n + extra
+        self.buf = np.zeros(max(2 * total, total + 8192), np.int64)
+        for lo in range(0, n, self.CHUNK):
+            hi = min(n, lo + self.CHUNK)
+            self.buf[lo:hi] = tokens[lo:hi]
+        self.n, self.extra = n, extra
+        self.order = self.sorted = None
+        if n >= NGRAM:
+            h = _prompt_hashes(self.buf[:n], NGRAM)
+            self.order = np.argsort(h, kind="stable").astype(np.int64)
+            self.sorted = h[self.order]
+
+    def matches(self, tokens: List[int], n: int) -> bool:
+        """Cheap identity check against ``tokens[:n]`` (length, head and tail)."""
+        if n != self.n or len(tokens) < n:
+            return False
+        k = min(n, 256)
+        return (
+            self.buf[:k].tolist() == list(tokens[:k])
+            and self.buf[n - k : n].tolist() == list(tokens[n - k : n])
+        )
+
+
 class CopyIndex:
     """n-gram index over the token stream plus the acceptance-only draft policy."""
 
@@ -62,6 +99,35 @@ class CopyIndex:
         else:
             self._order = np.zeros(0, np.int64)
             self._sorted = np.zeros(0, np.uint64)
+        self._init_policy()
+
+    @classmethod
+    def from_prompt(cls, pre: PromptIndex, extra: List[int]) -> Optional["CopyIndex"]:
+        """``CopyIndex(prompt + extra)`` from a PromptIndex of ``prompt``, or None if it does not apply.
+
+        The stable argsort orders equal hashes by start position, and every new
+        n-gram starts after all prompt n-grams, so each one goes right after its
+        equal keys: the same ``_order``/``_sorted`` arrays, bit for bit. Consumes
+        ``pre`` (its buffer becomes this index's buffer).
+        """
+        m = len(extra)
+        if pre.order is None or m != pre.extra or pre.buf is None:
+            return None
+        self = cls.__new__(cls)
+        base, n = pre.n, pre.n + m
+        buf, pre.buf = pre.buf, None
+        buf[base:n] = extra
+        order, keys = pre.order, pre.sorted
+        new = _prompt_hashes(buf[base + 1 - NGRAM : n], NGRAM)
+        for j, key in enumerate(new):
+            at = int(np.searchsorted(keys, key, "right"))
+            keys = np.insert(keys, at, key)
+            order = np.insert(order, at, base + 1 - NGRAM + j)
+        self._buf, self.n, self._order, self._sorted = buf, n, order, keys
+        self._init_policy()
+        return self
+
+    def _init_policy(self) -> None:
         self._extra: dict[int, list[int]] = {}
         self.cur = MIN_DRAFT
         self.min_match = NGRAM

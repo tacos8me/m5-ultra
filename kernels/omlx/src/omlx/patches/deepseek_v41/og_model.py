@@ -73,6 +73,10 @@ NUMERICS = [None]  # numerics key of the latest import; store lookups match it
 # at least FUSE_MIN requests verify in a scheduler step. With 2 the lone pair waits for both box steps
 # (per-request verify hides them), so pairs start at 3.
 FUSE_MIN = int(os.environ.get('DS41_OG_FUSE_MIN', '3'))
+# TTFT: emit the first token before the MTP post-init (its second forward is pre-sent to the box
+# so it overlaps the emission), and build the copy-draft prompt index while the box prefills.
+EARLY_FIRST = os.environ.get('DS41_OG_EARLY_FIRST', '1') == '1'
+COPY_PREBUILD = os.environ.get('DS41_OG_COPY_PREBUILD', '1') == '1'
 _lock = threading.Lock()
 _ids = itertools.count(1)
 
@@ -164,6 +168,31 @@ class GpuWarm:
 
 class OgLanguageModel(DecoderHalf):
     """Layers 20-39 + head + DSpark; layers 0-19 are remote placeholders."""
+
+    _omlx_mtp_early_first = EARLY_FIRST
+
+    def mtp_first_presend(self, gen_batch, token_id):
+        """The first token went out before the post-init: send its forward's STEP now (ensure_step finds it)."""
+        try:
+            cache = gen_batch.prompt_cache
+            encoder = session_of(cache)
+            if encoder._pending is None:
+                encoder.send_step([int(token_id)], cache[0].size())
+                STATS['first_presend'] = STATS.get('first_presend', 0) + 1
+        except Exception:  # noqa: BLE001 -- the post-init forward sends it itself
+            STATS['presend_errors'] += 1
+            logger.debug('ds41-og first presend skipped', exc_info=True)
+
+    def mtp_copy_prompt_index(self, cache):
+        """The request's prompt index built during its box OPEN (copy_draft.PromptIndex), once, or None."""
+        try:
+            prebuilt = session_of(cache).__dict__.pop('_og_copy_prompt', None)
+        except RuntimeError:
+            return None
+        index = prebuilt.get() if prebuilt is not None else None
+        STATS['copy_prebuilt' if index is not None else 'copy_local'] = STATS.get(
+            'copy_prebuilt' if index is not None else 'copy_local', 0) + 1
+        return index
 
     def set_tokenizer(self, tokenizer):
         # Engram hashing runs on the box.
@@ -418,6 +447,26 @@ def language_model_of(model):
     return model
 
 
+class CopyPrompt(threading.Thread):
+    """copy_draft.PromptIndex of a prompt, built beside the box OPEN (numpy drops the GIL for the heavy parts)."""
+
+    def __init__(self, request_id, tokens):
+        super().__init__(name=f'ds41-og-copy-{request_id}', daemon=True)
+        self.tokens, self.index = tokens, None
+
+    def run(self):
+        from ..mlx_lm_mtp import copy_draft
+        try:
+            self.index = copy_draft.PromptIndex(self.tokens)
+        except Exception:  # noqa: BLE001 -- the post-init builds the index itself
+            logger.debug('ds41-og copy prompt index failed', exc_info=True)
+        self.tokens = None
+
+    def get(self):
+        self.join()
+        return self.index
+
+
 class Job(threading.Thread):
     """Box OPEN (prefill + state transfer) off the engine thread.
 
@@ -434,6 +483,7 @@ class Job(threading.Thread):
         # Prefix keys for the Mac row store: token ids, image-content keys inside image spans (og_images).
         self.keys = og_images.prompt_keys(self.tokens[:-1], self.images)
         self.encoder = self.result = self.error = self.base_rows = None
+        self.copy_prompt = None
         self.done = threading.Event()
         self.cancelled = False
 
@@ -477,6 +527,11 @@ class Job(threading.Thread):
     def run(self):
         since, failures = time.monotonic(), 0
         self.trace = dict(job_start=time.time())
+        if COPY_PREBUILD and len(self.tokens) >= 64:
+            from ..mlx_lm_mtp import copy_draft
+            if copy_draft.ENABLED:
+                self.copy_prompt = CopyPrompt(self.request_id, self.tokens)
+                self.copy_prompt.start()
         try:
             while True:
                 try:
@@ -588,6 +643,8 @@ class OgPrefill:
                 og_failover.import_failed(request, exc)
                 return False
             STATS['import_fallbacks'] += 1
+        if job.copy_prompt is not None:
+            encoder._og_copy_prompt = job.copy_prompt
         sid = register(encoder)
         cache[SID_LAYER][6] = mx.array([[sid]], mx.int64)
         mx.eval(cache[SID_LAYER][6])
