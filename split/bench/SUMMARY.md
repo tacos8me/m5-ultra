@@ -41,7 +41,7 @@ Decode is set by DSpark acceptance, not depth: box compute stays 7.2-7.8 ms per 
 | c2 128K | 64.4 (54.2-76.6) | 107.2 (103.1-112.5) | 1.32 / 2.52 | 7.56 / 17.58 |
 | c4 8K | 40.1 (30.8-50.1) | 117.3 (114.5-119.8) | 0.92 / 2.11 / 3.17 / 4.19 | 0.94 / 2.08 / 3.16 / 4.17 |
 
-q3 baseline c2 (short prompts): aggregate 77.6 tok/s, per-stream 45.0. c2 streams decode concurrently; prefills are serialized on the box, so the second stream waits for the first prefill (at 8K the cached follow-ups also re-prefill; see caveats). c4 is accepted but runs 2 at a time: streams 3-4 queue until the first pair finishes (~5 s at 8K), so the aggregate stays around 97 tok/s.
+q3 baseline c2 (short prompts): aggregate 77.6 tok/s, per-stream 45.0. c2 streams decode concurrently; prefills are serialized on the box, so the second stream waits for the first prefill (at 8K the cached follow-ups also re-prefill; see caveats). c4 decodes all four streams at once as two fused pairs; its later arrivals wait only for the earlier prefills (see TTFT by arrival order). This leg uses fresh nonce prompts, so its aggregate varies with draft acceptance; a fixed-prompt identical-output A/B gave c4 113 -> 139 tok/s for fused pairs + batched drafting vs the previous build.
 
 ## 4. Resume (prefix cache on box + Mac)
 

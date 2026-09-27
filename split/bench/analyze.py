@@ -207,7 +207,7 @@ for k, a in p3.items():
     M.append(f"| {k} | {f(a['per_stream_tok_s'])} ({rng(a['per_stream_tok_s'])}) | {f(a['aggregate_tok_s'])} ({rng(a['aggregate_tok_s'])}) | {tt} | {ca} |")
 M.append(f"\nq3 baseline c2 (short prompts): aggregate {S['baseline_q3']['c2_short_prompts']['aggregate_tok_s']['mean']:.1f} tok/s, per-stream {S['baseline_q3']['c2_short_prompts']['per_stream_tok_s']['mean']:.1f}. "
          'c2 streams decode concurrently; prefills are serialized on the box, so the second stream waits for the first prefill '
-         '(at 8K the cached follow-ups also re-prefill; see caveats). c4 is accepted but runs 2 at a time: streams 3-4 queue until the first pair finishes (~5 s at 8K), so the aggregate stays around 97 tok/s.\n')
+         '(at 8K the cached follow-ups also re-prefill; see caveats). c4 decodes all four streams at once as two fused pairs; its later arrivals wait only for the earlier prefills (see TTFT by arrival order). This leg uses fresh nonce prompts, so its aggregate varies with draft acceptance; a fixed-prompt identical-output A/B gave c4 113 -> 139 tok/s for fused pairs + batched drafting vs the previous build.\n')
 M.append('## 4. Resume (prefix cache on box + Mac)\n')
 M.append('| Context | Turn-1 TTFT s (fresh) | Turn-2 TTFT s mean (range, n=3) | New tokens in turn 2 | Regenerate TTFT s | q3 turn-2 s |')
 M.append('|---|---:|---:|---:|---:|---:|')
