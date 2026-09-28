@@ -13,7 +13,7 @@ import mlx.nn as nn
 
 from ..mlx_lm_mtp.deepseek_v4_dspark import DSparkContextCache
 from .head import project_logits
-from . import decode_fusions
+from . import decode_fusions, woa_compact
 from .language import Attention, Block, RMSNorm, hc_mixes, hc_post, hc_pre, rope
 from .quantization import quantize_activation
 
@@ -85,7 +85,7 @@ class DSparkAttention(Attention):
         grouped = out.reshape(batch, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
         projected = (
-            decode_fusions.grouped_gemv(grouped, weight)
+            woa_compact.grouped_gemv(self.wo_a, grouped, weight)
             if decode_fusions.grouped_gemv_supported(grouped, weight)
             else mx.einsum("bsgd,grd->bsgr", grouped, weight)
         )

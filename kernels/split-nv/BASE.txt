@@ -1,5 +1,6 @@
-split-nv engine (own code, src/): 4dd01ac (branch og-moe; deployed as systemd user unit split-nv-engine, running the
-  image built from this Dockerfile). Engine numerics unchanged since c75a0a2 (og-s4.4).
+split-nv engine (own code, src/): b4f5ea4 (branch prefill-perf; deployed as systemd user unit split-nv-engine, running the
+  image built from this Dockerfile, with SPLIT_NV_PF_OVERLAP=1 SPLIT_NV_Q_NOCOPY=1: prefill chunks run as two halves so
+  one half's TP2 all-reduce overlaps the other half's compute; byte-identical). Engine numerics unchanged since c75a0a2 (og-s4.4).
 
 Base image: lmsysorg/sglang:dev-dsv41@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
   (torch 2.13.0+cu130, flashinfer 0.6.18+cu130 git 69ff11fc). The Dockerfile applies two patches:

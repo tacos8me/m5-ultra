@@ -233,7 +233,8 @@ class RankStore:
                 cap.tail = {int(L): tuple(t[f"cap.tail.{L}.{j}"].to(mr.device) for j in range(3)) for L in c["tail"]}
                 cap.h_ring = tuple(t[f"cap.h.{j}"].to(mr.device) for j in range(3)) if c["h_ring"] else None
             else:  # grid point: the prefill resuming here recomputes window, tails and hidden tail (>= 256 new rows)
-                cap.rows = {L: P // r for L, r in ((2, 2), (8, 2), (14, 2), (20, 1))}
+                from split_nv import state_pack
+                cap.rows = {L: P // r for L, r in state_pack.SOURCE.items()}
         torch.cuda.synchronize()
         sess.length = P
         sess.alloc_len = sess.req.kv.kv_allocated_len

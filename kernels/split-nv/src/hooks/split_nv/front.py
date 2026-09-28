@@ -27,6 +27,7 @@ import numpy as np
 import torch
 
 from split_nv.imagekeys import parse_images, prefix_digest, prompt_keys
+from split_nv.perf_flags import flag
 from split_nv.prefix_cache import PrefixIndex, _atomic_save, _load
 from split_nv.state_pack import (FORMAT, ENCODER_LAYERS, NUMERICS, SOURCE, RowChunks, TokenMap, assemble_parts, dtype_name,
                                  row_names, serialize_parts, tensor_bytes)
@@ -39,6 +40,7 @@ GRID = 8192
 MAX_STEP_ROWS = 8
 STEP_ROW_BYTES = 4 * 5120 * 2 + 4 * 4 + 288 + 68
 PREFILL_TOK_S = 17000.0
+SPIN_S = float(os.environ.get("SPLIT_NV_SPIN_S", "0.2"))
 ADMIN_PEERS = set(os.environ.get("SPLIT_NV_ADMIN_PEERS", "127.0.0.1,10.10.10.2").split(","))
 
 log_lock = threading.Lock()
@@ -271,6 +273,9 @@ class Front:
         self.t_start = time.time()
         self.version = os.environ.get("SPLIT_NV_VERSION", "")
         self.peers = []
+        self.gpu_lock = threading.Lock()  # one GPU job at a time: gpu_loop (queued jobs) or run_now (STEPs)
+        self.step_cv = threading.Condition()
+        self.step_waiters = 0
 
     # ---- GPU job queue ---------------------------------------------------------------------------------------
     def submit_async(self, cmd, priority=0):
@@ -288,25 +293,71 @@ class Front:
     def gpu_loop(self):
         while True:
             _, _, job = self.jobs.get()
+            with self.step_cv:
+                # a STEP running inline (run_now) goes before any queued job
+                while self.step_waiters:
+                    self.step_cv.wait()
+                self.gpu_lock.acquire()
             try:
-                job.t_get = time.perf_counter()
-                self.current = (job.cmd[0], time.monotonic())
-                for conn in self.peers:
-                    conn.send(job.cmd)
-                job.t_bcast = time.perf_counter()
-                job.result = self.engine.execute(job.cmd)
-                job.t_exec = time.perf_counter()
-            except Exception as e:  # noqa: BLE001
-                job.error = f"{e}\n{traceback.format_exc()}"
-                log("GPU job failed:", job.error)
-                if fatal_cuda_error(e):
-                    # A sticky CUDA error (device-side assert, illegal access) poisons the context: every later job
-                    # would fail while /health still said ok. Exit so the unit restarts the engine.
-                    log("FATAL CUDA error: exiting for a restart")
-                    os._exit(4)
+                self._execute(job)
             finally:
-                self.current = None
-                job.done.set()
+                self.gpu_lock.release()
+
+    def run_now(self, cmd):
+        """Execute a STEP on the calling (connection) thread: no hand-off to gpu_loop and back, each of which costs
+        a thread wake-up on a cold core. Waits only for the GPU job already running; ahead of queued jobs."""
+        job = Job(cmd)
+        with self.step_cv:
+            self.step_waiters += 1
+        self.gpu_lock.acquire()
+        try:
+            with self.step_cv:
+                self.step_waiters -= 1
+                self.step_cv.notify_all()
+            self._execute(job)
+        finally:
+            self.gpu_lock.release()
+        return job
+
+    def _execute(self, job):
+        try:
+            job.t_get = time.perf_counter()
+            self.current = (job.cmd[0], time.monotonic())
+            for conn in self.peers:
+                conn.send(job.cmd)
+            job.t_bcast = time.perf_counter()
+            job.result = self.engine.execute(job.cmd)
+            job.t_exec = time.perf_counter()
+        except Exception as e:  # noqa: BLE001
+            job.error = f"{e}\n{traceback.format_exc()}"
+            log("GPU job failed:", job.error)
+            if fatal_cuda_error(e):
+                # A sticky CUDA error (device-side assert, illegal access) poisons the context: every later job
+                # would fail while /health still said ok. Exit so the unit restarts the engine.
+                log("FATAL CUDA error: exiting for a restart")
+                os._exit(4)
+        finally:
+            self.current = None
+            job.done.set()
+
+    def spin_readable(self, conn, sid):
+        """While a single session is decoding (its last STEP less than SPIN_S ago), busy-wait for its next frame
+        instead of sleeping in recv: the core stays in C0 at full clock, so the next STEP's host work (~0.5 ms hot)
+        does not run ~3x slower after the ~25 ms idle of a c1 cycle. Other sessions (c2+) block as before."""
+        t_last = self.last_step.get(sid)
+        spin_s = float(flag("spin_s", SPIN_S))
+        if t_last is None or spin_s <= 0 or len(self.engine.sessions) != 1:
+            return
+        deadline = t_last + spin_s
+        sessions = self.engine.sessions
+        while time.monotonic() < deadline and len(sessions) == 1:
+            try:
+                conn.recv(1, socket.MSG_PEEK | socket.MSG_DONTWAIT)
+                return  # data or EOF: recv_exact takes it from here
+            except (BlockingIOError, InterruptedError):
+                continue
+            except OSError:
+                return
 
     def watchdog(self):
         """A GPU job that never returns means a wedged rank or collective: exit so the supervisor restarts us."""
@@ -392,7 +443,9 @@ class Front:
                     return None
                 a, e, k, last = pending.pop(0)
                 grid = grids[k][1] if grids[k] and last else None
-                return self.submit_async(("prefill_chunk", sid, ids[a:e], grid), priority=1), a, e, k, last
+                from split_nv.engine import pf_split
+                cmd = ("prefill_chunk", sid, ids[a:e], grid, pf_split(e - a))
+                return self.submit_async(cmd, priority=1), a, e, k, last
 
             try:
                 cur = submit_next()
@@ -532,7 +585,9 @@ class Front:
                     "cache": self.cache.summary(), "uptime_s": round(time.time() - self.t_start),
                     "version": self.version, "sglang": os.environ.get("SPLIT_NV_SGLANG_VERSION", ""), "numerics": NUMERICS,
                     "tree_head": tree, "restart_pending": bool(tree) and not self.version.startswith(tree[:len(self.version.split("-")[0])]),
-                    "dev_hook": os.environ.get("SPLIT_NV_DEV") == "1", "vision": self.engine.vision}
+                    "dev_hook": os.environ.get("SPLIT_NV_DEV") == "1", "vision": self.engine.vision,
+                    "prefill_perf": {k: os.environ.get(f"SPLIT_NV_{k.upper()}", "0") == "1"
+                                     for k in ("pf_overlap", "ce_ar", "q_nocopy")}}
 
     # ---- HTTP: /v1/prefill (phase-2 compatible), /health, /v1/info, /v1/cache ------------------------------------
     def serve_http(self, host, port):
@@ -715,7 +770,7 @@ class Front:
         def on_rows(rows):
             if stream:
                 streamer.rows_chunk(rows)
-                send_frame(conn, b"PROG", {"tokens_done": streamer.sent["layer.20.slot.2"]})
+                send_frame(conn, b"PROG", {"tokens_done": streamer.sent[f"layer.{ENCODER_LAYERS - 1}.slot.2"]})
 
         with (self.prefill_lock if use_cache else contextlib.nullcontext()):
             return self._open(conn, peer, h, tokens, sid, t0, stream, streamer, use_cache, want_state, lean, delta_from,
@@ -759,6 +814,8 @@ class Front:
             self.open_conns += 1
         try:
             while True:
+                if sid is not None:
+                    self.spin_readable(conn, sid)
                 head = recv_exact(conn, FRAME.size)
                 if head is None:
                     break
@@ -801,7 +858,8 @@ class Front:
                         break
                     t0 = time.perf_counter()
                     self.last_step[sid] = time.monotonic()
-                    job = self.submit_async(("step", sid, keep, ids))
+                    cmd = ("step", sid, keep, ids)
+                    job = self.run_now(cmd) if flag("inline", True) else self.submit_async(cmd)
                     step, box_s = job.wait()
                     t_get, t_bcast, t_exec = job.t_get, job.t_bcast, job.t_exec
                     out = step["payload"]
@@ -809,10 +867,13 @@ class Front:
                         send_frame(conn, b"ERR ", {"error": f"step payload {len(out)} bytes for L={L}"})
                         break
                     conn.sendall(FRAME.pack(b"STPR", STPR_HDR.size, len(out)) + STPR_HDR.pack(sid, keep + L, L, len(out), box_s) + out)
-                    if os.environ.get("SPLIT_NV_STEP_LOG"):
+                    if os.environ.get("SPLIT_NV_STEP_LOG") or flag("step_log", False):
+                        tm = step.get("t")
+                        ph = (" " + " ".join(f"{k}={(b - a) * 1e3:.3f}" for k, a, b in zip(tm[0::2], tm[1::2], tm[3::2])
+                                             if isinstance(k, str))) if tm else ""
                         log(f"session {sid} step keep={keep} L={L} box={box_s * 1e3:.2f}ms total={(time.perf_counter() - t0) * 1e3:.2f}ms "
                             f"queue={(t_get - t0) * 1e3:.2f} bcast={(t_bcast - t_get) * 1e3:.2f} "
-                            f"exec={(t_exec - t_bcast) * 1e3:.2f} reply={(time.perf_counter() - t_exec) * 1e3:.2f}")
+                            f"exec={(t_exec - t_bcast) * 1e3:.2f} reply={(time.perf_counter() - t_exec) * 1e3:.2f}{ph}")
                 elif tag == b"CLOS":
                     break
                 else:

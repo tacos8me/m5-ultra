@@ -1,7 +1,7 @@
 Applies on top of deepseek-v41.patch (head ef88391e):
 base: ef88391e
-head: 3339e76d (branch ds41-ttft, served as llama-swap ds41; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
-      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft)
+head: 2a70d1b0 (branch ds41-probe, served as llama-swap ds41; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
+      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe)
 
 5b17cbbc perf: keep DeepSeek V4.1 decode KV growth in place across extract and rollback
 88cfffd9 perf: score DeepSeek V4.1 decode index keys in one lazy tile
@@ -88,3 +88,9 @@ f7a48ef2 perf(ds41-fe): text-only prepare_inputs through the piece cache; privat
 51233501..3339e76d:
 3339e76d docs(ds41-ttft): TTFT-MERGE-READY (per-stage before/after, identity, gap finding, deploy/rollback)
 4ff35972 perf(ds41-ttft): first token before the MTP post-init, copy index during box prefill, replay eval every 20
+
+3339e76d..2a70d1b0:
+2a70d1b0 fix(ds41-og): reaper treats a changed parent as supervisor exit (zombie supervisor left a stale worker holding gpu.lock)
+0c476bc8 docs(ds41-probe): PROBE-MERGE-READY (counters, go/no-go, identity, deploy/rollback)
+8476793c feat(ds41-probe): stats-only copy-lock pre-send probe (DS41_OG_SPEC_PROBE)
+1bc1271a perf(ds41-woa): lossless byte storage for wo_a at verify widths 2-5

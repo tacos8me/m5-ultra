@@ -201,7 +201,7 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
   <h1>DeepSeek-V4.1-Flash on a Mac and two RTX PRO 6000s</h1>
   <p class="meta"><b>DeepSeek-V4.1-Flash</b> on its original FP4/FP8 weights, served as one model across a
   <b>Mac Studio M5 Ultra</b> (256&nbsp;GB) and <b>two RTX PRO 6000 Blackwell</b> GPUs over a 10GbE cable.
-  Measured through the production API, September 27, 2026.<br>
+  Measured through the production API, September 28, 2026.<br>
   <span class="links"><a href="https://github.com/tacos8me/m5-ultra/tree/main/kernels">Code on GitHub</a> · <a href="../">All M5 Ultra results</a></span></p>
 
   <div class="figs">
@@ -286,7 +286,7 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
 
   <section class="prose">
     <h2>How it runs</h2>
-    <p>The box prefills layers 0–20 over the whole prompt and streams the state to the Mac in 8K chunks while it works.
+    <p>The box prefills layers 0–20 over the whole prompt and streams the state to the Mac in 8K chunks while it works; each chunk runs as two halves so one half's all-reduce between the GPUs overlaps the other half's compute, with byte-identical results.
     The Mac replays the last rows through layers 20–39, then each decode step crosses the link twice: draft tokens go to
     the box, which returns 41&nbsp;KB of hidden state per row. Two requests pipeline, so each machine works on one while the
     other finishes the next. From three requests up they run as fused pairs: the Mac verifies and drafts a pair in one pass,
@@ -301,7 +301,7 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
     load. Prefill at 8K–128K is the mean of three fresh prompts, longer points single runs that repeat within 1%. Decode
     samples swing about ±15% with speculative acceptance.</p>
     <p>The 3-bit baseline is the previous production build (Mac only, LSQ 3-bit experts), measured earlier with a similar
-    harness; ratios are indicative, not a controlled A/B. Box engine {S["deployment"]["box_engine"]}, numerics {S["deployment"]["numerics"]}; Mac build 3339e76d.</p>
+    harness; ratios are indicative, not a controlled A/B. Box engine {S["deployment"]["box_engine"]}, numerics {S["deployment"]["numerics"]}; Mac build 2a70d1b0.</p>
     <p>Hardware: Mac Studio M5 Ultra, 80-core GPU, 256&nbsp;GB · 2× NVIDIA RTX PRO 6000 Blackwell, 96&nbsp;GB each ·
     direct 10GbE. Model: <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">deepseek-ai/DeepSeek-V4.1-Flash</a>, original weights.</p>
   </footer>

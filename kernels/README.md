@@ -83,13 +83,13 @@ Each directory keeps its upstream license.
 
 Results: [tacos8me.github.io/m5-ultra/split](https://tacos8me.github.io/m5-ultra/split/) · design notes: [`../split/README.md`](../split/README.md).
 
-- `omlx/deepseek-v41-split.patch` (applies on top of `deepseek-v41.patch`, `ef88391e..3339e76d`, commit list in
+- `omlx/deepseek-v41-split.patch` (applies on top of `deepseek-v41.patch`, `ef88391e..2a70d1b0`, commit list in
   `omlx/COMMITS-split.txt`): the Mac half. Original-precision layers 20-39 + head + DSpark, the pipeline decode loop,
   prefix reuse, image input, verify-cost-aware draft depth, extra draft sources, and the `og_serve/` supervisor
   (OpenAI-compatible server, failover that never swaps models, parity/soak/bench harnesses). Since f56f7ffa, all
   bit-identical: incremental tokenization and faster wake/kickoff (resume), fused attention and hc kernels, fused
   MoE for up to 16 rows, fused verify and drafting for pairs of requests (4 concurrent streams), first token before the second
-  setup pass. `src/` holds the
+  setup pass, lossless byte storage for the wo_a projection. `src/` holds the
   changed files.
 - `split-nv/`: the RTX half.
   - `Dockerfile` + `sglang-dsv41-split.patch` + `flashinfer-sparse-mla-sm120.patch`: the engine image from public

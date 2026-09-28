@@ -36,7 +36,7 @@ from .mtp import DSparkMixin
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
 from . import attn_fusions, decode_fusions, decode_topk, growth, affine_gather, fast_rope, moe_decode
-from . import hc_fuse
+from . import hc_fuse, woa_compact
 
 logger = logging.getLogger(__name__)
 
@@ -666,7 +666,7 @@ class Attention(nn.Module):
                 axis=1,
             )
         elif decode_fusions.grouped_gemv_supported(grouped, weight):
-            projected = decode_fusions.grouped_gemv(grouped, weight)
+            projected = woa_compact.grouped_gemv(self.wo_a, grouped, weight)
         else:
             projected = mx.einsum("bsgd,grd->bsgr", grouped, weight)
         projected = projected.flatten(-2)

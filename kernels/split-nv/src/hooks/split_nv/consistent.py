@@ -16,7 +16,6 @@ def install():
 
     if getattr(B, '_pipe1_consistent', False):
         return
-    B._pipe1_consistent = True
 
     original_topk = B.topk_transform_paged_v2
 
@@ -47,6 +46,21 @@ def install():
     S.DeepseekV41Indexer.forward_wk = lambda self, x: linear(x, self.wk.weight).to(x.dtype)
 
     original_attention = A.flash_mla_with_kvcache_sm120
+    padded = {}
+
+    def pad(name, x, n, value):
+        # STEP widths (n <= 8): a persistent 65-row buffer per (tensor, n, shape) whose dummy rows are written once
+        # (in the eager warm-up before graph capture); each call copies only the n live rows. Rows >= n of a buffer
+        # are never written again, so the kernel sees exactly the rows torch.cat would build.
+        if n > 8:
+            return torch.cat((x, x.new_full((65 - n, *x.shape[1:]), value)))
+        key = (name, n, tuple(x.shape[1:]), x.dtype, x.device)
+        buf = padded.get(key)
+        if buf is None:
+            buf = x.new_full((65, *x.shape[1:]), value)
+            padded[key] = buf
+        buf[:n].copy_(x)
+        return buf
 
     def attention(*args, **kwargs):
         # FlashInfer switches at 64 rows from split-K decode to prefill; those
@@ -57,8 +71,7 @@ def install():
             for name in ('q', 'indices', 'topk_length', 'extra_indices_in_kvcache', 'extra_topk_length'):
                 x = kwargs.get(name)
                 if x is not None:
-                    value = -1 if 'indices' in name else 0
-                    kwargs[name] = torch.cat((x, x.new_full((65 - n, *x.shape[1:]), value)))
+                    kwargs[name] = pad(name, x, n, -1 if 'indices' in name else 0)
         out, aux = original_attention(*args, **kwargs)
         return out[:n], aux
 
@@ -75,3 +88,4 @@ def install():
         return (self.weight * x).to(dtype)
 
     S.RMSNorm.forward = rms_norm
+    B._pipe1_consistent = True  # last: a failed install must not look installed to a retry

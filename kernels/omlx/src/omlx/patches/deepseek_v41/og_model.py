@@ -39,7 +39,7 @@ import time
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import fast_encode, fe_trace, growth, og_cache, og_failover, og_fused, og_images, pipe_wire
+from . import fast_encode, fe_trace, growth, og_cache, og_failover, og_fused, og_images, pipe_wire, spec_probe, woa_compact
 from .cache import DeepseekV41Cache
 from .pipe_decoder import DecoderHalf, load_decoder
 from .pipe_session import PipelineDepthController, open_remote
@@ -53,6 +53,7 @@ STATS = dict(opened=0, open_failed=0, open_retries=0, closed=0, steps=0, box_s=0
              payload_s=0.0, single_calls=0, multi_calls=0, present_hits=0, presend_errors=0, box_lost=0,
              box_resumed=0, box_resumed_tokens=0, delta_opens=0, delta_rows=0, delta_retries=0,
              import_failed=0, import_fallbacks=0, kickoff_sent=0, kickoff_errors=0, fused_calls=0, fused_steps=0, draft_batches=0)
+spec_probe.bind(STATS)  # stats-only copy-lock pre-send probe (DS41_OG_SPEC_PROBE): spec_probe_* keys
 BOX_CACHE = os.environ.get('DS41_OG_BOX_CACHE', '1') == '1'
 STATE = os.environ.get('DS41_OG_STATE', 'lean')
 STREAM = os.environ.get('DS41_OG_STREAM', '1') == '1'
@@ -99,6 +100,14 @@ def close_session(sid):
 def close_request(request_id):
     sid = REQUESTS.pop(request_id, None)
     if sid is not None:
+        if spec_probe.ENABLED:
+            encoder = SESSIONS.get(sid)
+            if encoder is not None:
+                try:
+                    spec_probe.close(encoder, request_id)
+                except Exception:  # noqa: BLE001 -- statistics only
+                    STATS['spec_probe_errors'] += 1
+                    logger.debug('ds41-og spec probe close failed', exc_info=True)
         close_session(sid)
 
 
@@ -224,12 +233,16 @@ class OgLanguageModel(DecoderHalf):
         ids_list = [list(ids) for ids in ids_list]
         fuse = (len(caches) > 1 and all(states is not None for states in states_list)
                 and og_fused.eligible(self, [len(ids) for ids in ids_list]))
+        if spec_probe.ENABLED:
+            _probe_steps(sessions, ids_list, starts)
         try:
             for encoder, ids, start in zip(sessions, ids_list, starts):
                 STATS['present_hits'] += encoder.ensure_step_safe(ids, start)
             out, items = [], []
             for encoder, ids, start, cache, states in zip(sessions, ids_list, starts, caches, states_list):
                 raw, timing = encoder.recv_step_safe(ids, start, self._gpu_warm())
+                if spec_probe.ENABLED:
+                    spec_probe.note_recv(encoder, start, timing)
                 arrays = mlx_step(raw, len(ids))
                 if fuse:
                     # One Mac pass for all of them once every boundary is in (og_fused).
@@ -426,6 +439,7 @@ def load(path, **kwargs):
     from .tool_parser import parse_tool_call, tool_call_end, tool_call_start
 
     language_model = load_decoder(path, cls=OgLanguageModel)
+    woa_compact.install(language_model)
     tokenizer = PreTrainedTokenizerFast.from_pretrained(path)
     tokenizer.has_tool_calling = True
     tokenizer.tool_call_start = tool_call_start
@@ -728,6 +742,17 @@ def opened_step(step):
     return wrapped
 
 
+def _probe_steps(sessions, ids_list, starts):
+    """Real STEPs of a forward that presend() did not see (first step, fallback paths): resolve predictions."""
+    try:
+        c1 = len(SESSIONS) == 1
+        for encoder, ids, start in zip(sessions, ids_list, starts):
+            spec_probe.observe_step(encoder, ids, start, None, c1)
+    except Exception:  # noqa: BLE001 -- statistics only
+        STATS['spec_probe_errors'] += 1
+        logger.debug('ds41-og spec probe observe failed', exc_info=True)
+
+
 def presend(gen_batch, state):
     """After a request's accept+draft, send its next verify rows to the box at once.
 
@@ -747,8 +772,26 @@ def presend(gen_batch, state):
     if not 1 <= len(ids) <= 5:
         return
     encoder = session_of(cache)
+    keep = cache[0].size()
+    probe = spec_probe.ENABLED
+    if probe:
+        c1 = len(SESSIONS) == 1
+        try:
+            spec_probe.observe_step(encoder, ids, keep, getattr(state, "draft_source", None), c1)
+        except Exception:  # noqa: BLE001 -- statistics only
+            probe = False
+            STATS['spec_probe_errors'] += 1
+            logger.debug('ds41-og spec probe observe failed', exc_info=True)
     if encoder._pending is None:
-        encoder.send_step(ids, cache[0].size())
+        encoder.send_step(ids, keep)
+    if probe:
+        # After the send: the box computes this step meanwhile, so the prediction costs no c1 time.
+        try:
+            budget = int(gen_batch.max_tokens[0]) - int(gen_batch._num_tokens[0]) - len(state.queue) - 1
+            spec_probe.predict(encoder, state, budget, keep, ids, c1)
+        except Exception:  # noqa: BLE001 -- statistics only
+            STATS['spec_probe_errors'] += 1
+            logger.debug('ds41-og spec probe predict failed', exc_info=True)
 
 
 def install(host='10.10.10.1', port=10052):

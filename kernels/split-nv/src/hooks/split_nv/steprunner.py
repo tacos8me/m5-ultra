@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import torch
 
+from split_nv.perf_flags import flag
+
 WIDTHS = (1, 2, 3, 4, 5, 6, 8)
 WINDOW = 128
 
@@ -197,10 +199,14 @@ class StepRunner:
                                seq_lens=slot.sl, seq_lens_cpu=None, seq_lens_sum=slot.fb.seq_lens_sum, out_cache_loc=slot.ocl,
                                positions=slot.pos, spec_info=slot.spec, input_ids=slot.ids, forward_metadata_ready=False)
         model = self.mr.model
+        tm = getattr(self, "tm", None) or []
         with forward_context(ForwardContext(attn_backend=self.be)):
+            tm += ["meta", time.perf_counter()]
             self.be.init_forward_metadata_out_graph(view)
+            tm += ["engram", time.perf_counter()]
             if hasattr(model, "engram_fill_decode_pregather"):
                 model.engram_fill_decode_pregather(view)
+            tm += ["launch", time.perf_counter()]
             slot.graph.replay()
 
     def pick(self, L):
@@ -215,20 +221,26 @@ class StepRunner:
 
     def run(self, sess, keep, ids, use_graph=True):
         """Rows [keep, keep+L). Returns (capture dict for rank 0, seconds)."""
+        pc = time.perf_counter
+        tm = ["commit", pc()]
         L = len(ids)
         slot = self.pick(L)
         W = slot.W
         self.commit_pending(sess, keep)
         sess.length = keep
+        tm += ["evict", pc()]
         self.evict_swa(sess, keep)
         if keep + L > self.max_pos:
             raise ValueError(f"step rows {keep}..{keep + L} exceed the context length {self.max_pos}")
+        tm += ["alloc", pc()]
         self.ensure_alloc(sess, min(keep + W, self.mr.req_to_token_pool.req_to_token.shape[1]))
         row = sess.req.kv.req_pool_idx
         locs = self.mr.req_to_token_pool.req_to_token[row, keep:keep + W]
+        tm += ["load", pc()]
         self._load(slot, keep, ids, locs, row)
         cap = self.engine.cap
         t0 = time.perf_counter()
+        self.tm = tm
         if use_graph and slot.graph is not None:
             self.replay(slot)
             out = slot.out
@@ -241,6 +253,21 @@ class StepRunner:
                 cap.step = None
         if self.og_valid is not None:
             self.og_valid.fill_(1 << 30)  # prefill and other callers: every row is valid
+        early = cap.enabled and not self.full_outputs and flag("early_d2h", True)
+        tm += ["sync", pc()]
+        if early:
+            # The STPR payload (h19 BF16 | pre F32 | ckv20 U8 | idxk20 U8, row-major) into one pinned buffer, queued
+            # behind the graph so a single synchronize covers the step and its copies.
+            parts = [out["h"], out["pre"], out["ckv"], out["idxk"]]
+            if any(t.shape[0] < L for t in parts):
+                raise RuntimeError(f"step capture has {[tuple(t.shape) for t in parts]} for L={L}")
+            if self.host_out is None:
+                self.host_out = torch.empty(self.max_w * 41332, dtype=torch.uint8, pin_memory=True)
+            off = 0
+            for t in parts:
+                flat = t[:L].contiguous().view(torch.uint8).reshape(-1)
+                self.host_out[off:off + flat.numel()].copy_(flat, non_blocking=True)
+                off += flat.numel()
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         sess.length = keep + L
@@ -250,16 +277,20 @@ class StepRunner:
         if self.full_outputs:
             # Host copies: graph outputs alias graph-owned memory that the next replay overwrites.
             return {k: (v[:L].cpu() if torch.is_tensor(v) and v.shape[0] == W else v) for k, v in out.items()}, dt
-        # The STPR payload (h19 BF16 | pre F32 | ckv20 U8 | idxk20 U8, row-major) in one pinned buffer, one sync.
-        parts = [out["h"], out["pre"], out["ckv"], out["idxk"]]
-        if any(t.shape[0] < L for t in parts):
-            raise RuntimeError(f"step capture has {[tuple(t.shape) for t in parts]} for L={L}")
-        if self.host_out is None:
-            self.host_out = torch.empty(self.max_w * 41332, dtype=torch.uint8, pin_memory=True)
-        off = 0
-        for t in parts:
-            flat = t[:L].contiguous().view(torch.uint8).reshape(-1)
-            self.host_out[off:off + flat.numel()].copy_(flat, non_blocking=True)
-            off += flat.numel()
-        torch.cuda.current_stream().synchronize()
-        return {"payload": self.host_out[:off].numpy().tobytes(), "L": L}, dt
+        tm += ["d2h", pc()]
+        if not early:
+            parts = [out["h"], out["pre"], out["ckv"], out["idxk"]]
+            if any(t.shape[0] < L for t in parts):
+                raise RuntimeError(f"step capture has {[tuple(t.shape) for t in parts]} for L={L}")
+            if self.host_out is None:
+                self.host_out = torch.empty(self.max_w * 41332, dtype=torch.uint8, pin_memory=True)
+            off = 0
+            for t in parts:
+                flat = t[:L].contiguous().view(torch.uint8).reshape(-1)
+                self.host_out[off:off + flat.numel()].copy_(flat, non_blocking=True)
+                off += flat.numel()
+            torch.cuda.current_stream().synchronize()
+        tm += ["bytes", pc()]
+        payload = self.host_out[:off].numpy().tobytes()
+        tm += ["end", pc()]
+        return {"payload": payload, "L": L, "t": tm}, dt

@@ -117,14 +117,14 @@
   <h1>DeepSeek-V4.1-Flash on a Mac and two RTX PRO 6000s</h1>
   <p class="meta"><b>DeepSeek-V4.1-Flash</b> on its original FP4/FP8 weights, served as one model across a
   <b>Mac Studio M5 Ultra</b> (256&nbsp;GB) and <b>two RTX PRO 6000 Blackwell</b> GPUs over a 10GbE cable.
-  Measured through the production API, September 27, 2026.<br>
+  Measured through the production API, September 28, 2026.<br>
   <span class="links"><a href="https://github.com/tacos8me/m5-ultra/tree/main/kernels">Code on GitHub</a> · <a href="../">All M5 Ultra results</a></span></p>
 
   <div class="figs">
-    <div class="fig"><div class="k">128K prompt, first token</div><div class="v">7.5<small>s</small></div><div class="was">was 51.1 s</div></div>
-    <div class="fig"><div class="k">1M prompt, first token</div><div class="v">66<small>s</small></div><div class="was">was 521 s</div></div>
-    <div class="fig"><div class="k">Decode at 512K</div><div class="v">98<small>tok/s</small></div><div class="was">was 66 tok/s</div></div>
-    <div class="fig"><div class="k">Two requests at once</div><div class="v">113<small>tok/s</small></div><div class="was">was 78 tok/s</div></div>
+    <div class="fig"><div class="k">128K prompt, first token</div><div class="v">6.9<small>s</small></div><div class="was">was 51.1 s</div></div>
+    <div class="fig"><div class="k">1M prompt, first token</div><div class="v">61<small>s</small></div><div class="was">was 521 s</div></div>
+    <div class="fig"><div class="k">Decode at 512K</div><div class="v">107<small>tok/s</small></div><div class="was">was 66 tok/s</div></div>
+    <div class="fig"><div class="k">Two requests at once</div><div class="v">110<small>tok/s</small></div><div class="was">was 78 tok/s</div></div>
   </div>
 
   <section>
@@ -186,17 +186,17 @@
 <circle class="q3" cx="527.9" cy="234.9" r="2.5"/>
 <circle class="q3" cx="680.0" cy="236.0" r="2.5"/>
 <text class="lbl q3" x="688.0" y="240.0">3-bit, Mac only</text>
-<path class="ic" d="M60.9,153.4 L65.9,112.9 L75.7,88.2 L95.3,60.3 L134.7,50.6 L213.3,47.1 L370.6,52.8 L527.9,64.7 L680.0,72.2"/>
-<circle class="ic" cx="60.9" cy="153.4" r="3.5"/>
-<circle class="ic" cx="65.9" cy="112.9" r="3.5"/>
-<circle class="ic" cx="75.7" cy="88.2" r="3.5"/>
-<circle class="ic" cx="95.3" cy="60.3" r="3.5"/>
-<circle class="ic" cx="134.7" cy="50.6" r="3.5"/>
-<circle class="ic" cx="213.3" cy="47.1" r="3.5"/>
-<circle class="ic" cx="370.6" cy="52.8" r="3.5"/>
-<circle class="ic" cx="527.9" cy="64.7" r="3.5"/>
-<circle class="ic" cx="680.0" cy="72.2" r="3.5"/>
-<text class="lbl ic" x="688.0" y="76.2">Mac + RTX</text>
+<path class="ic" d="M60.9,145.4 L65.9,105.2 L75.7,66.9 L95.3,43.3 L134.7,31.3 L213.3,29.0 L370.6,34.0 L527.9,47.5 L680.0,55.9"/>
+<circle class="ic" cx="60.9" cy="145.4" r="3.5"/>
+<circle class="ic" cx="65.9" cy="105.2" r="3.5"/>
+<circle class="ic" cx="75.7" cy="66.9" r="3.5"/>
+<circle class="ic" cx="95.3" cy="43.3" r="3.5"/>
+<circle class="ic" cx="134.7" cy="31.3" r="3.5"/>
+<circle class="ic" cx="213.3" cy="29.0" r="3.5"/>
+<circle class="ic" cx="370.6" cy="34.0" r="3.5"/>
+<circle class="ic" cx="527.9" cy="47.5" r="3.5"/>
+<circle class="ic" cx="680.0" cy="55.9" r="3.5"/>
+<text class="lbl ic" x="688.0" y="59.9">Mac + RTX</text>
 </svg></div>
   </section>
 
@@ -229,18 +229,18 @@
 <circle class="q3" cx="370.6" cy="128.8" r="2.5"/>
 <circle class="q3" cx="680.0" cy="137.2" r="2.5"/>
 <text class="lbl q3" x="688.0" y="141.2">3-bit, Mac only</text>
-<path class="ic" d="M60.9,67.3 L134.7,76.0 L213.3,70.7 L370.6,64.7 L680.0,77.7"/>
-<line class="ic whisk" x1="60.9" x2="60.9" y1="86.0" y2="37.8"/>
-<circle class="ic" cx="60.9" cy="67.3" r="3.5"/>
-<line class="ic whisk" x1="134.7" x2="134.7" y1="89.0" y2="65.4"/>
-<circle class="ic" cx="134.7" cy="76.0" r="3.5"/>
-<line class="ic whisk" x1="213.3" x2="213.3" y1="92.0" y2="40.2"/>
-<circle class="ic" cx="213.3" cy="70.7" r="3.5"/>
-<line class="ic whisk" x1="370.6" x2="370.6" y1="99.6" y2="35.4"/>
-<circle class="ic" cx="370.6" cy="64.7" r="3.5"/>
-<line class="ic whisk" x1="680.0" x2="680.0" y1="109.4" y2="54.2"/>
-<circle class="ic" cx="680.0" cy="77.7" r="3.5"/>
-<text class="lbl ic" x="688.0" y="81.7">Mac + RTX</text>
+<path class="ic" d="M60.9,47.5 L134.7,47.7 L213.3,70.4 L370.6,46.2 L680.0,75.3"/>
+<line class="ic whisk" x1="60.9" x2="60.9" y1="57.4" y2="41.6"/>
+<circle class="ic" cx="60.9" cy="47.5" r="3.5"/>
+<line class="ic whisk" x1="134.7" x2="134.7" y1="66.2" y2="11.4"/>
+<circle class="ic" cx="134.7" cy="47.7" r="3.5"/>
+<line class="ic whisk" x1="213.3" x2="213.3" y1="98.8" y2="50.8"/>
+<circle class="ic" cx="213.3" cy="70.4" r="3.5"/>
+<line class="ic whisk" x1="370.6" x2="370.6" y1="79.2" y2="19.4"/>
+<circle class="ic" cx="370.6" cy="46.2" r="3.5"/>
+<line class="ic whisk" x1="680.0" x2="680.0" y1="97.2" y2="50.8"/>
+<circle class="ic" cx="680.0" cy="75.3" r="3.5"/>
+<text class="lbl ic" x="688.0" y="79.3">Mac + RTX</text>
 </svg></div>
   </section>
 
@@ -250,33 +250,33 @@
     <div class="tablewrap"><table>
       <thead><tr><th>Prompt</th><th>First token</th><th>Prefill tok/s</th><th>Speedup</th><th>Decode tok/s</th></tr></thead>
       <tbody>
-<tr><td>8K<span>8,238 tokens</span></td><td>0.93 s<span>3.29 s</span></td><td>8,883<span>2,498</span></td><td class="x">3.6×</td><td>96.4<span>71.7</span></td></tr>
-<tr><td>16K<span>16,430 tokens</span></td><td>1.34 s<span>6.38 s</span></td><td>12,261<span>2,573</span></td><td class="x">4.8×</td><td><i class="na">—</i></td></tr>
-<tr><td>32K<span>32,812 tokens</span></td><td>2.29 s<span>12.6 s</span></td><td>14,320<span>2,610</span></td><td class="x">5.5×</td><td><i class="na">—</i></td></tr>
-<tr><td>64K<span>65,581 tokens</span></td><td>3.94 s<span>25.3 s</span></td><td>16,639<span>2,591</span></td><td class="x">6.4×</td><td><i class="na">—</i></td></tr>
-<tr><td>128K<span>131,115 tokens</span></td><td>7.51 s<span>51.1 s</span></td><td>17,449<span>2,545</span></td><td class="x">6.9×</td><td>92.0<span>66.2</span></td></tr>
-<tr><td>256K<span>262,192 tokens</span></td><td>14.8 s<span>111 s</span></td><td>17,744<span>2,360</span></td><td class="x">7.5×</td><td>94.7<span>63.5</span></td></tr>
-<tr><td>512K<span>524,332 tokens</span></td><td>30.4 s<span>235 s</span></td><td>17,264<span>2,234</span></td><td class="x">7.7×</td><td>97.7<span>65.6</span></td></tr>
-<tr><td>768K<span>786,477 tokens</span></td><td>48.3 s<span>376 s</span></td><td>16,275<span>2,090</span></td><td class="x">7.8×</td><td><i class="na">—</i></td></tr>
-<tr><td>1M<span>1,040,048 tokens</span></td><td>66.5 s<span>521 s</span></td><td>15,651<span>1,998</span></td><td class="x">7.8×</td><td>91.2<span>61.4</span></td></tr>
+<tr><td>8K<span>8,237 tokens</span></td><td>0.86 s<span>3.29 s</span></td><td>9,548<span>2,498</span></td><td class="x">3.8×</td><td>106.2<span>71.7</span></td></tr>
+<tr><td>16K<span>16,427 tokens</span></td><td>1.27 s<span>6.38 s</span></td><td>12,903<span>2,573</span></td><td class="x">5.0×</td><td><i class="na">—</i></td></tr>
+<tr><td>32K<span>32,811 tokens</span></td><td>2.04 s<span>12.6 s</span></td><td>16,095<span>2,610</span></td><td class="x">6.2×</td><td><i class="na">—</i></td></tr>
+<tr><td>64K<span>65,581 tokens</span></td><td>3.63 s<span>25.3 s</span></td><td>18,062<span>2,591</span></td><td class="x">7.0×</td><td><i class="na">—</i></td></tr>
+<tr><td>128K<span>131,114 tokens</span></td><td>6.88 s<span>51.1 s</span></td><td>19,058<span>2,545</span></td><td class="x">7.5×</td><td>106.1<span>66.2</span></td></tr>
+<tr><td>256K<span>262,189 tokens</span></td><td>13.6 s<span>111 s</span></td><td>19,253<span>2,360</span></td><td class="x">8.2×</td><td>94.8<span>63.5</span></td></tr>
+<tr><td>512K<span>524,333 tokens</span></td><td>27.8 s<span>235 s</span></td><td>18,832<span>2,234</span></td><td class="x">8.4×</td><td>106.9<span>65.6</span></td></tr>
+<tr><td>768K<span>786,483 tokens</span></td><td>44.4 s<span>376 s</span></td><td>17,710<span>2,090</span></td><td class="x">8.5×</td><td><i class="na">—</i></td></tr>
+<tr><td>1M<span>1,040,045 tokens</span></td><td>61.2 s<span>521 s</span></td><td>17,005<span>1,998</span></td><td class="x">8.5×</td><td>92.3<span>61.4</span></td></tr>
       </tbody>
     </table></div>
   </section>
 
   <section class="facts">
     <div><h3>Concurrency</h3><dl>
-      <dt>2 requests, 8K</dt><dd>112.5 tok/s<span>65 each</span></dd>
-      <dt>2 requests, 128K</dt><dd>107.2 tok/s<span>64 each</span></dd>
-      <dt>4 requests, 8K</dt><dd>117.3 tok/s<span>all 4 at once, 40 each</span></dd>
+      <dt>2 requests, 8K</dt><dd>110.4 tok/s<span>64 each</span></dd>
+      <dt>2 requests, 128K</dt><dd>111.2 tok/s<span>66 each</span></dd>
+      <dt>4 requests, 8K</dt><dd>119.0 tok/s<span>all 4 at once, 41 each</span></dd>
     </dl></div>
     <div><h3>Resuming a conversation</h3><dl>
-      <dt>Turn 2 at 8K</dt><dd>0.65 s</dd>
-      <dt>Turn 2 at 128K</dt><dd>0.80 s<span>3-bit 0.85 s</span></dd>
-      <dt>Turn 2 at 512K</dt><dd>1.15 s</dd>
+      <dt>Turn 2 at 8K</dt><dd>0.58 s</dd>
+      <dt>Turn 2 at 128K</dt><dd>0.75 s<span>3-bit 0.85 s</span></dd>
+      <dt>Turn 2 at 512K</dt><dd>1.18 s</dd>
     </dl></div>
     <div><h3>Images</h3><dl>
-      <dt>1 image, first token</dt><dd>0.39 s<span>6/6 correct</span></dd>
-      <dt>2 images, first token</dt><dd>0.46 s<span>6/6 correct</span></dd>
+      <dt>1 image, first token</dt><dd>0.37 s<span>6/6 correct</span></dd>
+      <dt>2 images, first token</dt><dd>0.41 s<span>5/6 correct</span></dd>
     </dl></div>
     <div><h3>Quality, 27 cases</h3><dl>
       <dt>Code continuation NLL</dt><dd>0.058<span>3-bit 0.062</span></dd>
@@ -287,7 +287,7 @@
 
   <section class="prose">
     <h2>How it runs</h2>
-    <p>The box prefills layers 0–20 over the whole prompt and streams the state to the Mac in 8K chunks while it works.
+    <p>The box prefills layers 0–20 over the whole prompt and streams the state to the Mac in 8K chunks while it works; each chunk runs as two halves so one half's all-reduce between the GPUs overlaps the other half's compute, with byte-identical results.
     The Mac replays the last rows through layers 20–39, then each decode step crosses the link twice: draft tokens go to
     the box, which returns 41&nbsp;KB of hidden state per row. Two requests pipeline, so each machine works on one while the
     other finishes the next. From three requests up they run as fused pairs: the Mac verifies and drafts a pair in one pass,
@@ -302,7 +302,7 @@
     load. Prefill at 8K–128K is the mean of three fresh prompts, longer points single runs that repeat within 1%. Decode
     samples swing about ±15% with speculative acceptance.</p>
     <p>The 3-bit baseline is the previous production build (Mac only, LSQ 3-bit experts), measured earlier with a similar
-    harness; ratios are indicative, not a controlled A/B. Box engine 4dd01ac, numerics og-s4.4; Mac build 3339e76d.</p>
+    harness; ratios are indicative, not a controlled A/B. Box engine b4f5ea4, numerics og-s4.4; Mac build 2a70d1b0.</p>
     <p>Hardware: Mac Studio M5 Ultra, 80-core GPU, 256&nbsp;GB · 2× NVIDIA RTX PRO 6000 Blackwell, 96&nbsp;GB each ·
     direct 10GbE. Model: <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">deepseek-ai/DeepSeek-V4.1-Flash</a>, original weights.</p>
   </footer>

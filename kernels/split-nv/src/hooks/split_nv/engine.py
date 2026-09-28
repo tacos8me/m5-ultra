@@ -23,6 +23,16 @@ import torch
 
 CHUNK = 8192
 
+
+def pf_split(n):
+    """Rows of the first half when a prefill chunk of n rows runs split with overlapped all-reduces (0 = unsplit):
+    SPLIT_NV_PF_OVERLAP=1 (default off), overridable at runtime by the box-perf flag pf_overlap (read on rank 0 only;
+    the decision travels in the command)."""
+    from split_nv import pf_overlap
+    from split_nv.perf_flags import flag
+
+    return pf_overlap.split_rows(n, bool(flag("pf_overlap", pf_overlap.default_enabled())))
+
 log_lock = threading.Lock()
 
 
@@ -85,6 +95,17 @@ class Engine:
         if os.environ.get("SPLIT_NV_OG_MOE") == "1":
             from split_nv.og_moe.install import install as og_moe_install
             og_moe_install(self)
+        from split_nv.engram_prefetch import install as engram_prefetch_install
+        engram_prefetch_install(self)
+        from split_nv import ce_allreduce, pf_overlap
+        if ce_allreduce.enabled():
+            # copy-engine all-reduce for the large prefill all-reduces (collective setup: every rank, same point)
+            from sglang.srt.distributed import get_tp_group
+            ce_allreduce.setup(get_tp_group(), CHUNK * self.mr.model_config.hf_text_config.hidden_size)
+        pf_overlap.install()
+        from split_nv import q_nocopy
+        if q_nocopy.enabled():
+            q_nocopy.install()
         self.window = self.tree_cache.sliding_window_size
         from split_nv.steprunner import StepRunner
 
@@ -114,6 +135,29 @@ class Engine:
 
     @torch.no_grad()
     def _extend(self, sess, new_ids, forward=True, replace=None):
+        fb = self._prepare_extend(sess, new_ids, forward, replace)
+        if fb is not None:
+            self.mr.forward(fb)
+
+    @torch.no_grad()
+    def _extend_split(self, sess, new_ids, split, replace_fn):
+        """One chunk as two halves [0, split) and [split, n) with overlapped all-reduces (split_nv.pf_overlap);
+        the same bytes as _extend(sess, new_ids). replace_fn(start, n) -> image rows of [start, start + n)."""
+        from split_nv import pf_overlap
+
+        if not split:
+            return self._extend(sess, new_ids, replace=replace_fn(sess.length, len(new_ids)))
+        a, b = new_ids[:split], new_ids[split:]
+        fb_a = self._prepare_extend(sess, a, True, replace_fn(sess.length, len(a)))
+        # B is prepared before A has run: it must not evict A's out-of-window SWA slots (A has not written them yet).
+        # Nothing is evicted mid-chunk, exactly like the unsplit chunk: the next chunk's prepare evicts them, so SWA
+        # slot assignment -- and with it every page a prefix-cache entry gathers -- is the same as unsplit.
+        pf_overlap.run_split(self.mr, fb_a, lambda: self._prepare_extend(
+            sess, b, True, replace_fn(sess.length, len(b)), evict_swa=False), len(new_ids))
+
+    def _prepare_extend(self, sess, new_ids, forward=True, replace=None, evict_swa=True):
+        """Allocate the chunk's KV slots and build its ForwardBatch (None when forward is False). evict_swa=False
+        skips the out-of-window SWA eviction prepare_for_extend does first (the caller runs it later)."""
         from sglang.srt.managers.schedule_batch import ScheduleBatch
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -131,7 +175,12 @@ class Engine:
         batch = ScheduleBatch.init_new(reqs=[req], req_to_token_pool=mr.req_to_token_pool,
                                        token_to_kv_pool_allocator=mr.token_to_kv_pool_allocator, tree_cache=self.tree_cache,
                                        model_config=mr.model_config, enable_overlap=False, spec_algorithm=SpeculativeAlgorithm.NONE)
+        if not evict_swa:
+            batch.maybe_evict_swa = lambda: None
         batch.prepare_for_extend()
+        if not evict_swa:
+            del batch.maybe_evict_swa
+        fb = None
         if forward:
             mr.ngram_embedding_manager.prepare_for_forward(batch, chunked_req=None)
             if batch.input_ids is None and getattr(batch, "prefill_input_ids_cpu", None) is not None:
@@ -142,12 +191,14 @@ class Engine:
                 # Image rows: the model embeds the chunk's ids, then these rows overwrite their positions
                 # (model_runner's replace_embeds path). Chunks without image rows run exactly as before.
                 fb.replace_positions, fb.replace_embeds = replace
-            mr.forward(fb)
         sess.length = start + len(new_ids)
         sess.batch = batch
+        return fb
 
     # ---- commands (executed identically on every rank) --------------------------------------------------------
     def cmd_prefill(self, sid, ids, dump=True):
+        from split_nv import pf_overlap
+
         sess = Session(sid)
         sess.req = self._new_req(sid)
         self.sessions[sid] = sess
@@ -163,7 +214,9 @@ class Engine:
             t0 = time.perf_counter()
             self.cap.tokens.append(torch.tensor(chunk, dtype=torch.int64))
             self.cap.ntok += len(chunk)
-            self._extend(sess, chunk)
+            # every rank runs this command on its own: only the static env default may decide the split here
+            self._extend_split(sess, chunk, pf_overlap.split_rows(len(chunk), pf_overlap.default_enabled()),
+                               lambda a, n: None)
             torch.cuda.synchronize()
             self.cap.chunks.append((len(chunk), time.perf_counter() - t0))
             if self.cap.collect:
@@ -228,15 +281,16 @@ class Engine:
             return None
         return torch.cat(pos), torch.cat(rows)
 
-    def cmd_prefill_chunk(self, sid, chunk, grid=None):
+    def cmd_prefill_chunk(self, sid, chunk, grid=None, split=0):
         """Returns (rank 0) the packed source rows this chunk produced and its GPU seconds.
         grid = (blocks, entry key or None): save the 8K grid blocks [(bid, end)] this chunk completed, and a grid
-        entry at the chunk end (which must then lie on the grid)."""
+        entry at the chunk end (which must then lie on the grid). split > 0: run the chunk as halves [0, split) and
+        [split, n) with overlapped all-reduces (decided by rank 0, so every rank issues the same collectives)."""
         t0 = time.perf_counter()
         sess = self.sessions[sid]
         self.cap.tokens.append(torch.tensor(chunk, dtype=torch.int64))
         self.cap.ntok += len(chunk)
-        self._extend(sess, chunk, replace=self._replace_rows(sid, sess.length, len(chunk)))
+        self._extend_split(sess, chunk, split, lambda a, n: self._replace_rows(sid, a, n))
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         self.cap.chunks.append((len(chunk), dt))
@@ -341,7 +395,7 @@ class Engine:
         if kind == "prefill_begin":
             return self.cmd_prefill_begin(cmd[1])
         if kind == "prefill_chunk":
-            return self.cmd_prefill_chunk(cmd[1], cmd[2], cmd[3] if len(cmd) > 3 else None)
+            return self.cmd_prefill_chunk(cmd[1], cmd[2], cmd[3] if len(cmd) > 3 else None, cmd[4] if len(cmd) > 4 else 0)
         if kind == "prefill_end":
             return self.cmd_prefill_end(cmd[1], cmd[2])
         if kind == "restore":
@@ -384,9 +438,20 @@ class Engine:
 def rank_main(server_args, port_args, gpu_id, tp_rank, conns):
     engine = Engine(server_args, port_args, gpu_id, tp_rank)
     if tp_rank != 0:
-        # Commands arrive over a local pipe from rank 0 (~20 us vs ~0.3 ms for a gloo broadcast).
+        # Commands arrive over a local pipe from rank 0 (~20 us vs ~0.3 ms for a gloo broadcast). Within SPLIT_NV_SPIN_S
+        # of a STEP the pipe is busy-polled: a blocking recv after the ~25 ms idle of a c1 cycle wakes a cold core
+        # (~60 us) that then runs the step's host work ~3x slower, and rank 0 waits for this rank at the first reduction.
+        from split_nv.perf_flags import flag
+        spin_default = float(os.environ.get("SPLIT_NV_SPIN_S", "0.2"))
+        spin_until = 0.0
         while True:
+            if time.monotonic() < spin_until:
+                while not conns.poll() and time.monotonic() < spin_until:
+                    pass
             cmd = conns.recv()
+            if cmd[0] == "step":
+                spin_s = float(flag("r1_spin_s", spin_default))
+                spin_until = time.monotonic() + spin_s if spin_s > 0 else 0.0
             try:
                 engine.execute(cmd)
             except Exception as e:  # noqa: BLE001

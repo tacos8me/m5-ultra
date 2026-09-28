@@ -191,6 +191,47 @@ class CopyIndex:
         self.pending = (source, k)
         return self._buf[source : source + k].tolist()
 
+    def speculate(self, budget: int) -> Optional[tuple]:
+        """The next cycle's copy block if this cycle's drafts are all accepted and the source continues.
+
+        With pending = (source, k) from the last propose(), assumes observe(k) and a bonus equal to the
+        token after the copied span, then runs the real append + propose on that hypothetical tail.
+        Returns (bonus, drafts) or None (no copy proposal would follow). Every field of the index is
+        restored before returning, so the served draft sequence is unchanged (spec-probe statistics).
+        """
+        if self.pending is None:
+            return None
+        source, k = self.pending
+        n = self.n
+        # The stream as if all k drafts were accepted: buf[:n] + buf[source:source + k], then the bonus.
+        end = source + k
+        bonus = int(self._buf[end] if end < n else self._buf[source + end - n])
+        extra = self._buf[source:end].tolist() + [bonus]
+        m = len(extra)
+        if n + m > len(self._buf):
+            return None  # append would reallocate; skip rather than copy the buffer
+        saved = (self.cur, self.min_match, self.expected, self.pending)
+        tail = self._buf[n : n + m].copy()
+        appended = False
+        try:
+            self.observe(k)
+            self.append(extra)
+            appended = True
+            drafts = self.propose(budget - m)
+        finally:
+            if appended:
+                for p in range(n + m - 1, n - 1, -1):
+                    if p + 1 >= NGRAM:
+                        key = _hash(self._buf[p + 1 - NGRAM : p + 1])
+                        items = self._extra[key]
+                        items.pop()
+                        if not items:
+                            del self._extra[key]
+            self._buf[n : n + m] = tail
+            self.n = n
+            self.cur, self.min_match, self.expected, self.pending = saved
+        return None if not drafts else (bonus, drafts)
+
     def observe(self, accepted: int) -> None:
         if self.pending is None:
             return

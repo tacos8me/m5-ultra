@@ -903,7 +903,9 @@ def alive(pid):
 def reap(supervisor, child):
     """Exit with the child; TERM (then KILL) it if the supervisor vanishes first."""
     while alive(child):
-        if not alive(supervisor):
+        # The reaper is the supervisor's child: a changed parent means the supervisor is gone even if its pid
+        # still answers kill(0) (a zombie not yet reaped by llama-swap), which once left a stale worker holding gpu.lock.
+        if os.getppid() != supervisor or not alive(supervisor):
             os.kill(child, 15)
             for _ in range(240):
                 if not alive(child):

@@ -85,6 +85,8 @@ load('fast_encode')
 wire = load('pipe_wire')
 failover = load('og_failover')
 load('og_images')
+load('spec_probe')
+stub('ogtest.woa_compact', install=lambda *a, **k: None)
 og = load('og_model')
 
 

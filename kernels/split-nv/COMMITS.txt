@@ -60,6 +60,19 @@ c75a0a2 fix(split-nv): og_valid set after StepRunner's local os import
 1954bf6 feat(split-nv): run from the public-parts image; prefix cache 96 GiB with an NVMe mirror restored after reboot
 9947c60 chore(split-nv): gate references, deploy logs and traces live on local NVMe
 4dd01ac perf(split-nv): prefill indexer logits budget 256 -> 1024 MB (1M box prefill 75.4 -> 63.5 s, byte-identical)
+e8a38a7 perf(split-nv): STEP runs inline on its connection thread with a busy-wait for the next frame while one session decodes; rank 1 busy-polls its pipe; payload D2H queued before the single sync
+7a3ab72 perf(split-nv): persistent 65-row attention padding buffers for STEP widths (copy the live rows only)
+4d0e119 perf(split-nv): runtime box-perf switches (SPLIT_NV_DIR/box-perf-flags.json), per-phase STEP host timings in the step log, optional prefill engram gather prefetch on a side stream (off by default)
+1989fb5 tools(box-perf): nsys profiling entry/window, traffic driver, trace analysis, in-window A/B and NCCL protocol bench
+50a9598 test(review): og_moe self-review verification tooling (variants, A/B bench, reachability checks)
+64c5a5b fix(split-nv): consistent.install sets its idempotence flag after patching (a failed install no longer looks installed to a retry)
+2a7a3c4 feat(split-nv): split-chunk prefill with overlapped TP all-reduces behind SPLIT_NV_PF_OVERLAP (default off)
+38466ac feat(split-nv): copy-engine TP2 all-reduce for large prefill all-reduces (SPLIT_NV_CE_AR, default off); q written in place for prefill (SPLIT_NV_Q_NOCOPY, default off)
+2e92971 chore(split-nv): run_engine.sh passes SPLIT_NV_PF_OVERLAP / SPLIT_NV_CE_AR / SPLIT_NV_Q_NOCOPY (default 0); /health reports them
+e18719e fix(split-nv): copy-engine all-reduce uses a pull protocol (remote reads of owner-completed data only); overlapped chunks use NCCL unless SPLIT_NV_CE_AR_IN_OVERLAP=1; B's per-chunk metadata released after the chunk
+cd54129 test(prefill-perf): time mode ovl_q plan, clean 8K/6K timings; task A variants measured
+3c631c2 fix(split-nv): overlapped halves keep their own capture mode and forward flags across hand-overs
+b4f5ea4 fix(split-nv): overlapped chunks evict out-of-window SWA slots on the unsplit schedule (at the next chunk's prepare)
 
 sglang (757e8f3..a618602):
 fca050c feat(split-nv): optional prompt-state capture hooks for encoder prefill
