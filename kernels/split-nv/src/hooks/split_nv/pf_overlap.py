@@ -69,6 +69,7 @@ class _Run:
         self.globals = {}  # half -> its process-global per-forward state, saved at every hand-over (_save_globals)
         self.error = None
         self.n_async = 0
+        self.inflight = {}  # half -> its all-reduce in flight while the other half runs (NCCL work or CE event)
 
     def other(self, me):
         return "B" if me == "A" else "A"
@@ -136,6 +137,19 @@ def _restore_globals(saved):
     fw.update(plain)
 
 
+def fence():
+    """Make the current stream wait for every all-reduce an overlapped chunk has in flight (split_nv.preempt: a step
+    enqueued between two layers then starts after them; no two collectives run concurrently)."""
+    run = _state
+    if run is None:
+        return
+    for w in list(run.inflight.values()):
+        if isinstance(w, torch.cuda.Event):
+            torch.cuda.current_stream().wait_event(w)
+        else:
+            w.wait()
+
+
 def _half(run):
     return None if run is None else run.halves.get(threading.get_ident())
 
@@ -170,8 +184,10 @@ def install():
             ref = input_.clone() if _VERIFY is not None else None
             done = ce.all_reduce_async(input_)
             run.n_async += 1
+            run.inflight[me] = done
             run.switch(me)
             torch.cuda.current_stream().wait_event(done)
+            run.inflight.pop(me, None)
             if ref is not None:  # diagnostics: the same sum by NCCL, compared on the GPU (no host sync)
                 torch.distributed.all_reduce(ref, group=self.device_group)
                 v = ref.view(ref.shape[0], -1) if ref.dim() > 1 else ref.view(1, -1)
@@ -191,8 +207,10 @@ def install():
         # The same collective the original issues (torch.distributed.all_reduce on this group), asynchronously.
         work = torch.distributed.all_reduce(input_, group=self.device_group, async_op=True)
         run.n_async += 1
+        run.inflight[me] = work
         run.switch(me)
         work.wait()  # the compute stream waits for NCCL's stream
+        run.inflight.pop(me, None)
 
     GroupCoordinator._all_reduce_in_place = all_reduce_in_place
 
@@ -292,4 +310,4 @@ def run_split(mr, fb_a, prepare_b, max_rows):
     return run.n_async
 
 
-__all__ = ["split_rows", "default_enabled", "run_split", "install", "MIN_ROWS"]
+__all__ = ["split_rows", "default_enabled", "run_split", "install", "fence", "MIN_ROWS"]

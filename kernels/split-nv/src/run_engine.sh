@@ -26,13 +26,16 @@ else
   SGLANG_MOUNT=(); SGLANG_VERSION=$IMAGE
 fi
 mkdir -p /dev/shm/split-nv
+# PyTorch caching-allocator options for memory windows only (e.g. garbage_collection_threshold:0.9 together with
+# SPLIT_NV_MEM_FRACTION). Never expandable_segments: the step graphs' custom all-reduce needs IPC-able segments.
+ALLOC_CONF=(); [ -n "${SPLIT_NV_ALLOC_CONF:-}" ] && ALLOC_CONF=(-e PYTORCH_CUDA_ALLOC_CONF="$SPLIT_NV_ALLOC_CONF")
 exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime nvidia --ipc=host --network host \
   --stop-timeout 60 --shm-size 64g --ulimit memlock=-1 --ulimit stack=67108864 \
   -e CUDA_VISIBLE_DEVICES=0,1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e HF_HUB_OFFLINE=1 \
   -e SGLANG_SM120_FLASHMLA_BACKEND=flashinfer -e SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0 \
   -e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 -e SGLANG_DSV41_ENGRAM_HOST_TABLE_DIR=/engram \
   -e SGLANG_DSV41_ENGRAM_PINNED="$ENGRAM_PINNED" -e SGLANG_DSV41_ENGRAM_PREWARM=1 \
-  -e SGLANG_DSV41_INDEXER_LOGITS_BUDGET_MB=1024 -e SGLANG_OPT_USE_TOPK_V2=1 \
+  -e SGLANG_DSV41_INDEXER_LOGITS_BUDGET_MB="${SPLIT_NV_IDX_BUDGET_MB:-1024}" -e SGLANG_OPT_USE_TOPK_V2=1 \
   -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/home/ian/split-nv/hooks \
   -e SPLIT_NV_HOOKS=1 -e SPLIT_NV_CONFIG=/home/ian/split-nv/$MODEL/config.json \
   -e SPLIT_NV_DIR=/dev/shm/split-nv -e SPLIT_NV_MAX_TOKENS=1056768 -e SPLIT_NV_STEP_LOG="${SPLIT_NV_STEP_LOG:-}" \
@@ -43,6 +46,11 @@ exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime 
   -e SPLIT_NV_OG_MOE="${SPLIT_NV_OG_MOE-1}" -e SPLIT_NV_SPIN_S="${SPLIT_NV_SPIN_S-0.2}" \
   -e SPLIT_NV_PF_OVERLAP="${SPLIT_NV_PF_OVERLAP-0}" -e SPLIT_NV_CE_AR="${SPLIT_NV_CE_AR-0}" -e SPLIT_NV_Q_NOCOPY="${SPLIT_NV_Q_NOCOPY-0}" \
   -e SPLIT_NV_TOPK_DET="${SPLIT_NV_TOPK_DET-1}" -e SPLIT_NV_TOPK_AUDIT="${SPLIT_NV_TOPK_AUDIT:-}" \
+  -e SPLIT_NV_PREEMPT="${SPLIT_NV_PREEMPT-0}" -e SPLIT_NV_PREEMPT_LAG="${SPLIT_NV_PREEMPT_LAG-2}" -e SPLIT_NV_PREEMPT_SHARE="${SPLIT_NV_PREEMPT_SHARE-0.5}" \
+  -e SPLIT_NV_BYPASS_TOKENS="${SPLIT_NV_BYPASS_TOKENS-0}" -e SPLIT_NV_BYPASS_SHARE="${SPLIT_NV_BYPASS_SHARE-0.5}" \
+  -e SPLIT_NV_SHARE_CHUNK="${SPLIT_NV_SHARE_CHUNK-2048}" -e SPLIT_NV_TRIM_MIN_TOKENS="${SPLIT_NV_TRIM_MIN_TOKENS-0}" \
+  -e SPLIT_NV_IDX_LOWMEM="${SPLIT_NV_IDX_LOWMEM-0}" -e SPLIT_NV_MEMLOG="${SPLIT_NV_MEMLOG:-}" -e SPLIT_NV_MEMHIST="${SPLIT_NV_MEMHIST:-}" \
+  -e SPLIT_NV_MEM_FRACTION="${SPLIT_NV_MEM_FRACTION:-}" "${ALLOC_CONF[@]}" \
   -v "$ROOT":/home/ian/split-nv:ro \
   -v /home/ian/models/DeepSeek-V4.1-Flash-original:/home/ian/models/DeepSeek-V4.1-Flash-original:ro \
   "${SGLANG_MOUNT[@]}" \

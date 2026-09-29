@@ -85,6 +85,11 @@ READY_S = float(os.environ.get('DS41_OG_READY_S', '900'))
 FAILOVER_S = float(os.environ.get('DS41_OG_FAILOVER_S', '900'))
 MAX_RESUMES = int(os.environ.get('DS41_OG_MAX_RESUMES', '2'))
 KEEPALIVE_S = float(os.environ.get('DS41_OG_KEEPALIVE_S', '5'))
+# og only (DS41_OG_Q3=off): a worker that exits on its own (crash, 245 GiB guard, failed warm-up) is restarted in the
+# background once the box answers, instead of by the next request (which then waited out the whole load + warm-up,
+# ~30 s, with no response bytes). Attempts are at least this far apart.
+RESTART_BACKOFF_S = float(os.environ.get('DS41_OG_WORKER_RESTART_S', '60'))  # 0 = off
+PORT_WAIT_S = float(os.environ.get('DS41_OG_PORT_WAIT_S', '180'))
 # Each child takes gpu.lock through gpu-exec. A test harness that already holds the lock for its
 # whole lease sets DS41_OG_GPU_EXEC='' so no other job can take the GPU between two children.
 GPU_EXEC = os.environ.get('DS41_OG_GPU_EXEC', str(HOME/'llm/bin/gpu-exec'))
@@ -95,6 +100,7 @@ RESUMABLE = ('/v1/chat/completions', '/v1/completions')
 DROP = {'host', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'accept-encoding',
         'content-encoding'}
 MARK = 'ds41-og-resume:'
+GONE = object()  # watched(): the client disconnected first
 DONE = b'data: [DONE]\n\n'
 # DS41_FE_TRACE=1: one "ds41-fe sup" log line per inference request with wall-clock stamps
 # (recv, body, parsed, sent, headers, first_content, end), comparable with the worker's trace.
@@ -137,6 +143,15 @@ def box_state(timeout=0.5):
         return 'refused'
     except OSError:
         return 'down'
+
+
+def listening(port):
+    """Something accepts connections on 127.0.0.1:port."""
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=0.5):
+            return True
+    except OSError:
+        return False
 
 
 def child_spec(mode):
@@ -440,10 +455,35 @@ class Supervisor:
         self.vision_waiting = 0
         self.stats = dict(og=0, q3=0, failovers=0, switches=0, box_lost=0, resumed=0, resume_failed=0,
                           vision=0, vision_rejected=0,
-                          broken=0, divergent=0)
+                          broken=0, divergent=0, worker_exits=0, worker_restarts=0, client_gone=0)
+        self.exit_code = None
+        self.restarting = None
+        self.restart_after = 0.0
+        self.dead_pid = None
+
+    async def port_free(self, port, limit):
+        """Wait until nothing listens on the child's fixed port. A previous supervisor's child (llama-swap reload,
+        restart) can still be draining there; its /health answered this supervisor's readiness poll, which then
+        reported "ready" in ms and sent requests to a port that closed a second later (ConnectError -> 503s for the
+        whole reload)."""
+        deadline = time.monotonic() + limit
+        waited = False
+        while time.monotonic() < deadline:
+            busy = await asyncio.get_running_loop().run_in_executor(None, listening, port)
+            if not busy:
+                if waited:
+                    LOG.warning('port %d is free now; starting the child', port)
+                return True
+            if not waited:
+                LOG.warning('port %d still has a listener (a previous child draining?); waiting for it', port)
+                waited = True
+            await asyncio.sleep(0.5)
+        LOG.error('port %d still busy after %.0fs; starting anyway', port, limit)
+        return False
 
     async def start(self, mode):
         argv, env, port, model_id = child_spec(mode)
+        await self.port_free(port, PORT_WAIT_S)
         LOGS.mkdir(parents=True, exist_ok=True)
         log = (LOGS/f'{mode}-child.log').open('a')
         log.write(f'\n=== {time.strftime("%F %T")} start {mode}: {" ".join(argv)}\n'); log.flush()
@@ -518,13 +558,42 @@ class Supervisor:
         # CPU-only probe; the recovery clock runs even while no request arrives.
         while True:
             await self.probe()
+            self.check_worker()
             await asyncio.sleep(2)
+
+    def check_worker(self):
+        """og only: notice a worker that exited on its own and restart it in the background (box up, backoff)."""
+        proc = self.proc
+        if Q3 or RESTART_BACKOFF_S <= 0 or proc is None or self.mode != 'og' or proc.poll() is None:
+            return
+        if self.dead_pid != proc.pid:
+            self.dead_pid, self.exit_code = proc.pid, proc.returncode
+            self.stats['worker_exits'] += 1
+            LOG.error('og worker pid %d exited with %s', proc.pid, proc.returncode)
+        if (self.restarting is not None and not self.restarting.done()) or self.switch.locked():
+            return
+        if time.monotonic() < self.restart_after or not self.box_ok():
+            return
+        self.restart_after = time.monotonic() + RESTART_BACKOFF_S
+        self.restarting = asyncio.ensure_future(self.restart_worker())
+
+    async def restart_worker(self):
+        LOG.warning('restarting the og worker')
+        try:
+            await self.ensure()
+        except Exception as exc:  # noqa: BLE001 -- retried after the backoff (or by the next request)
+            LOG.error('og worker restart failed: %r', exc)
+            return
+        if self.proc is not None and self.proc.poll() is None:
+            self.stats['worker_restarts'] += 1
 
     def want(self, vision=False):
         """The child the next request needs, or None when the current one can serve it now."""
         alive = self.proc is not None and self.proc.poll() is None
         if not Q3:
-            return None if alive and self.mode == 'og' else 'og'
+            # A child that is alive but still loading (a background restart) is waited for under the switch lock
+            # instead of being sent requests that its closed port refuses (503 "no backend").
+            return None if alive and self.mode == 'og' and self.ready else 'og'
         if vision or self.vision_waiting or (self.vision_at is not None
                                              and time.monotonic() - self.vision_at < RECOVER_S):
             # Images (and text while an image request is active or recent) go to q3.
@@ -649,7 +718,7 @@ class Supervisor:
             out_headers['x-ds41-og-backend'] = mode
             return StreamingResponse(self.splice(upstream, request.method, path, query, headers, data),
                                      status_code=200, headers=out_headers)
-        return await self.complete(request.method, path, query, headers, data, body)
+        return await self.complete(request.method, path, query, headers, data, body, client=request)
 
     async def forward_images_og(self, method, path, query, headers, data, body):
         """Image request on the og worker (the box runs the vision tower); never on q3."""
@@ -841,22 +910,51 @@ class Supervisor:
         upstream, _ = task.result()
         asyncio.ensure_future(self.release(upstream))
 
-    async def complete(self, method, path, query, headers, data, body=b''):
+    async def watched(self, aw, client):
+        """Await `aw`, or GONE (cancelling it) once a non-streaming client has disconnected. Without this, a
+        request whose client gave up kept generating up to max_tokens and held a worker slot and a box session:
+        the worker only aborts when its own connection (this upstream) closes, and a non-streaming reply sends
+        no bytes (not even headers) until it is done."""
+        if client is None:
+            return await aw
+        task = asyncio.ensure_future(aw)
+        try:
+            while True:
+                done, _ = await asyncio.wait({task}, timeout=1.0)
+                if done:
+                    return task.result()
+                if await client.is_disconnected():
+                    self.stats['client_gone'] += 1
+                    LOG.info('client gone during a non-streaming request; cancelling it upstream')
+                    return GONE
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.wait({task})
+
+    async def complete(self, method, path, query, headers, data, body=b'', client=None):
         """Non-streaming chat/text completion with the same failover (nothing sent yet)."""
         started, resumes, resume = time.monotonic(), 0, None
         while True:
             try:
-                upstream, mode = await self.open(method, path, query, headers, data, body, resume=resume)
+                # Backend selection (a worker start included) runs to completion even if the client leaves.
+                await self.ensure()
+                opened = await self.watched(self.open(method, path, query, headers, data, body, resume=resume), client)
             except (OSError, RuntimeError, httpx.HTTPError) as exc:
                 LOG.exception('no backend for a completion')
                 return self.error_response(f'no backend: {type(exc).__name__}')
+            if opened is GONE:
+                return Response(status_code=499)
+            upstream, mode = opened
             try:
-                raw = await upstream.aread()
+                raw = await self.watched(upstream.aread(), client)
             except httpx.HTTPError as exc:
                 self.stats['broken'] += 1
                 return self.error_response(type(exc).__name__)
             finally:
                 await self.release(upstream)
+            if raw is GONE:
+                return Response(status_code=499)
             info = None
             if upstream.status_code >= 500:
                 with contextlib.suppress(ValueError):
@@ -947,6 +1045,9 @@ def main():
         return JSONResponse(dict(status='ok' if ok else 'degraded' if degraded else 'starting', backend=sup.mode,
                                  inflight=sup.inflight,
                                  pid=sup.proc.pid if sup.proc is not None else None,
+                                 worker_alive=sup.proc is not None and sup.proc.poll() is None,
+                                 worker_exit_code=sup.exit_code,
+                                 worker_restarting=sup.restarting is not None and not sup.restarting.done(),
                                  box_up=sup.box_since is not None, box_trusted=sup.box_ok(),
                                  box_restarting=sup.box_restarting(), q3_enabled=Q3, **sup.stats),
                             status_code=200 if ok or degraded else 503)

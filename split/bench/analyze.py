@@ -172,7 +172,7 @@ f = lambda a, k='mean', d=1: '-' if not a else (f"{a[k]:,.{d}f}")
 rng = lambda a, d=1: '-' if not a else f"{a['min']:,.{d}f}-{a['max']:,.{d}f}"
 M = []
 M.append('# Mac + RTX split benchmark: DeepSeek-V4.1-Flash ORIGINAL FP4/FP8, RTX PRO 6000 pair (layers 0-19) + M5 Ultra (layers 20-39 + head + DSpark)\n')
-M.append(f"Run 2026-09-27, box engine {S['deployment']['box_engine']}, numerics {S['deployment']['numerics']}, served by llama-swap as `ds41`. "
+M.append(f"Run 2026-09-29, box engine {S['deployment']['box_engine']}, numerics {S['deployment']['numerics']}, served by llama-swap as `ds41`. "
          'All numbers are through the production OpenAI chat-completions API (streaming, temperature 0), client on the Mac (localhost:8080), warm server '
          '(warm-up request discarded at the start of every leg). Fresh prompts start with a unique nonce; box log confirms `resumed 0` for every fresh prompt. '
          f"Contention: {S['contention']['foreign_requests_total']} foreign requests and {S['contention']['box_sessions_nonzero_before_request']} non-idle starts across {S['contention']['requests_checked']} measured requests.\n")

@@ -5,6 +5,7 @@ Run: python og_serve/test_wire_failover.py   (no MLX, no GPU, no real box)
 import importlib.util
 import os
 from pathlib import Path
+import socket
 import struct
 import sys
 import threading
@@ -150,6 +151,59 @@ def main():
         b.step([60], 23)
         assert a.enc.recoveries and not b.enc.recoveries
 
+    def refused_step_is_bounded():
+        # A STEP the box refuses deterministically (ERR retry:false, e.g. context length exceeded) used to be
+        # rebuilt and resent forever on the engine thread (every rebuild succeeds, the step fails again).
+        c = Client(prompt)
+        c.step([prompt[-1], 5], 39)
+        box.err_steps = True
+        result = {}
+
+        def run():
+            try:
+                c.step([5, 6], 40)
+                result['ok'] = True
+            except wire.BoxLost as exc:
+                result['lost'] = exc
+            except Exception as exc:  # noqa: BLE001
+                result['other'] = exc
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(8)
+        box.err_steps = False
+        assert not t.is_alive(), 'recv_step_safe is still rebuilding a refused step (endless loop)'
+        assert 'lost' in result, result
+        refused = [e for e in box.log if e[0] == 'step_refused']
+        assert len(refused) == wire.RESUME_TRIES + 1, refused
+
+    def keepalive_on():
+        c = Client(prompt)
+        assert c.enc.sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE)
+        c.enc.close()
+
+    def interrupt_wakes_open():
+        box.open_delay = 5
+        enc = wire.EncoderSession('127.0.0.1', PORT)
+        err = {}
+
+        def run():
+            try:
+                enc.open(prompt)
+            except Exception as exc:  # noqa: BLE001
+                err['e'] = exc
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        time.sleep(0.5)
+        t0 = time.monotonic()
+        enc.interrupt()
+        t.join(3)
+        box.open_delay = 0
+        assert not t.is_alive() and 'e' in err, 'interrupt() did not wake the blocked OPEN'
+        assert time.monotonic() - t0 < 1.5
+        time.sleep(0.3)
+        assert any(e[0] == 'open_aborted' for e in box.log), 'the box did not see the OPEN go away'
+        enc.close()
+
     ok = all([case('normal steps and rollback', normal),
               case('connection killed with a step in flight', killed_mid_step),
               case('stale pre-sent step on a dead link', stale_presend_on_dead_link),
@@ -157,7 +211,10 @@ def main():
               case('box down past the wait -> BoxLost', down_past_wait),
               case('box refuses reopen -> BoxLost after tries', refusing_box),
               case('busy box (retryable ERR) is waited for', busy_box_waits),
-              case('c2: one session lost, the other untouched', two_sessions_one_lost)])
+              case('c2: one session lost, the other untouched', two_sessions_one_lost),
+              case('box refuses the STEP itself -> BoxLost after RESUME_TRIES rebuilds', refused_step_is_bounded),
+              case('step sockets use TCP keepalive', keepalive_on),
+              case('interrupt() wakes an OPEN blocked on a long box prefill', interrupt_wakes_open)])
     box.down()
     print('ALL PASS' if ok else 'SOME FAILED')
     sys.exit(0 if ok else 1)

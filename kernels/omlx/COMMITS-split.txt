@@ -1,7 +1,7 @@
 Applies on top of deepseek-v41.patch (head ef88391e):
 base: ef88391e
-head: b16205ac (branch ds41-next2, served as llama-swap ds41; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
-      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe, then ds41-ffn + ds41-ttft2 merged as ds41-next2)
+head: 0bda9fc4 (branch ds41-next3, served as llama-swap ds41; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
+      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe, then ds41-ffn + ds41-ttft2 merged as ds41-next2, then ds41-robust + ds41-c4 merged as ds41-next3)
 
 5b17cbbc perf: keep DeepSeek V4.1 decode KV growth in place across extract and rollback
 88cfffd9 perf: score DeepSeek V4.1 decode index keys in one lazy tile
@@ -103,3 +103,14 @@ f54d9810 test(ds41-ffn): bitwise unit tests for ffn_fuse/attn_in; keep Attention
 18a120a4 perf(ds41-ffn): recalibrated depth-controller C(L) + fused-pair (c3+) table
 bc3d7087 perf(ds41-ffn): attention input pre-norm + FP8 + wq_a/wkv in two launches (bitwise)
 c2274ebd perf(ds41-ffn): fused FFN sublayer for decode/verify rows (bitwise)
+
+b16205ac..0bda9fc4 (no merges):
+0bda9fc4 fault_soak: phase F passes on a clean finish once max_tokens was clamped (model may stop before the clamp)
+52a616f8 test(preopen): FakeJob carries cancel_event like og_model.Job after the cancellation fixes
+0669f3fc docs(ds41-c4): C4-ANALYSIS (c4 pass breakdown, shortfall root cause, fixes, A/B plan)
+40f24863 bench(ds41-c4): cold-shape probe, per-step fused trace, c4 A/B client
+c5d530c7 perf(ds41-c4): warm the fused-pair verify shapes at worker start
+9fe97a71 perf(ds41-c4): chained box OPENs for queued requests (burst admission)
+6a581b50 robust: fault-injection soak driver for a maintenance window (not run)
+6d2fffae robust: bounded step rebuilds, context clamp, cancellable OPEN, worker restart, client-gone cancel
+71e7bc52 Avoid import token lists and honour cancellation during box open

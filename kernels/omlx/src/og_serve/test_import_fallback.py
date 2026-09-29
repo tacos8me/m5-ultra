@@ -122,9 +122,10 @@ class LM:
 
 
 class Request:
-    def __init__(self, rid, tokens):
+    def __init__(self, rid, tokens, max_tokens=32768):
         self.request_id, self.prompt_token_ids, self.num_prompt_tokens = rid, tokens, len(tokens)
         self.vlm_inputs_embeds = None
+        self.sampling_params = types.SimpleNamespace(max_tokens=max_tokens)
 
 
 class Sched:
@@ -208,6 +209,45 @@ def main():
     results.append(check('box refuses the retry OPEN -> clean failure with marker, no local prefill',
                          ok is False and getattr(req2, '_ds41_og_failed', None)
                          and failover.RESUMABLE.get('r-refused', {}).get('kind') == 'box', (ok, lm.calls)))
+    # Context budget: prompt + output + one verify step must fit the box context (STEP past it is refused).
+    og.BOX_CONTEXT = 100
+    shared = types.SimpleNamespace(max_tokens=32768)
+    req3 = Request('r-clamp', list(range(100, 140)))
+    req3.sampling_params = shared
+    manager3 = og.OgPrefill('127.0.0.1', PORT)
+    manager3.should_defer(Sched(LM()), req3)
+    manager3.jobs['r-clamp'].join(10)
+    results.append(check('max_tokens clamped to the box context (100 - 40 - 8 = 52), shared params untouched',
+                         req3.sampling_params.max_tokens == 52 and shared.max_tokens == 32768, req3.sampling_params))
+    req4 = Request('r-small', list(range(100, 140)), max_tokens=10)
+    manager3.should_defer(Sched(LM()), req4)
+    manager3.jobs['r-small'].join(10)
+    results.append(check('a max_tokens that fits is left alone', req4.sampling_params.max_tokens == 10))
+    req5 = Request('r-long', list(range(100, 193)))  # 93 > 100 - 8 - 1
+    deferred = manager3.should_defer(Sched(LM()), req5)
+    results.append(check('prompt with no room for a step -> clean invalid failure, no box OPEN',
+                         deferred and 'r-long' not in manager3.jobs and failover._failed_opens.get('r-long', ('',))[0] == 'invalid',
+                         failover._failed_opens.get('r-long')))
+    og.BOX_CONTEXT = 1048576
+    for rid in ('r-clamp', 'r-small'):
+        manager3.abort(rid)
+
+    # Cancel during a long box prefill: the OPEN is cut at once and the box sees the connection go.
+    box.open_delay = 10
+    req6 = Request('r-cancel', list(range(100, 140)))
+    manager3.should_defer(Sched(LM()), req6)
+    job = manager3.jobs['r-cancel']
+    import time as _time
+    _time.sleep(0.5)
+    t0 = _time.monotonic()
+    manager3.abort('r-cancel')
+    job.done.wait(3)
+    took = _time.monotonic() - t0
+    _time.sleep(0.3)
+    box.open_delay = 0
+    results.append(check('abort during a box OPEN interrupts it (job done in < 1.5 s, box saw it go)',
+                         job.done.is_set() and took < 1.5 and any(e[0] == 'open_aborted' for e in box.log)
+                         and og.STATS.get('open_cancelled') == 1, (took, box.log[-3:], og.STATS.get('open_cancelled'))))
     box.down()
     ok = all(results)
     print('ALL PASS' if ok else 'SOME FAILED', f'({sum(results)}/{len(results)})')

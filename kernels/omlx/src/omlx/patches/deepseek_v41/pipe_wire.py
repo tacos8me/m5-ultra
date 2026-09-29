@@ -72,6 +72,26 @@ def refused(tag, header, what):
     return RuntimeError(f'{what} refused: {str(header)[:200]}')
 
 
+TCP_KEEPALIVE_S = int(os.environ.get('DS41_OG_TCP_KEEPALIVE_S', '20'))  # not DS41_OG_KEEPALIVE_S (the supervisor's SSE interval)
+
+
+def keepalive(sock):
+    """TCP keepalive: a box that vanished without a FIN (link down, host hung) is noticed while this side only
+    waits (a queued OPEN is quiet for minutes) after ~TCP_KEEPALIVE_S + 4 x 5 s, not at the 600 s OPEN timeout.
+    Probes are answered by the peer's kernel, so a slow but alive box is never cut. 0 = off."""
+    if TCP_KEEPALIVE_S <= 0:
+        return
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        idle = getattr(socket, 'TCP_KEEPIDLE', None) or getattr(socket, 'TCP_KEEPALIVE', None)
+        for opt, value in ((idle, TCP_KEEPALIVE_S), (getattr(socket, 'TCP_KEEPINTVL', None), 5),
+                           (getattr(socket, 'TCP_KEEPCNT', None), 4)):
+            if opt is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, value)
+    except OSError:
+        pass
+
+
 def receive(sock, size):
     buf = bytearray(size)
     view = memoryview(buf)
@@ -116,7 +136,18 @@ class EncoderSession:
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         if RCVBUF:
             self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, RCVBUF)
+        keepalive(self.sock)
         self.sock.settimeout(timeout)
+
+    def interrupt(self):
+        """Wake a thread blocked on this session's socket (an OPEN of a cancelled request): its read fails
+        at once and the box, seeing the connection go, stops streaming (and prefilling) within a chunk."""
+        sock = self.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
     def close(self):
         if self.sock is not None:
@@ -364,16 +395,24 @@ class EncoderSession:
             return False
 
     def recv_step_safe(self, tokens, keep, idle=None):
-        """recv_step() for STEP(tokens, keep) that rebuilds a lost session and resends the step."""
-        since = None
+        """recv_step() for STEP(tokens, keep) that rebuilds a lost session and resends the step.
+
+        A step the box keeps refusing on freshly rebuilt sessions (e.g. ERR "context length exceeded") is
+        deterministic, not a lost link: after RESUME_TRIES rebuilds it raises BoxLost instead of rebuilding
+        (a box re-prefill each time) forever on the engine thread."""
+        since, rebuilds = None, 0
         while True:
             try:
                 return self.recv_step(idle)
             except (OSError, RuntimeError, ValueError, struct.error, TypeError) as exc:
                 if isinstance(exc, BoxLost):
                     raise
+                if rebuilds >= RESUME_TRIES:
+                    self._drop()
+                    raise BoxLost(f'box refused STEP at {keep} tokens after {rebuilds} rebuilt sessions: {exc!r}'[:300]) from exc
                 since = since or time.monotonic()
                 self.recover(tokens, keep, exc, since)
+                rebuilds += 1
 
 
 def parse_state_blob(blob):

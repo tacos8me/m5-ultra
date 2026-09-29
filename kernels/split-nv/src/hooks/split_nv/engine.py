@@ -33,6 +33,15 @@ def pf_split(n):
 
     return pf_overlap.split_rows(n, bool(flag("pf_overlap", pf_overlap.default_enabled())))
 
+# Per-prompt fields of the capture state (hooks.Capture.reset); swapped per session when prefills interleave.
+CAP_FIELDS = ("tokens", "ntok", "swa", "rows", "tail", "h_ring", "pending", "chunks", "t_start", "first_chunk_wall",
+              "chunk_rows", "collect")
+MEM_KEYS = ("allocated_bytes.all.current", "allocated_bytes.all.peak", "reserved_bytes.all.current",
+            "reserved_bytes.all.peak", "active_bytes.all.peak", "requested_bytes.all.peak",
+            "inactive_split_bytes.all.current", "inactive_split_bytes.all.peak", "reserved_bytes.large_pool.current",
+            "reserved_bytes.small_pool.current", "segment.all.current", "num_alloc_retries", "num_ooms",
+            "num_device_alloc", "num_device_free")
+
 log_lock = threading.Lock()
 
 
@@ -120,6 +129,23 @@ class Engine:
         self.vision = getattr(self.mr.model, "vision", None) is not None
         self.image_token_id = int(getattr(self.mr.model_config.hf_config, "image_token_id", 129264))
         self.use_graph = False
+        # fairness / memory prototypes (all default off)
+        self.cap_swap = int(os.environ.get("SPLIT_NV_BYPASS_TOKENS", "0") or 0) > 0
+        self.cap_owner = None
+        self.cap_saved = {}
+        self.preempt_peers = None  # rank 0: connections to the other ranks; others: the connection from rank 0
+        self.preempt_take = None  # rank 0: the front end's parked-step source
+        self.last_preempt = None  # (points, inline steps, step seconds) of the last preemptible chunk
+        self.memlog = os.environ.get("SPLIT_NV_MEMLOG") == "1"
+        self.mem_t = {}
+        if os.environ.get("SPLIT_NV_MEM_FRACTION"):
+            # cap the caching allocator (cached blocks are released and the allocation retried before this is exceeded)
+            torch.cuda.set_per_process_memory_fraction(float(os.environ["SPLIT_NV_MEM_FRACTION"]))
+        if int(os.environ.get("SPLIT_NV_MEMHIST", "0") or 0) > 0:
+            torch.cuda.memory._record_memory_history(max_entries=int(os.environ["SPLIT_NV_MEMHIST"]))
+        if os.environ.get("SPLIT_NV_IDX_LOWMEM") == "1":
+            from split_nv import idx_lowmem
+            idx_lowmem.install()
         if os.environ.get("SPLIT_NV_TRACE"):
             from split_nv.numerics import configure
             configure(self, 'trace')
@@ -198,6 +224,102 @@ class Engine:
         sess.batch = batch
         return fb
 
+    # ---- per-session capture state (SPLIT_NV_BYPASS_TOKENS: prefills interleave at chunk boundaries) -----------
+    def _cap_use(self, sid):
+        """Make the global capture state the one of `sid`'s prefill: park the current owner's per-prompt fields (they
+        are rebound, never mutated across prompts, by Capture.reset) and bring back sid's, if it has any."""
+        if not self.cap_swap or self.cap_owner == sid:
+            return
+        if self.cap_owner is not None and self.cap_owner in self.sessions:
+            self.cap_saved[self.cap_owner] = {f: getattr(self.cap, f) for f in CAP_FIELDS}
+        st = self.cap_saved.pop(sid, None)
+        if st is not None:
+            for f, v in st.items():
+                setattr(self.cap, f, v)
+        self.cap_owner = sid
+
+    def _cap_done(self, sid):
+        self.cap_saved.pop(sid, None)
+        if self.cap_owner == sid:
+            self.cap_owner = None
+
+    # ---- memory ---------------------------------------------------------------------------------------------------
+    def mem_summary(self):
+        st = torch.cuda.memory_stats()
+        free, total = torch.cuda.mem_get_info()
+        out = {k: st.get(k, 0) for k in MEM_KEYS}
+        out.update(rank=self.tp_rank, device_free=free, device_total=total,
+                   non_torch=total - free - st.get("reserved_bytes.all.current", 0))
+        return out
+
+    def cmd_memstats(self, path=None, reset_peak=False, snapshot=None, segments=True):
+        """Read-only allocator statistics of this rank (torch.cuda.memory_stats + a segment summary), written to
+        <path>.rank<r>.json; rank 0 also returns them. snapshot: dump the allocation history (SPLIT_NV_MEMHIST)."""
+        out = self.mem_summary()
+        if segments:
+            segs = torch.cuda.memory_snapshot()
+            by_pool, free_blocks, big = {}, [], []
+            for sg in segs:
+                pool = str(tuple(sg.get("segment_pool_id", (0, 0))))
+                p = by_pool.setdefault(pool, {"segments": 0, "total": 0, "allocated": 0})
+                p["segments"] += 1
+                p["total"] += sg["total_size"]
+                p["allocated"] += sg["allocated_size"]
+                for b in sg["blocks"]:
+                    if b["state"] == "inactive":
+                        free_blocks.append(b["size"])
+                big.append((sg["total_size"], sg["allocated_size"], sg.get("stream", 0), pool))
+            free_blocks.sort(reverse=True)
+            big.sort(reverse=True)
+            out["pools"] = by_pool
+            out["free_in_segments"] = sum(free_blocks)
+            out["largest_free_blocks"] = free_blocks[:16]
+            out["largest_segments"] = big[:24]
+            hist = {}
+            for size, alloc, _, _ in big:
+                key = "<20M" if size < 20 << 20 else "<256M" if size < 256 << 20 else "<1G" if size < 1 << 30 else ">=1G"
+                h = hist.setdefault(key, [0, 0, 0])
+                h[0] += 1
+                h[1] += size
+                h[2] += alloc
+            out["segment_hist"] = hist  # bucket -> [count, reserved, allocated]
+        if snapshot:
+            try:
+                torch.cuda.memory._dump_snapshot(f"{snapshot}.rank{self.tp_rank}.pickle")
+                out["snapshot"] = f"{snapshot}.rank{self.tp_rank}.pickle"
+            except Exception as e:  # noqa: BLE001
+                out["snapshot_error"] = str(e)
+        if reset_peak:
+            torch.cuda.reset_peak_memory_stats()
+        if path:
+            with open(f"{path}.rank{self.tp_rank}.json", "w") as f:
+                json.dump(out, f)
+        return out
+
+    def cmd_trim(self):
+        """Return the caching allocator's free cached segments to the device (SPLIT_NV_TRIM_MIN_TOKENS). Byte-neutral:
+        only which addresses later allocations get changes (every block stays 512-byte aligned)."""
+        before = torch.cuda.memory_reserved()
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return before - torch.cuda.memory_reserved()
+
+    def _mem_begin(self, sid):
+        if self.memlog:
+            torch.cuda.reset_peak_memory_stats()
+            self.mem_t[sid] = time.perf_counter()
+
+    def _mem_end(self, sid, sess):
+        if self.memlog and sid in self.mem_t:
+            self.mem_t.pop(sid)
+            m = self.mem_summary()
+            g = 1 << 30
+            log(f"rank {self.tp_rank} mem after prefill {sid} ({sess.length} tokens): alloc {m['allocated_bytes.all.current'] / g:.2f} "
+                f"peak {m['allocated_bytes.all.peak'] / g:.2f} GiB, reserved {m['reserved_bytes.all.current'] / g:.2f} "
+                f"peak {m['reserved_bytes.all.peak'] / g:.2f} GiB, split-free {m['inactive_split_bytes.all.current'] / g:.2f} GiB, "
+                f"non-torch {m['non_torch'] / g:.2f} GiB, device free {m['device_free'] / g:.2f} GiB, "
+                f"retries {m['num_alloc_retries']} ooms {m['num_ooms']}")
+
     # ---- commands (executed identically on every rank) --------------------------------------------------------
     def cmd_prefill(self, sid, ids, dump=True):
         from split_nv import pf_overlap
@@ -205,6 +327,7 @@ class Engine:
         sess = Session(sid)
         sess.req = self._new_req(sid)
         self.sessions[sid] = sess
+        self._cap_use(sid)
         self.cap.reset()
         self.cap.collect = not dump
         trace = os.environ.get("SPLIT_NV_TRACE") and len(ids) == 8213
@@ -241,6 +364,8 @@ class Engine:
         sess = Session(sid)
         sess.req = self._new_req(sid)
         self.sessions[sid] = sess
+        self._cap_use(sid)
+        self._mem_begin(sid)
         self.cap.reset()
         self.cap.collect = True
         self.cap.t_start = time.perf_counter()
@@ -284,16 +409,27 @@ class Engine:
             return None
         return torch.cat(pos), torch.cat(rows)
 
-    def cmd_prefill_chunk(self, sid, chunk, grid=None, split=0):
+    def cmd_prefill_chunk(self, sid, chunk, grid=None, split=0, preemptible=False):
         """Returns (rank 0) the packed source rows this chunk produced and its GPU seconds.
         grid = (blocks, entry key or None): save the 8K grid blocks [(bid, end)] this chunk completed, and a grid
         entry at the chunk end (which must then lie on the grid). split > 0: run the chunk as halves [0, split) and
-        [split, n) with overlapped all-reduces (decided by rank 0, so every rank issues the same collectives)."""
+        [split, n) with overlapped all-reduces (decided by rank 0, so every rank issues the same collectives).
+        preemptible: parked STEPs run between its layers (split_nv.preempt; decided by rank 0)."""
         t0 = time.perf_counter()
         sess = self.sessions[sid]
+        self._cap_use(sid)
         self.cap.tokens.append(torch.tensor(chunk, dtype=torch.int64))
         self.cap.ntok += len(chunk)
-        self._extend_split(sess, chunk, split, lambda a, n: self._replace_rows(sid, a, n))
+        if preemptible:
+            from split_nv import preempt
+            win = preempt.open_window(self, self.tp_rank == 0, self.preempt_peers, self.preempt_take)
+            try:
+                self._extend_split(sess, chunk, split, lambda a, n: self._replace_rows(sid, a, n))
+            finally:
+                preempt.close_window()
+            self.last_preempt = (win.k, win.steps, win.step_s)
+        else:
+            self._extend_split(sess, chunk, split, lambda a, n: self._replace_rows(sid, a, n))
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         self.cap.chunks.append((len(chunk), dt))
@@ -313,21 +449,28 @@ class Engine:
     def cmd_prefill_end(self, sid, keep_capture=False):
         """Returns (rank 0) the final state parts (window rings, ratio-2 tails, hidden tail)."""
         sess = self.sessions[sid]
+        self._cap_use(sid)
         sess.alloc_len = sess.req.kv.kv_allocated_len
         self.vision_spans.pop(sid, None)
         # Free the SWA slots of the last chunk that fell out of the window now instead of at the first step
         # (identical range), so a prefilled session holds ~window SWA slots, not a whole chunk.
         self.steps.evict_swa(sess, sess.length)
-        if not self.cap.enabled:
-            return None
-        if keep_capture:
-            self.pending_capture[sid] = self.cap.export_state()
-        return self.cap.final_parts()
+        self._mem_end(sid, sess)
+        try:
+            if not self.cap.enabled:
+                return None
+            if keep_capture:
+                self.pending_capture[sid] = self.cap.export_state()
+            return self.cap.final_parts()
+        finally:
+            self._cap_done(sid)
 
     def cmd_restore(self, sid, key, blocks, P):
         sess = Session(sid)
         sess.req = self._new_req(sid)
         self.sessions[sid] = sess
+        self._cap_use(sid)
+        self._mem_begin(sid)
         self.cap.reset()
         t0 = time.perf_counter()
         self.store.restore(sess, key, blocks, P, CHUNK)
@@ -363,6 +506,8 @@ class Engine:
         self.use_graph = True
 
     def cmd_close(self, sid):
+        self._cap_done(sid)
+        self.mem_t.pop(sid, None)
         self.pending_capture.pop(sid, None)
         self.vision_spans.pop(sid, None)
         sess = self.sessions.pop(sid, None)
@@ -398,7 +543,8 @@ class Engine:
         if kind == "prefill_begin":
             return self.cmd_prefill_begin(cmd[1])
         if kind == "prefill_chunk":
-            return self.cmd_prefill_chunk(cmd[1], cmd[2], cmd[3] if len(cmd) > 3 else None, cmd[4] if len(cmd) > 4 else 0)
+            return self.cmd_prefill_chunk(cmd[1], cmd[2], cmd[3] if len(cmd) > 3 else None, cmd[4] if len(cmd) > 4 else 0,
+                                          bool(cmd[5]) if len(cmd) > 5 else False)
         if kind == "prefill_end":
             return self.cmd_prefill_end(cmd[1], cmd[2])
         if kind == "restore":
@@ -423,6 +569,10 @@ class Engine:
         if kind == "sync":
             torch.cuda.synchronize()
             return None
+        if kind == "memstats":
+            return self.cmd_memstats(*cmd[1:])
+        if kind == "trim":
+            return self.cmd_trim()
         if kind == "exec" and os.environ.get("SPLIT_NV_DEV") == "1":
             # Localhost-only numerics development hook: the same code runs on every rank.
             ns = self.__dict__.setdefault("_dev_ns", {"engine": self, "torch": torch, "os": os, "json": json})
@@ -440,6 +590,7 @@ class Engine:
 # --------------------------------------------------------------------------------------------- process entry
 def rank_main(server_args, port_args, gpu_id, tp_rank, conns):
     engine = Engine(server_args, port_args, gpu_id, tp_rank)
+    engine.preempt_peers = conns
     if tp_rank != 0:
         # Commands arrive over a local pipe from rank 0 (~20 us vs ~0.3 ms for a gloo broadcast). Within SPLIT_NV_SPIN_S
         # of a STEP the pipe is busy-polled: a blocking recv after the ~25 ms idle of a c1 cycle wakes a cold core

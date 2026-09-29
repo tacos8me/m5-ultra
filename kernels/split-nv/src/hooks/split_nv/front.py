@@ -26,7 +26,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import torch
 
-from split_nv import topk_det
+from split_nv import preempt, topk_det
+from split_nv.fair import PrefillGate
 from split_nv.imagekeys import parse_images, prefix_digest, prompt_keys
 from split_nv.perf_flags import flag
 from split_nv.prefix_cache import PrefixIndex, _atomic_save, _load
@@ -43,6 +44,36 @@ STEP_ROW_BYTES = 4 * 5120 * 2 + 4 * 4 + 288 + 68
 PREFILL_TOK_S = 17000.0
 SPIN_S = float(os.environ.get("SPLIT_NV_SPIN_S", "0.2"))
 ADMIN_PEERS = set(os.environ.get("SPLIT_NV_ADMIN_PEERS", "127.0.0.1,10.10.10.2").split(","))
+# Frame limits: a JSON header is a few KB; an OPEN payload is 4 B/token (<= 1M tokens) plus image patches.
+MAX_HEADER = 4 << 20
+MAX_PAYLOAD = int(os.environ.get("SPLIT_NV_MAX_PAYLOAD_MB", "1024")) << 20
+# TCP keepalive on step connections: a Mac that vanished without a FIN (link down, power loss, kernel panic) left its
+# sessions -- and their KV, up to a 1M context each -- allocated forever (the connection thread blocks in recv with no
+# timeout). Probes are answered by the peer's kernel, so a live but idle client is never cut. 0 = off.
+KEEPALIVE_S = int(os.environ.get("SPLIT_NV_KEEPALIVE_S", "30"))
+
+
+def keepalive(conn):
+    if KEEPALIVE_S <= 0:
+        return
+    try:
+        conn.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, KEEPALIVE_S)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 5)
+        conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4)
+    except (OSError, AttributeError):
+        pass
+
+
+def gpu_memory():
+    """Rank-0 CUDA allocator state (MiB): the caching allocator keeps its high-water mark reserved, so `reserved`
+    near the card's capacity is expected; `free` is what is left for a larger prefill than any seen so far."""
+    try:
+        free, total = torch.cuda.mem_get_info()
+        return {"allocated": torch.cuda.memory_allocated() >> 20, "reserved": torch.cuda.memory_reserved() >> 20,
+                "peak": torch.cuda.max_memory_allocated() >> 20, "free": free >> 20, "total": total >> 20}
+    except Exception:  # noqa: BLE001
+        return None
 
 log_lock = threading.Lock()
 
@@ -277,6 +308,23 @@ class Front:
         self.gpu_lock = threading.Lock()  # one GPU job at a time: gpu_loop (queued jobs) or run_now (STEPs)
         self.step_cv = threading.Condition()
         self.step_waiters = 0
+        # Fairness prototypes (default off): prefill admission gate with a short-prompt bypass (split_nv.fair), STEPs
+        # preempting preemptible prefill chunks between layers (split_nv.preempt), cache trim after long prefills.
+        self.gate = PrefillGate(self.prefill_lock, int(os.environ.get("SPLIT_NV_BYPASS_TOKENS", "0") or 0),
+                                float(os.environ.get("SPLIT_NV_BYPASS_SHARE", "0.5")))
+        self.pf_need = {}  # sid -> KV tokens an unfinished prefill may still allocate (admission of interleaved prefills)
+        self.preempt_on = preempt.enabled()
+        self.pq_lock = threading.Lock()
+        self.pq_open = False  # a preemptible chunk is running: STEPs park here and run between its layers
+        self.pq = []
+        self.pstats = {"chunks": 0, "inline_steps": 0, "after_chunk_steps": 0}
+        self.trim_min = int(os.environ.get("SPLIT_NV_TRIM_MIN_TOKENS", "0") or 0)
+        engine.preempt_take = self._take_parked
+        c128 = getattr(engine.steps.be, "online_c128_mtp", None)
+        if self.preempt_on and c128 is not None and c128.enabled():
+            # its per-forward state is mutated in place by a verify step's metadata init: not restorable by preempt
+            log("preempt: online c128 MTP is enabled; preemption stays off")
+            self.preempt_on = False
 
     # ---- GPU job queue ---------------------------------------------------------------------------------------
     def submit_async(self, cmd, priority=0):
@@ -300,14 +348,57 @@ class Front:
                     self.step_cv.wait()
                 self.gpu_lock.acquire()
             try:
-                self._execute(job)
+                park = job.cmd[0] == "prefill_chunk" and len(job.cmd) > 5 and bool(job.cmd[5])
+                if park:
+                    with self.pq_lock:
+                        self.pq_open = True
+                    self.pstats["chunks"] += 1
+                try:
+                    self._execute(job)
+                finally:
+                    if park:
+                        with self.pq_lock:
+                            self.pq_open = False
+                            left, self.pq = self.pq, []
+                        # STEPs parked too late for a point of this chunk run now, before anything else
+                        self.pstats["after_chunk_steps"] += len(left)
+                        for j in left:
+                            self._execute(j)
             finally:
                 self.gpu_lock.release()
+
+    def _take_parked(self, win):
+        """Rank 0's preemption source (split_nv.preempt): the STEPs parked since the last point, if this chunk's
+        decode share allows."""
+        with self.pq_lock:
+            if not self.pq or not win.share_ok(float(flag("preempt_share", preempt.SHARE))):
+                return []
+            jobs, self.pq = self.pq, []
+        self.pstats["inline_steps"] += len(jobs)
+        return jobs
+
+    def _parkable(self, cmd):
+        if cmd[0] != "step":
+            return False
+        steps = self.engine.steps
+        try:
+            slot = steps.pick(len(cmd[3]))
+        except ValueError:
+            return False
+        return steps.engine.use_graph and slot.graph is not None  # graph steps only (no eager forward inside a chunk)
 
     def run_now(self, cmd):
         """Execute a STEP on the calling (connection) thread: no hand-off to gpu_loop and back, each of which costs
         a thread wake-up on a cold core. Waits only for the GPU job already running; ahead of queued jobs."""
         job = Job(cmd)
+        if self.pq_open and self._parkable(cmd):
+            with self.pq_lock:
+                parked = self.pq_open
+                if parked:
+                    self.pq.append(job)
+            if parked:
+                job.done.wait()
+                return job
         with self.step_cv:
             self.step_waiters += 1
         self.gpu_lock.acquire()
@@ -381,7 +472,8 @@ class Front:
             return sid
 
     # ---- prefill (+ prefix cache) ----------------------------------------------------------------------------
-    def prefill(self, sid, tokens, *, use_cache, on_ready=None, on_rows=None, lean=False, delta_from=0, images=()):
+    def prefill(self, sid, tokens, *, use_cache, on_ready=None, on_rows=None, lean=False, delta_from=0, images=(),
+                keys=None):
         """Prefill tokens[:-1] into a new session `sid`. Returns (arrays, manifest, info).
 
         images: imagekeys.parse_images() output; their span rows replace the embeddings at their positions, and the
@@ -394,16 +486,18 @@ class Front:
         """
         ids = list(tokens[:-1])
         n1 = len(ids)
-        keys = prompt_keys(ids, [(st, ln, dg) for st, ln, _, _, dg, _ in images])
+        if keys is None:
+            keys = prompt_keys(ids, [(st, ln, dg) for st, ln, _, _, dg, _ in images])
         t0 = time.perf_counter()
         info = {"resumed_tokens": 0, "new_blocks": [], "grid_entries": []}
         rows = Rows()
         blocks = []
         entry = None
-        with self.prefill_lock:
+        with self.gate.enter(None if use_cache else n1):
             if use_cache:
                 entry = self.cache.lookup(keys, min_len=min(self.min_resume, n1))
-            self.admit(n1)
+            self.admit(n1, sid)
+            self.pf_need[sid] = n1
             if entry is not None:
                 try:
                     _, info["restore_s"] = self.submit(("restore", sid, entry.key, entry.blocks, entry.P), priority=1)
@@ -431,14 +525,21 @@ class Front:
             timing = []
             job = None
             pending, next_k = [], [0]
+            preemptible = False
 
             def submit_next():
                 # Plan chunks are split into pieces when another session is decoding (re-checked per chunk): a
                 # STEP waits for at most one piece. Grid work rides on the last piece of its chunk.
+                nonlocal preemptible
                 if not pending and next_k[0] < len(plan):
                     k = next_k[0]
                     next_k[0] += 1
-                    ps = split_piece(*plan[k], self.share_chunk) if self.contended(sid) else [plan[k]]
+                    contended = self.contended(sid)
+                    # SPLIT_NV_PREEMPT: whole (overlapped) chunks whose layers STEPs can preempt; otherwise pieces of
+                    # share_chunk rows (runtime perf flag share_chunk, 0 = never split)
+                    preemptible = contended and self.preempt_on and bool(flag("preempt", True))
+                    size = int(flag("share_chunk", self.share_chunk))
+                    ps = split_piece(*plan[k], size) if contended and size > 0 and not preemptible else [plan[k]]
                     pending.extend((a, e, k, i == len(ps) - 1) for i, (a, e) in enumerate(ps))
                 if not pending:
                     return None
@@ -446,6 +547,8 @@ class Front:
                 grid = grids[k][1] if grids[k] and last else None
                 from split_nv.engine import pf_split
                 cmd = ("prefill_chunk", sid, ids[a:e], grid, pf_split(e - a))
+                if preemptible:
+                    cmd += (True,)
                 return self.submit_async(cmd, priority=1), a, e, k, last
 
             try:
@@ -457,6 +560,9 @@ class Front:
                 while cur is not None:
                     job, a, e, k, last = cur
                     part, dt = job.wait()
+                    self.pf_need[sid] = n1 - e
+                    if not pending:  # between plan chunks, nothing of ours queued: short prompts may go first
+                        info["suspended_s"] = info.get("suspended_s", 0.0) + self.gate.prefill_yield()
                     cur = submit_next()
                     job = cur[0] if cur else None
                     timing.append((e - a, dt))
@@ -466,6 +572,10 @@ class Front:
                     if last and grids[k] is not None:
                         blocks = self._grid_done(grids[k], keys, e, blocks, rows, info)
                 final = self.submit(("prefill_end", sid, use_cache), priority=1)
+                if self.trim_min and n1 - P >= self.trim_min and not self.gate.fifo and not self.gate.suspended:
+                    # return the long prefill's cached activation segments to the device (asynchronous: the reply
+                    # does not wait; the next STEP waits for it like for any GPU job)
+                    self.submit_async(("trim",), priority=1)
             except Exception:
                 if job is not None:
                     try:
@@ -477,6 +587,8 @@ class Front:
                     for f in self.cache.entry_files(gkey):
                         os.path.exists(f) and os.unlink(f)
                 raise
+            finally:
+                self.pf_need.pop(sid, None)
         info["prefill_s"] = time.perf_counter() - t0
         arrays, manifest = assemble_parts(tokens, rows.by_layer(), final, self.identity, self.token_map,
                                           {"encoder_request_seconds": info["prefill_s"], "chunks": timing,
@@ -544,25 +656,28 @@ class Front:
         if final:
             self.cache.add(key, ids, blocks, capture=True)
         self.cache.forget_blocks(new_blocks)  # only those no registered entry references
-        if self.cache.total() > self.cache.budget:
-            self.cache.evict()  # after the barrier: rank 1 no longer reads any file
+        if self.cache.total() > self.cache.budget and not self.gate.suspended:
+            # after the barrier: rank 1 no longer reads any file. Not while a prefill is suspended for this one (its
+            # grid plan may adopt blocks of existing entries): that prefill evicts at its own snapshot.
+            self.cache.evict()
         if not final:
             return None
         return {"key": key, "bytes": self.cache.entries[key].bytes if key in self.cache.entries else 0, "snapshot_s": dt}
 
-    def admit(self, n1):
+    def admit(self, n1, sid=None):
         """Refuse (retryable) a prefill that cannot fit, before anything is allocated: an allocation failure half
-        way through a prefill is the one path that can leave the pools inconsistent."""
+        way through a prefill is the one path that can leave the pools inconsistent. Unfinished prefills (suspended
+        for a short prompt) keep their remaining tokens reserved."""
         cap = self.submit(("capacity",))
         page = 256
         busy = cap["sessions"]
-        need_full = (n1 // page + 2) * page + busy * 4 * page
+        need_full = (n1 // page + 2) * page + busy * 4 * page + sum(v for k, v in list(self.pf_need.items()) if k != sid)
         need_swa = min(n1, CHUNK) + 3 * page + busy * 2 * page
         if cap["rows"] < 1 or cap["full"] < need_full or cap["swa"] < need_swa:
             raise Busy(f"busy: KV capacity (free rows {cap['rows']}, full {cap['full']} < {need_full} or swa {cap['swa']} < {need_swa})")
 
     def cache_clear(self):
-        with self.prefill_lock:
+        with self.gate.enter(None):
             self.submit(("barrier",), priority=1)
             return {"dropped": self.cache.clear()}
 
@@ -580,8 +695,14 @@ class Front:
         ok = step_api and not wedged and not self.draining
         state = "draining" if self.draining else ("wedged" if wedged else "up")
         tree = tree_head("/home/ian/split-nv")
+        now = time.monotonic()
+        steps = list(self.last_step.values())
         return ok, {"ok": ok, "encoder": state, "step_api": "up" if step_api else "down", "token_map": True,
                     "sessions": len(self.engine.sessions), "connections": self.open_conns,
+                    # seconds since the least recently stepped session's last STEP: a large value with sessions open
+                    # is a client that holds a session without using it (leak), not load
+                    "stalest_step_s": round(now - min(steps), 1) if steps else None,
+                    "gpu_mem_mib": gpu_memory(),
                     "gpu_job": cur[0] if cur else None, "gpu_job_s": round(busy, 2), "queued_jobs": self.jobs.qsize(),
                     "cache": self.cache.summary(), "uptime_s": round(time.time() - self.t_start),
                     "version": self.version, "sglang": os.environ.get("SPLIT_NV_SGLANG_VERSION", ""), "numerics": NUMERICS,
@@ -589,7 +710,10 @@ class Front:
                     "dev_hook": os.environ.get("SPLIT_NV_DEV") == "1", "vision": self.engine.vision,
                     "prefill_perf": {k: os.environ.get(f"SPLIT_NV_{k.upper()}", "0") == "1"
                                      for k in ("pf_overlap", "ce_ar", "q_nocopy")},
-                    "topk_det": topk_det.digest() if topk_det.installed() else False}
+                    "topk_det": topk_det.digest() if topk_det.installed() else False,
+                    **({"fair": {"gate": self.gate.summary(), "preempt": dict(self.pstats) if self.preempt_on else False,
+                                 "trim_min_tokens": self.trim_min}}
+                       if self.preempt_on or self.gate.bypass_tokens or self.trim_min else {})}
 
     # ---- HTTP: /v1/prefill (phase-2 compatible), /health, /v1/info, /v1/cache ------------------------------------
     def serve_http(self, host, port):
@@ -614,6 +738,14 @@ class Front:
                 self._send(code, json.dumps(obj).encode())
 
             def do_GET(self):
+                if self.path.startswith("/debug/mem"):
+                    if self.client_address[0] not in ADMIN_PEERS:
+                        return self._json(403, {"error": "forbidden"})
+                    try:
+                        return self._json(200, front.memstats(reset="reset=1" in self.path, snapshot="snapshot=1" in self.path,
+                                                              segments="segments=0" not in self.path))
+                    except Exception as e:  # noqa: BLE001
+                        return self._json(500, {"error": str(e)[:500]})
                 if self.path.startswith("/health"):
                     ok, body = front.health()
                     return self._json(200 if ok else 503, body)
@@ -660,7 +792,7 @@ class Front:
                 sid = front.new_sid()
                 t0 = time.perf_counter()
                 try:
-                    with (front.prefill_lock if body.get("cache") else contextlib.nullcontext()):
+                    with (front.gate.enter(None) if body.get("cache") else contextlib.nullcontext()):
                         arrays, manifest, info = front.prefill(sid, tokens, use_cache=bool(body.get("cache")))
                         manifest["identity"] = identity
                         blob = serialize_parts(arrays, manifest)
@@ -697,7 +829,7 @@ class Front:
                 code = self.rfile.read(int(self.headers.get("Content-Length", "0"))).decode()
                 try:
                     # Dev code may prefill through the global capture state: never between another prompt's chunks.
-                    with front.prefill_lock:
+                    with front.gate.enter(None):
                         body = json.dumps({"result": front.submit(("exec", code))}, default=repr)
                     status = 200
                 except Exception as e:  # noqa: BLE001
@@ -711,6 +843,21 @@ class Front:
         srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
         log(f"dev exec on 127.0.0.1:{port}")
         srv.serve_forever()
+
+    def memstats(self, reset=False, snapshot=False, segments=True):
+        """Allocator statistics of every rank (engine command "memstats"; read-only unless reset: peak counters)."""
+        d = os.environ.get("SPLIT_NV_DIR", "/dev/shm/split-nv")
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        path = os.path.join(d, f"memstats-{stamp}")
+        self.submit(("memstats", path, reset, os.path.join(d, f"memsnap-{stamp}") if snapshot else None, segments))
+        self.submit(("barrier",))
+        out = {}
+        for r in range(1 + len(self.peers)):
+            f = f"{path}.rank{r}.json"
+            with open(f) as fh:
+                out[f"rank{r}"] = json.load(fh)
+            os.unlink(f)
+        return out
 
     # ---- drain -------------------------------------------------------------------------------------------------
     def drain_and_exit(self, *_):
@@ -774,15 +921,20 @@ class Front:
                 streamer.rows_chunk(rows)
                 send_frame(conn, b"PROG", {"tokens_done": streamer.sent[f"layer.{ENCODER_LAYERS - 1}.slot.2"]})
 
-        with (self.prefill_lock if use_cache else contextlib.nullcontext()):
+        keys, est = None, len(tokens) - 1
+        if use_cache and self.gate.bypass_tokens and est > self.gate.bypass_tokens:
+            # a long prompt that resumes from the cache may still be short work: estimate from a read-only peek
+            keys = prompt_keys(tokens[:-1], [(st, ln, dg) for st, ln, _, _, dg, _ in images])
+            est -= self.cache.peek(keys, min_len=min(self.min_resume, est))
+        with (self.gate.enter(est) if use_cache else contextlib.nullcontext()):
             return self._open(conn, peer, h, tokens, sid, t0, stream, streamer, use_cache, want_state, lean, delta_from,
-                              on_ready, on_rows, images)
+                              on_ready, on_rows, images, keys)
 
     def _open(self, conn, peer, h, tokens, sid, t0, stream, streamer, use_cache, want_state, lean, delta_from, on_ready, on_rows,
-              images):
+              images, keys=None):
         try:
             arrays, manifest, info = self.prefill(sid, tokens, use_cache=use_cache, on_ready=on_ready, on_rows=on_rows,
-                                                  lean=lean, delta_from=delta_from, images=images)
+                                                  lean=lean, delta_from=delta_from, images=images, keys=keys)
         except Exception:
             try:
                 self.submit(("close", sid))
@@ -811,6 +963,7 @@ class Front:
 
     def handle_conn(self, conn, peer):
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        keepalive(conn)
         sid = None
         with self.conn_lock:
             self.open_conns += 1
@@ -822,6 +975,9 @@ class Front:
                 if head is None:
                     break
                 tag, hlen, plen = FRAME.unpack(head)
+                if hlen > MAX_HEADER or plen > MAX_PAYLOAD:
+                    send_frame(conn, b"ERR ", {"error": f"frame too large (header {hlen}, payload {plen})", "retry": False})
+                    break
                 header = recv_exact(conn, hlen) if hlen else b""
                 payload = recv_exact(conn, plen) if plen else b""
                 if tag == b"OPEN":

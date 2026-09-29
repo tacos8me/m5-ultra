@@ -34,6 +34,12 @@ def run(args, tokens, n, **opts):
     return ack, tensors, manifest, info, steps
 
 
+def script_digest(tokens, n):
+    """The OPEN prompt plus every STEP's (keep, ids): a ref only applies to a check that sends the same tokens (the
+    step script reads tokens[n-1:n+12], past the prompt -- id files that agree on the prompt can differ there)."""
+    return hashlib.sha256(json.dumps([tokens[:n], step_script(tokens, n)]).encode()).hexdigest()
+
+
 def digest_state(tensors):
     return {k: [v[0], v[1], hashlib.sha256(v[2]).hexdigest()] for k, v in sorted(tensors.items())}
 
@@ -73,15 +79,25 @@ def main():
         os.makedirs(args.out, exist_ok=True)
         tag = f"n{args.n}"
         json.dump({"state": digest_state(tensors), "steps": [hashlib.sha256(p).hexdigest() for p in steps],
-                   "info": info, "manifest_identity": manifest.get("identity")},
+                   "info": info, "manifest_identity": manifest.get("identity"),
+                   "script_sha256": script_digest(tokens, args.n), "ids": os.path.abspath(args.ids)},
                   open(os.path.join(args.out, tag + ".json"), "w"))
         print(json.dumps({"ref": tag, "tensors": len(tensors), "bytes": info["bytes"], "open_s": round(info["open_s"], 3)}))
         return
     if args.mode == "check":
         if args.cache:
             opts["cache"] = 1
-        ack, tensors, manifest, info, steps = run(args, tokens, args.n, **opts)
         ref = json.load(open(os.path.join(args.ref, f"n{args.n}.json")))
+        want = ref.get("script_sha256")
+        if want is None:
+            print(json.dumps({"warning": "ref has no script_sha256 (recorded before it existed): it cannot tell whether "
+                              "this check sends the same step tokens; og refs for n > 8192 were recorded from "
+                              "ids-131072.json, whose tokens differ from ids-8192.json at position 8198"}), flush=True)
+        elif want != script_digest(tokens, args.n):
+            print(json.dumps({"gate": f"check n={args.n} {opts}", "error": "step tokens differ from the ref's "
+                              f"(ref ids: {ref.get('ids')}, this check: {os.path.abspath(args.ids)})", "pass": False}))
+            sys.exit(2)
+        ack, tensors, manifest, info, steps = run(args, tokens, args.n, **opts)
         ok = compare({k: v for k, v in ref["state"].items()}, {k: list(v) for k, v in digest_state(tensors).items()},
                      ref["steps"], [hashlib.sha256(p).hexdigest() for p in steps], f"check n={args.n} {opts}")
         print(json.dumps({"open_s": round(info["open_s"], 3), "first_part_s": info.get("first_part_s"), "ack": ack}))

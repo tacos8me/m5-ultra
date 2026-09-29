@@ -329,6 +329,15 @@ class PrefixIndex:
                     return e
         return None
 
+    def peek(self, ids, min_len=1):
+        """Tokens `lookup` would resume from (0 if none), without touching hit counters or LRU times."""
+        arr = np.asarray(ids, dtype=np.uint64)
+        n = len(ids)
+        with self.lock:
+            cands = sorted((e for e in self.entries.values() if min_len <= e.P <= n and n - e.P != 1
+                            and (e.capture or n - e.P >= 256)), key=lambda e: -e.P)
+            return next((e.P for e in cands if np.array_equal(e.tokens, arr[:e.P])), 0)
+
     def find(self, P, ids_prefix):
         arr = np.asarray(ids_prefix, dtype=np.uint64)
         with self.lock:

@@ -65,7 +65,7 @@ room for 3M tokens of KV on the box and 1M-context requests on the Mac.
 | Box engine | systemd user unit `split-nv-engine` (restart on crash, starts at boot), pinned deploy `/home/ian/split-nv-deploy` |
 | Box health | `curl 10.10.10.1:10051/health` (version, numerics, sessions, cache, restart_pending) |
 | Deploy / rollback | `tools/s4_deploy.sh <commit> <label>` (then the gate script); rollback = previous commit |
-| Box down | requests ride out an engine restart (≤240 s, bit-identical continuation), then a retryable 503 — never another model |
+| Box down | requests ride out an engine restart (≤420 s; a crash restart takes ~3-4 min; bit-identical continuation), then a retryable 503 — never another model |
 | Monitor | `all-smi view --hosts http://10.10.10.2:9090 http://10.10.10.1:9090 --icculis` ([fork](https://github.com/tacos8me/all-smi/tree/consolidated)) |
 
 ## Components

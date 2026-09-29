@@ -83,6 +83,18 @@ COPY_PREBUILD = os.environ.get('DS41_OG_COPY_PREBUILD', '1') == '1'
 # one piece (each stream then sees steps ~slice ms longer instead of one 0.2-0.3 s stall; the new request
 # pays the interleaved steps). Same ops in the same order on the same stream. 0 = one piece (old behaviour).
 ADMIT_SLICE_MS = float(os.environ.get('DS41_OG_ADMIT_SLICE_MS', '90'))
+# The box refuses a STEP past its context length (ERR "context length exceeded", keep + rows > 1048576), and there
+# is no local fallback: a request's prompt + output must stay below it, with room for one verify step's rows.
+BOX_CONTEXT = int(os.environ.get('DS41_OG_BOX_CONTEXT', '1048576'))
+STEP_MARGIN = 8
+# Burst admission: start the box OPEN of up to this many text requests queued behind the head at once
+# (OgPrefill.preopen) instead of one after another. 0 = head only (old behaviour).
+PREOPEN = int(os.environ.get('DS41_OG_PREOPEN', '3'))
+# chain (default): the next queued OPEN starts when every earlier one has finished on the box, so the box never
+# prefills two of our prompts at once (the head's TTFT is unchanged; the Mac import and scheduler steps of
+# request k overlap the box prefill of k+1). 0 = start them all at once (box interleaves the prefills: the whole
+# burst starts together, the head's first token comes later).
+PREOPEN_CHAIN = os.environ.get('DS41_OG_PREOPEN_CHAIN', '1') == '1'
 
 
 def _layer_ms(rows):
@@ -515,29 +527,38 @@ class Job(threading.Thread):
         self.copy_prompt = None
         self.done = threading.Event()
         self.cancelled = False
+        self.cancel_event = threading.Event()
         # Admission slices (engine thread only): the import_state_steps generator, its result or error.
         self.replay = self.imported = self.replay_error = None
         self.replay_start = self.replay_marks = None
 
     def _open(self, delta_from):
         self.encoder = EncoderSession(self.host, self.port)
+        if self.cancelled:  # abort() ran before this encoder existed: nothing interrupted it
+            raise ConnectionAbortedError('request cancelled')
         self.result = open_remote(self.encoder, self.tokens, self.request_id,
                                   cache=BOX_CACHE, state=STATE, delta_from=delta_from, stream=STREAM,
                                   **({'images': self.images} if self.images else {}))
         return self.result[1]
 
     def _attempt(self):
+        if self.cancelled:
+            return
         self.base_rows = None
         entry, base = STORE.lookup(self.keys, NUMERICS[0]) if STORE is not None else (None, 0)
         if base < DELTA_MIN:
             entry, base = None, 0
         manifest = self._open(base)
+        if self.cancelled:
+            return
         delta = int(manifest.get('delta_from') or 0)
         if delta and (entry is None or delta != base or og_cache.numerics_key(manifest) != entry.key):
             # The box arithmetic changed since these rows were stored: never mix them.
             STATS['delta_retries'] += 1
             STORE.clear()
             self.encoder.close()
+            if self.cancelled:
+                return
             manifest = self._open(0)
             delta = int(manifest.get('delta_from') or 0)
             if delta:
@@ -548,7 +569,7 @@ class Job(threading.Thread):
         for key in ('t_ack', 't_first_part', 't_end'):
             if info.get(key) is not None:
                 fe_trace.og_stamp(self.request_id, 'box_' + key[2:], info[key])
-        if KICKOFF:
+        if KICKOFF and not self.cancelled:
             try:
                 self.encoder.send_step(self.tokens[-1:], len(self.tokens) - 1)
                 STATS['kickoff_sent'] += 1
@@ -559,13 +580,13 @@ class Job(threading.Thread):
     def run(self):
         since, failures = time.monotonic(), 0
         self.trace = dict(job_start=time.time())
-        if COPY_PREBUILD and len(self.tokens) >= 64:
+        if COPY_PREBUILD and not self.cancelled and len(self.tokens) >= 64:
             from ..mlx_lm_mtp import copy_draft
             if copy_draft.ENABLED:
                 self.copy_prompt = CopyPrompt(self.request_id, self.tokens)
                 self.copy_prompt.start()
         try:
-            while True:
+            while not self.cancelled:
                 try:
                     self._attempt()
                     return
@@ -580,12 +601,14 @@ class Job(threading.Thread):
                         raise
                     STATS['open_retries'] += 1
                     logger.warning('ds41-og box open for %s failed (%r); retrying', self.request_id, exc)
-                    time.sleep(1.0)
+                    self.cancel_event.wait(1.0)
         except BaseException as exc:  # noqa: BLE001 -- surfaced by should_defer()
             self.error = exc
             if self.encoder is not None:
                 self.encoder.close()
         finally:
+            if self.cancelled and self.encoder is not None:
+                self.encoder.close()
             self.trace['job_end'] = time.time()
             fe_trace.og_stamp(self.request_id, 'job_start', self.trace['job_start'])
             fe_trace.og_stamp(self.request_id, 'job_end', self.trace['job_end'])
@@ -629,11 +652,17 @@ class OgPrefill:
                 og_failover.open_failed(request.request_id, ValueError(
                     'ds41-og: the image payload of this request is missing'), kind='invalid')
                 return True
-        if not 2 <= len(tokens) <= 1048576:
+        room = BOX_CONTEXT - STEP_MARGIN - len(tokens)
+        if len(tokens) < 2 or room < 1:
             # There is no local prefill: fail this request alone, cleanly.
             og_failover.open_failed(request.request_id, ValueError(
-                f'ds41-og serves prompts of 2..1048576 tokens (got {len(tokens)})'), kind='invalid')
+                f'ds41-og serves prompts of 2..{BOX_CONTEXT - STEP_MARGIN - 1} tokens (got {len(tokens)})'), kind='invalid')
             return True
+        clamp_max_tokens(request, room)
+        self.launch(scheduler, request, tokens, images)
+        return True
+
+    def launch(self, scheduler, request, tokens, images=None):
         job = Job(self.host, self.port, request.request_id, tokens, images, wake=opened_wake(scheduler) if WAKE else None)
         job.arrival = time.time() - (time.monotonic() - getattr(request, 'arrival_time', time.monotonic()))
         job.deferred = time.time()
@@ -641,7 +670,50 @@ class OgPrefill:
         fe_trace.og_stamp(request.request_id, 'deferred', job.deferred)
         self.jobs[request.request_id] = job
         job.start()
-        return True
+        return job
+
+    def preopen(self, scheduler):
+        """Start the box OPEN of text requests queued behind the head of the waiting queue.
+
+        The scheduler only offers waiting[0] to should_defer(), so without this a burst opens one
+        request at a time: the next OPEN starts only after the previous request's OPEN and import
+        (c4 at 8K: the 4th stream's first token ~3.1 s after arrival). Admission order is unchanged
+        (FIFO, one request per step as before); only the network OPEN (box prefill + state transfer)
+        starts early, within the scheduler's free slots, so at most max_num_seqs sessions exist.
+        PREOPEN_CHAIN: one box prefill at a time, the next as soon as the previous OPEN is done.
+        The imported state does not depend on when or how the OPEN ran (resume/delta are exact).
+        """
+        waiting = getattr(scheduler, 'waiting', None)
+        if PREOPEN <= 0 or not waiting or len(waiting) < 2:
+            return 0
+        try:
+            free = scheduler._effective_max_num_seqs() - scheduler._num_admitted_requests() - 1
+        except Exception:  # noqa: BLE001 -- unknown scheduler shape: keep the old behaviour
+            return 0
+        head = self.jobs.get(waiting[0].request_id)
+        ready = head is not None and head.done.is_set()  # chain: every earlier OPEN has finished
+        budget, started = min(PREOPEN, free), 0
+        for request in itertools.islice(waiting, 1, None):
+            if budget <= 0:
+                break
+            budget -= 1
+            job = self.jobs.get(request.request_id)
+            if job is not None or request.request_id in self.failed:
+                ready = ready and (job is None or job.done.is_set())
+                continue
+            tokens = request.prompt_token_ids or []
+            if request.vlm_inputs_embeds is not None or len(tokens) < 2 or BOX_CONTEXT - STEP_MARGIN - len(tokens) < 1:
+                ready = False  # images / invalid prompts keep the ordinary path at the head
+                continue
+            if PREOPEN_CHAIN and not ready:
+                break
+            clamp_max_tokens(request, BOX_CONTEXT - STEP_MARGIN - len(tokens))
+            self.launch(scheduler, request, tokens)
+            started += 1
+            ready = False
+        if started:
+            STATS['preopened'] = STATS.get('preopened', 0) + started
+        return started
 
     def advance(self, scheduler, request, job):
         """One admission slice of this request's import+replay (engine thread, engine stream).
@@ -777,6 +849,12 @@ class OgPrefill:
         job = self.jobs.pop(request_id, None)
         if job is not None:
             job.cancelled = True
+            job.cancel_event.set()
+            if not job.done.is_set() and job.encoder is not None:
+                # An OPEN in flight (box prefill + state stream, up to ~60 s at 1M): cut it now instead of
+                # letting the box finish a prefill nobody will use while other OPENs queue behind it.
+                job.encoder.interrupt()
+                STATS['open_cancelled'] = STATS.get('open_cancelled', 0) + 1
 
             def reap():
                 job.done.wait()
@@ -784,6 +862,21 @@ class OgPrefill:
                     job.encoder.close()
             threading.Thread(target=reap, daemon=True).start()
         close_request(request_id)
+
+
+def clamp_max_tokens(request, room):
+    """Cap this request's output at `room` tokens (prompt + output + one verify step within the box context):
+    it then ends with finish_reason "length" instead of a STEP the box refuses."""
+    import copy
+    params = getattr(request, 'sampling_params', None)
+    limit = getattr(params, 'max_tokens', None)
+    if params is None or (isinstance(limit, int) and limit <= room):
+        return
+    params = copy.copy(params)  # never mutate a shared default
+    params.max_tokens = room
+    request.sampling_params = params
+    STATS['max_tokens_clamped'] = STATS.get('max_tokens_clamped', 0) + 1
+    logger.info('ds41-og %s: max_tokens %s -> %d (box context %d)', request.request_id, limit, room, BOX_CONTEXT)
 
 
 def opened_wake(scheduler):
@@ -893,9 +986,16 @@ def install(host='10.10.10.1', port=10052):
     abort, cleanup = Scheduler._do_abort_request, Scheduler._cleanup_finished
 
     def _defer(self, request):
-        if manager.should_defer(self, request):
-            return True
-        return defer(self, request)
+        try:
+            if manager.should_defer(self, request):
+                return True
+            return defer(self, request)
+        finally:
+            # After the head's own OPEN was started: the box serves OPENs in arrival order.
+            try:
+                manager.preopen(self)
+            except Exception:  # noqa: BLE001 -- the head-only path still admits everything
+                logger.debug('ds41-og preopen skipped', exc_info=True)
 
     def _prepare(self, request):
         if request.request_id in self._prefix_cache_prepared:

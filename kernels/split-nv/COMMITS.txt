@@ -80,6 +80,14 @@ b4f5ea4 fix(split-nv): overlapped chunks evict out-of-window SWA slots on the un
 45c5c2e test(topk-det): production-size timing shapes under FULL=1
 e923471 feat(topk-det): optional prefill overflow audit (SPLIT_NV_TOPK_AUDIT=1) for maintenance windows
 0802427 test(topk-det): window gate runner and repetitive-prompt id builder
+8c7b12b robust: step-socket keepalive, frame caps, health leak/GPU fields, llama-swap engine guard
+c81f1dd feat(fair): prefill/decode fairness and GPU memory prototypes (all default off)
+7aa3add test(fair): CPU tests and window tools for the fairness/memory prototypes
+05ed248 fix(fair): keep preemption off when the online c128 MTP controller is enabled
+1c027c9 fix(fair): a failing inline step releases the other steps parked at the same point
+5c47019 fix(og-gate): refs record a digest of the OPEN and step tokens; check refuses a ref recorded from other step tokens
+6d91821 test(robust): Front fixture carries the fair attributes (gate, preempt_on, trim_min, pstats) set in __init__
+1074e0b fix(fair window): short prompt uses ids-131072 like the 8193 reference
 
 sglang (757e8f3..a618602):
 fca050c feat(split-nv): optional prompt-state capture hooks for encoder prefill

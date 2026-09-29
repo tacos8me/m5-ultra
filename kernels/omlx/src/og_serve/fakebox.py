@@ -4,10 +4,14 @@ Every STPR row carries sha256 of the session's box-side token sequence up to and
 including that row (first 32 bytes of the row), so a client can check that a
 rebuilt session holds exactly the tokens the original one did. Controls:
 kill() drops every connection (engine crash), down()/up() stop and restart
-listening (engine restart), err_opens makes OPEN answer ERR.
+listening (engine restart), err_opens makes OPEN answer ERR, err_steps makes every
+STEP answer ERR retry:false (like "context length exceeded"), open_delay holds an
+OPEN's reply that long (a long prefill; a client that goes away is logged as
+('open_aborted', ...) as soon as its connection closes).
 """
 import hashlib
 import json
+import select
 import socket
 import struct
 import threading
@@ -51,6 +55,8 @@ class FakeBox:
         self.port, self.step_delay = port, step_delay
         self.sessions, self.conns, self.log = {}, [], []
         self.err_opens = False
+        self.err_steps = False
+        self.open_delay = 0.0
         self.next_sid = 1
         self.srv = None
         self.lock = threading.Lock()
@@ -115,6 +121,12 @@ class FakeBox:
                         sid, self.next_sid = self.next_sid, self.next_sid + 1
                         self.sessions[sid] = tokens[:-1]
                     self.log.append(('open', sid, len(tokens), h.get('state')))
+                    if self.open_delay:
+                        deadline = time.monotonic() + self.open_delay
+                        while time.monotonic() < deadline:
+                            if select.select([conn], [], [], 0.05)[0] and not conn.recv(1, socket.MSG_PEEK):
+                                self.log.append(('open_aborted', sid))
+                                return
                     send_frame(conn, b'ACK ', dict(ok=True, session=sid, prefill_s=0.001))
                     if h.get('state', 'full') != 'none':
                         blob = state_blob(tokens)
@@ -126,6 +138,10 @@ class FakeBox:
                     history = self.sessions[s]
                     if s != sid or keep > len(history):
                         send_frame(conn, b'ERR ', dict(error='bad step'))
+                        return
+                    if self.err_steps:
+                        self.log.append(('step_refused', s, keep, n))
+                        send_frame(conn, b'ERR ', dict(error=f'context length exceeded at {keep + n}', retry=False))
                         return
                     history[keep:] = ids
                     self.log.append(('step', s, keep, n))

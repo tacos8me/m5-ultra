@@ -17,7 +17,7 @@ import time
 import numpy as np
 import torch
 
-from . import macpack
+from . import macpack, preempt
 
 SOURCE_LAYERS = (2, 8, 14, 20)
 ENCODER_LAYERS = 21
@@ -409,6 +409,8 @@ def install():
     orig_layer = M.DeepseekV4DecoderLayer.forward_hc_pre_from_prev
 
     def layer_forward(self, positions, hidden_states, input_ids, forward_batch, input_ids_global, prev_pre):
+        if preempt._win is not None:  # a preemptible prefill chunk (every rank): parked STEPs may run here
+            preempt.point()
         if cap.trace is not None:
             mask = positions >= cap.trace_start
             cap.trace_mask = mask

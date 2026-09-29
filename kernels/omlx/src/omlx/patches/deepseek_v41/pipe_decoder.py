@@ -1,4 +1,6 @@
 """Original-precision DS41 layers 20..39; encoder sessions live on the RTX box."""
+import hashlib
+import struct
 import json
 import os
 from pathlib import Path
@@ -81,7 +83,12 @@ class DecoderHalf(LanguageModel):
         mid = c.n_layers // 2
         prefilled = len(tokens) - 1
         if (manifest["format"] != FORMAT or manifest["identity"] != identity
-                or manifest["prompt_tokens"] != len(tokens) or manifest["token_sha256"] != token_digest(tokens)):
+                or manifest["prompt_tokens"] != len(tokens)):
+            raise ValueError("Encoder state format, identity or prompt mismatch")
+        # Serialize once: preserve struct.pack range/type validation and compare
+        # exact wire bytes without allocating a million Python integers.
+        token_bytes = struct.pack("<%dI" % len(tokens), *tokens)
+        if manifest["token_sha256"] != hashlib.sha256(token_bytes).hexdigest():
             raise ValueError("Encoder state format, identity or prompt mismatch")
         layers = manifest["layers"]
         if manifest.get("encoder_layers", len(layers)) != mid + 1 or len(layers) != mid + 1:
@@ -94,7 +101,7 @@ class DecoderHalf(LanguageModel):
                 raise ValueError("Unexpected encoder tensor " + name)
             return value
 
-        if raw("tokens", "<u4").tolist() != list(tokens):
+        if raw("tokens", "<u4").tobytes() != token_bytes:
             raise ValueError("Encoder state tokens mismatch")
         ratios = [c.compress_ratios[i] if i in c.kv_source_layers else 0 for i in range(mid + 1)]
         for i, layer in enumerate(layers):

@@ -145,19 +145,67 @@ def warmup():
                 break
             except Exception:
                 time.sleep(1)
-        for content, max_tokens in prompts:
+        def complete(content, max_tokens):
             body = json.dumps({'model': model, 'messages': [{'role': 'user', 'content': content}],
                                'max_tokens': max_tokens, 'temperature': 0}).encode()
             req = urllib.request.Request(base + '/v1/chat/completions', body, {'Content-Type': 'application/json'})
             reply = json.loads(urllib.request.urlopen(req, timeout=900).read())
             if not reply.get('choices'):
                 raise RuntimeError(f'warmup reply without choices: {str(reply)[:200]}')
+        for content, max_tokens in prompts:
+            complete(content, max_tokens)
+        if os.environ.get('DS41_OG_WARM_PAIRS', '1') == '1':
+            try:
+                warm_pairs(complete, text)
+            except Exception as e:  # noqa: BLE001 -- best effort: cold pipelines only cost the first c3+ steps
+                print(json.dumps({'warmup_pairs': 'skipped', 'error': repr(e)[:300]}), flush=True)
         print(json.dumps({'warmup': 'done', 's': round(time.time() - t0, 1)}), flush=True)
         WARM.set()
     except Exception as e:
         # Stay unhealthy: the supervisor treats a missing /health as not ready.
         print(json.dumps({'warmup': 'failed', 'error': repr(e)[:300]}), flush=True)
         os.kill(os.getpid(), signal.SIGTERM)
+
+
+def warm_pairs(complete, text):
+    """Run every fused-pair verify shape once before traffic (og_fused + batched DSpark drafts).
+
+    Each custom kernel is specialised on its row count, so the first c3+/c4 steps after a restart build
+    ~100 Metal pipelines (~0.2 s in all, partial-load c4_cold.py); the singleton warmup never runs a pair.
+    Two concurrent requests with pairs allowed at 2 sessions; the cost policy's depth is cycled so the pair
+    covers (2..5) x (2..5) verify rows. Widths 2-5 are row-prefix invariant, so nothing depends on this
+    (and no client sees these outputs); FUSE_MIN and the policy are restored afterwards.
+    """
+    import itertools
+    from omlx.patches.deepseek_v41 import og_fused, pipe_session
+    if not og_fused.ENABLED:
+        return
+    ctl = pipe_session.PipelineDepthController
+    saved = og_model.FUSE_MIN, ctl.choose_cost_depth
+    turn = itertools.count()
+
+    def cycled(self, probabilities, context):
+        if not self.cost_policy or context < 1024:
+            return saved[1](self, probabilities, context)
+        k = next(turn)  # the pair's two requests draft in turn: one walks 1..4 per pass, the other per 4 passes
+        return 1 + ((k // 2) % 4 if k % 2 == 0 else (k // 8) % 4)
+    og_model.FUSE_MIN, ctl.choose_cost_depth = 2, cycled
+    errors, t0 = [], time.time()
+    before = og_model.STATS['fused_calls']
+
+    def one():
+        try:
+            complete(text + '\n\nExplain this code in detail.', 96)
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e)[:200])
+    try:
+        threads = [threading.Thread(target=one) for _ in range(2)]
+        [t.start() for t in threads]
+        [t.join() for t in threads]
+    finally:
+        og_model.FUSE_MIN, ctl.choose_cost_depth = saved
+    print(json.dumps({'warmup_pairs': 'done' if not errors else 'partial', 's': round(time.time() - t0, 1),
+                      'fused_calls': og_model.STATS['fused_calls'] - before, 'errors': errors}), flush=True)
 
 
 if os.environ.get('DS41_WARMUP', '1') == '1':

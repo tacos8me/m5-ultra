@@ -26,10 +26,12 @@ if args.mode == 'og' and os.environ.get('FAKE_OG_NOSTART') and os.path.exists(os
     raise SystemExit(3)  # like an og worker whose warm-up through the box fails
 if args.mode == 'q3' and os.environ.get('FAKE_Q3_NOSTART') and os.path.exists(os.environ['FAKE_Q3_NOSTART']):
     raise SystemExit(3)
+if args.mode == 'og' and os.environ.get('FAKE_OG_START_DELAY'):
+    time.sleep(float(os.environ['FAKE_OG_START_DELAY']))  # a slow og load (restart after a crash)
 if args.mode == 'q3' and os.environ.get('FAKE_Q3_START_DELAY'):
     time.sleep(float(os.environ['FAKE_Q3_START_DELAY']))  # a slow model load: the supervisor sends keepalives
 app = FastAPI()
-STATS = dict(requests=0, resumed=0)
+STATS = dict(requests=0, resumed=0, cancelled=0, pid=os.getpid())
 
 
 @app.get('/health')
@@ -112,6 +114,14 @@ async def complete(request: Request):
         return chunk({key: text_of(t)})
 
     if not body.get('stream'):
+        if body.get('fake_slow_s'):
+            # A long non-streaming generation; like omlx, poll the connection and cancel when it goes away.
+            deadline = time.monotonic() + float(body['fake_slow_s'])
+            while time.monotonic() < deadline:
+                if await request.is_disconnected():
+                    STATS['cancelled'] += 1
+                    return JSONResponse({'error': 'cancelled'}, status_code=499)
+                await asyncio.sleep(0.1)
         if fail_after is not None:
             return JSONResponse({'error': {'message': marker(list(range(fail_after)), prompt_tokens)}}, status_code=503)
         reasoning = ''.join(text_of(t) for t in range(total) if think and t < 10)
