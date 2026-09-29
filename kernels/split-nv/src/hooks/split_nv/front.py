@@ -26,6 +26,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import torch
 
+from split_nv import topk_det
 from split_nv.imagekeys import parse_images, prefix_digest, prompt_keys
 from split_nv.perf_flags import flag
 from split_nv.prefix_cache import PrefixIndex, _atomic_save, _load
@@ -587,7 +588,8 @@ class Front:
                     "tree_head": tree, "restart_pending": bool(tree) and not self.version.startswith(tree[:len(self.version.split("-")[0])]),
                     "dev_hook": os.environ.get("SPLIT_NV_DEV") == "1", "vision": self.engine.vision,
                     "prefill_perf": {k: os.environ.get(f"SPLIT_NV_{k.upper()}", "0") == "1"
-                                     for k in ("pf_overlap", "ce_ar", "q_nocopy")}}
+                                     for k in ("pf_overlap", "ce_ar", "q_nocopy")},
+                    "topk_det": topk_det.digest() if topk_det.installed() else False}
 
     # ---- HTTP: /v1/prefill (phase-2 compatible), /health, /v1/info, /v1/cache ------------------------------------
     def serve_http(self, host, port):

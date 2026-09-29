@@ -89,6 +89,9 @@ class Engine:
 
         self.cap = H.CAP
         self.cap.auto = False
+        from split_nv import topk_det
+        topk_det.install()
+        topk_det.install_audit()
         if os.environ.get("SPLIT_NV_SELFTEST") != "numerics":
             from split_nv.consistent import install
             install()

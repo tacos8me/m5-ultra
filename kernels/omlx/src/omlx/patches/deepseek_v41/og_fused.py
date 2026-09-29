@@ -18,7 +18,7 @@ import os
 
 import mlx.core as mx
 
-from . import attn_fusions, decode_fusions, fast_qmv, head, hc_fuse, moe_decode
+from . import attn_fusions, attn_in, attn_out, decode_fusions, fast_qmv, ffn_fuse, head, hc_fuse, moe_decode
 from .activation import quantize_swiglu_activation
 from .quantization import QuantizedProjection, quantize_activation
 
@@ -92,10 +92,13 @@ def eligible(lm, lengths):
     )
 
 
-def _attention(attn, x, bounds, caches, shareds, starts, prebuilt):
+def _attention(attn, x, bounds, caches, shareds, starts, prebuilt, xq=None):
     c = attn._config
-    xq = quantize_activation(x)
-    query, kv_input = _rows(attn.wq_a, xq), _rows(attn.wkv, xq)
+    if xq is not None:
+        query, kv_input = attn_in.input_projections(xq, attn.wq_a, attn.wkv)
+    else:
+        xq = quantize_activation(x)
+        query, kv_input = _rows(attn.wq_a, xq), _rows(attn.wkv, xq)
     qrs, qr8s = [], []
     for b, e in bounds:
         qr, qr8 = attn_fusions.rms_quant(query[:, b:e], attn.q_norm.weight, attn.q_norm.eps, True)
@@ -112,6 +115,8 @@ def _attention(attn, x, bounds, caches, shareds, starts, prebuilt):
     out = mx.concatenate(heads, 1)
     grouped = out.reshape(1, out.shape[1], c.o_groups, -1)
     weight = attn.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
+    if attn_out.supported(attn.wo_b, grouped, weight, max_rows=MAX_ROWS):
+        return _rows(attn.wo_b, attn_out.grouped_gemv_q(attn.wo_a, grouped, weight, compact=False).flatten(-2))
     projected = decode_fusions.grouped_gemv(grouped, weight).flatten(-2)
     return _rows(attn.wo_b, quantize_activation(projected))
 
@@ -139,13 +144,20 @@ def _moe(moe, x, bounds):
 def _block(layer, h, pre, bounds, caches, shareds, starts, prebuilt, first):
     """hc_fuse.block_forward over all requests' rows (mHC kernels are per row)."""
     c = layer._config
-    mix_a, x = hc_fuse.project_pre_norm(h, pre, layer.hc_attn_fn, layer.attn_norm.weight,
-                                        c.norm_eps, layer.attn_norm.eps)
-    a = _attention(layer.attn, x, bounds, caches, shareds, starts, prebuilt)
+    xq = None
+    if attn_in.eligible(layer.attn, h, max_rows=MAX_ROWS):
+        mix_a, x, xq = attn_in.project_pre_norm_q(h, pre, layer.hc_attn_fn, layer.attn_norm.weight,
+                                                  c.norm_eps, layer.attn_norm.eps)
+    else:
+        mix_a, x = hc_fuse.project_pre_norm(h, pre, layer.hc_attn_fn, layer.attn_norm.weight,
+                                            c.norm_eps, layer.attn_norm.eps)
+    a = _attention(layer.attn, x, bounds, caches, shareds, starts, prebuilt, xq)
     if first and hc_fuse.EARLY_SUBMIT:
         mx.async_eval(a)
     h, ap = hc_fuse.post_mix(a, h, mix_a, layer.hc_attn_scale, layer.hc_attn_base, c.hc_eps,
                              c.hc_sinkhorn_iters)
+    if ffn_fuse.eligible(layer, h, None, max_rows=MAX_ROWS):
+        return ffn_fuse.ffn_forward(layer, h, ap, bounds)
     mix_f, x = hc_fuse.project_pre_norm(h, ap, layer.hc_ffn_fn, layer.ffn_norm.weight,
                                         c.norm_eps, layer.ffn_norm.eps)
     f = _moe(layer.ffn, x, bounds)

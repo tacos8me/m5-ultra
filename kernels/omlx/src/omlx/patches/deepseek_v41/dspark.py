@@ -13,7 +13,7 @@ import mlx.nn as nn
 
 from ..mlx_lm_mtp.deepseek_v4_dspark import DSparkContextCache
 from .head import project_logits
-from . import decode_fusions, woa_compact
+from . import attn_out, decode_fusions, woa_compact
 from .language import Attention, Block, RMSNorm, hc_mixes, hc_post, hc_pre, rope
 from .quantization import quantize_activation
 
@@ -84,9 +84,12 @@ class DSparkAttention(Attention):
         out = rope(out, positions, c, False, inverse=True)
         grouped = out.reshape(batch, length, c.o_groups, -1)
         weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
+        supported = decode_fusions.grouped_gemv_supported(grouped, weight)
+        if supported and attn_out.supported(self.wo_b, grouped, weight):
+            return self.wo_b.project_quantized(attn_out.grouped_gemv_q(self.wo_a, grouped, weight).flatten(-2))
         projected = (
             woa_compact.grouped_gemv(self.wo_a, grouped, weight)
-            if decode_fusions.grouped_gemv_supported(grouped, weight)
+            if supported
             else mx.einsum("bsgd,grd->bsgr", grouped, weight)
         )
         return self.wo_b(projected.flatten(-2))
@@ -315,6 +318,8 @@ def _attention_batch(attn, x, bounds, caches):
     out = mx.concatenate(heads, 1)
     grouped = out.reshape(1, out.shape[1], c.o_groups, -1)
     weight = attn.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
+    if attn_out.supported(attn.wo_b, grouped, weight, max_rows=_MAX_BATCH_ROWS):
+        return og_fused._rows(attn.wo_b, attn_out.grouped_gemv_q(attn.wo_a, grouped, weight, compact=False).flatten(-2))
     projected = decode_fusions.grouped_gemv(grouped, weight)
     return og_fused._rows(attn.wo_b, quantize_activation(projected.flatten(-2)))
 

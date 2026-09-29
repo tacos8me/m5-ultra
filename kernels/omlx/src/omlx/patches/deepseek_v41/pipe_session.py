@@ -16,13 +16,23 @@ from ..mlx_lm_mtp.copy_draft import CopyIndex
 
 # Pipeline verify cycle C(L), L=2..5 rows, in ms: box step + link + Mac layers
 # 20-39/head + drafter. Same (context tier -> costs) shape as the served table.
-# Re-profiled for og-speed (Sep 25): box 1f592ea step RTT from the Mac
-# ~9.9/10.5/10.6/11.1 + Mac layers 20-39/head 14.7/17.2/18.9/20.7 (one-pass
-# head, MXFP4 MoE launches) + width-4 drafter 4.3 + accept 0.3; long contexts
-# add ~0.3/0.6-1.1 ms of Mac attention. The flatter curve favours deeper drafts.
-_PIPE_COSTS = ((524288, (30.2, 33.4, 35.4, 37.8)),
-               (131072, (29.9, 32.9, 34.7, 37.1)),
-               (0, (29.6, 32.6, 34.4, 36.7)))
+# Re-profiled Sep 29: box STEP RTT from the Mac at 25 ms gaps 7.6/8.1/8.8/9.6
+# (decode-findings minus the ~0.7 ms box-perf gain) + Mac layers 20-39/head
+# 12.6/14.1/15.5/17.4 (real-boundary partial model, FFN fusion) + width-4
+# drafter 3.5 + accept 0.4; long contexts add the box/link +0.5/+0.9 and Mac
+# attention +0.3/0.6-1.1 ms. Also the c2 table: interleaving hides the box, and
+# Mac + drafter alone has the same shape (EVICT only uses cost ratios).
+_PIPE_COSTS = ((524288, (25.6, 27.8, 30.1, 32.8)),
+               (131072, (24.9, 26.9, 29.0, 31.7)),
+               (0, (24.1, 26.1, 28.2, 30.8)))
+# Per-request share of a fused pair (og_fused, >= DS41_OG_FUSE_MIN decoding
+# requests): the box is hidden, so a verify row costs Mac time only and the
+# curve is steeper. Pair pass 3+3 / 5+5 = 19.9 / 27.5 ms -> 4.2 ms fixed per
+# request + 1.9 ms per row, + half the batched draft (4.76) + accept 0.4 + 2.3
+# scheduler overhead (fitted to served c4 140.6 vs c1 84.6 tok/s).
+_FUSED_COSTS = ((524288, (13.7, 15.8, 17.9, 19.9)),
+                (131072, (13.4, 15.3, 17.2, 19.2)),
+                (0, (13.1, 15.0, 16.9, 18.8)))
 
 
 # Calibration log (JSONL path): per DSpark cycle the drafter's confidences,
@@ -30,28 +40,42 @@ _PIPE_COSTS = ((524288, (30.2, 33.4, 35.4, 37.8)),
 _CALIB = os.environ.get('DS41_PIPE_CALIB', '')
 
 
-def _pipeline_costs():
-    raw = os.environ.get('DS41_PIPE_COSTS', '')
+def _pipeline_costs(name='DS41_PIPE_COSTS', default=_PIPE_COSTS):
+    raw = os.environ.get(name, '')
     if not raw:
-        return _PIPE_COSTS
+        return default
     tiers = []
     for part in raw.split(';'):
         floor, values = part.split(':')
         costs = tuple(float(x) for x in values.split(','))
         if len(costs) != 4 or any(c <= 0 for c in costs):
-            raise ValueError('DS41_PIPE_COSTS needs four positive L=2..5 costs per tier')
+            raise ValueError(f'{name} needs four positive L=2..5 costs per tier')
         tiers.append((int(floor), costs))
     return tuple(sorted(tiers, reverse=True))
 
 
 class PipelineDepthController(AcceptanceDepthController):
-    """Served EVICT rule with the pipeline's own profiled C(L)."""
+    """Served EVICT rule with the pipeline's own profiled C(L).
+
+    ``fused`` (optional callable) reports whether fused-pair verify is live;
+    then the Mac-only per-request table applies. Both tables are fixed offline
+    profiles; the regime only moves the verify width within L=2..5, which is
+    row-prefix invariant, so it cannot change outputs. An explicit
+    DS41_PIPE_COSTS also replaces the fused table unless
+    DS41_PIPE_COSTS_FUSED is set.
+    """
     costs = _pipeline_costs()
+    fused_costs = _pipeline_costs('DS41_PIPE_COSTS_FUSED', costs if os.environ.get('DS41_PIPE_COSTS') else _FUSED_COSTS)
+
+    def __init__(self, depth, fused=None):
+        super().__init__(depth)
+        self.fused = fused
 
     def choose_cost_depth(self, probabilities, context):
         if not self.cost_policy or context < 1024:
             return self.cur
-        costs = next(c for floor, c in self.costs if context >= floor)
+        table = self.fused_costs if self.fused is not None and self.fused() else self.costs
+        costs = next(c for floor, c in table if context >= floor)
         cumulative, expected, best, best_utility = 1.0, 1.0, 1, -1.0
         for index, probability in enumerate(probabilities[: self.max_depth]):
             cumulative *= max(0.0, min(1.0, float(probability)))

@@ -86,10 +86,12 @@ async def gate_health(request, call_next):
 async def og_stats():
     from omlx.patches.deepseek_v41 import pipe_wire
     from omlx.patches.deepseek_v41 import fast_encode
+    from omlx.patches.deepseek_v41 import encoder_replay
     store = og_model.STORE.summary() if og_model.STORE is not None else None
     encoders = [e.summary() for e in fast_encode.ENCODERS]
     return dict(og_model.STATS, sessions=len(og_model.SESSIONS), recoveries=pipe_wire.RECOVERIES[-20:],
-                resume=og_resume.STATS, prefix_rows=store, encode=encoders[0] if encoders else fast_encode.STATS)
+                resume=og_resume.STATS, prefix_rows=store, encode=encoders[0] if encoders else fast_encode.STATS,
+                replay=encoder_replay.SEG_STATS)
 
 
 from omlx.patches.deepseek_v41 import fe_trace  # noqa: E402

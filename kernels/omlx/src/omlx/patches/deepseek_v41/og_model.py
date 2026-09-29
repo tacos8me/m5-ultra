@@ -78,8 +78,23 @@ FUSE_MIN = int(os.environ.get('DS41_OG_FUSE_MIN', '3'))
 # so it overlaps the emission), and build the copy-draft prompt index while the box prefills.
 EARLY_FIRST = os.environ.get('DS41_OG_EARLY_FIRST', '1') == '1'
 COPY_PREBUILD = os.environ.get('DS41_OG_COPY_PREBUILD', '1') == '1'
+# Admission slices: while other requests decode, a new request's import+replay (the ~0.2-0.3 s tail replay
+# of layers 20-39) runs in slices of about this much GPU time between their scheduler steps instead of in
+# one piece (each stream then sees steps ~slice ms longer instead of one 0.2-0.3 s stall; the new request
+# pays the interleaved steps). Same ops in the same order on the same stream. 0 = one piece (old behaviour).
+ADMIT_SLICE_MS = float(os.environ.get('DS41_OG_ADMIT_SLICE_MS', '90'))
+
+
+def _layer_ms(rows):
+    """Replay GPU time of one layer over `rows` tail rows (M5 Ultra, measured 24-128 rows): slice planning."""
+    return 1.8 + 0.052 * rows
 _lock = threading.Lock()
 _ids = itertools.count(1)
+
+
+def _fused_regime():
+    """Fused-pair verify is live: enough open sessions for og_fused pairs (depth costs only)."""
+    return og_fused.ENABLED and len(SESSIONS) >= FUSE_MIN
 
 
 def register(encoder):
@@ -211,7 +226,7 @@ class OgLanguageModel(DecoderHalf):
         return None
 
     def make_mtp_depth_controller(self, depth):
-        return PipelineDepthController(depth)
+        return PipelineDepthController(depth, fused=_fused_regime)
 
     def _gpu_warm(self):
         if not GPU_WARM_S:
@@ -500,6 +515,9 @@ class Job(threading.Thread):
         self.copy_prompt = None
         self.done = threading.Event()
         self.cancelled = False
+        # Admission slices (engine thread only): the import_state_steps generator, its result or error.
+        self.replay = self.imported = self.replay_error = None
+        self.replay_start = self.replay_marks = None
 
     def _open(self, delta_from):
         self.encoder = EncoderSession(self.host, self.port)
@@ -594,7 +612,15 @@ class OgPrefill:
                 self.failed.add(request.request_id)
                 og_failover.open_failed(request.request_id, job.error)
                 return True
-            return not job.done.is_set()
+            if not job.done.is_set():
+                return True
+            if fe_trace.ON and not getattr(job, 'seen_done', False):
+                job.seen_done = True
+                fe_trace.og_stamp(request.request_id, 'defer_done')
+            if job.replay is not None or (ADMIT_SLICE_MS > 0 and job.imported is None and job.replay_error is None
+                                          and getattr(scheduler, 'running', None)):
+                return self.advance(scheduler, request, job)
+            return False
         tokens = request.prompt_token_ids or []
         images = None
         if request.vlm_inputs_embeds is not None:
@@ -617,6 +643,40 @@ class OgPrefill:
         job.start()
         return True
 
+    def advance(self, scheduler, request, job):
+        """One admission slice of this request's import+replay (engine thread, engine stream).
+
+        True while unfinished (the request stays deferred and the scheduler runs the decode step of the
+        requests already running); False once imported or failed (prepare() then installs it or takes
+        the failure path). With nobody else decoding, the rest runs at once.
+        """
+        lm = language_model_of(scheduler.model)
+        budget = ADMIT_SLICE_MS if getattr(scheduler, 'running', None) else float('inf')
+        with mx.stream(scheduler._stream):
+            try:
+                if job.replay is None:
+                    tensors, manifest, _ = job.result
+                    job.replay_start = time.perf_counter()
+                    fe_trace.og_stamp(request.request_id, 'prepare_start')
+                    marks = job.replay_marks = fe_trace.for_request(request.request_id)
+                    job.replay = lm.import_state_steps(tensors, manifest, request.prompt_token_ids,
+                                                       identity=job.encoder.identity, base_rows=job.base_rows,
+                                                       **({'marks': marks} if marks is not None else {}))
+                    STATS['admit_sliced'] = STATS.get('admit_sliced', 0) + 1
+                spent = 0.0
+                while spent < budget:
+                    rows = next(job.replay)
+                    spent += _layer_ms(rows or 128)
+            except StopIteration as done:
+                job.imported, job.replay = done.value, None
+                return False
+            except Exception as exc:  # noqa: BLE001 -- prepare() takes the failed-import path
+                job.replay_error, job.replay = exc, None
+                return False
+        STATS['admit_slices'] = STATS.get('admit_slices', 0) + 1
+        scheduler._ds41_opened = True  # a step that ran a slice has work: no idle wait before the next one
+        return True
+
     def prepare(self, scheduler, request):
         job = self.jobs.pop(request.request_id, None)
         if job is None:
@@ -628,14 +688,25 @@ class OgPrefill:
             logger.error('ds41-og box open failed for %s: %s', request.request_id, job.error)
             return False
         tensors, manifest, open_s = job.result
-        start = time.perf_counter()
-        fe_trace.og_stamp(request.request_id, 'prepare_start')
+        start = time.perf_counter() if job.replay_start is None else job.replay_start
+        if job.replay_start is None:
+            fe_trace.og_stamp(request.request_id, 'prepare_start')
         marks = fe_trace.for_request(request.request_id)
         encoder = job.encoder
         lm = language_model_of(scheduler.model)
         try:
-            cache, rows = lm.import_state(tensors, manifest, tokens, identity=encoder.identity,
-                                          base_rows=job.base_rows, **({'marks': marks} if marks is not None else {}))
+            while job.replay is not None:  # not expected: should_defer() finishes it; finish here if not
+                try:
+                    next(job.replay)
+                except StopIteration as done:
+                    job.imported, job.replay = done.value, None
+            if job.replay_error is not None:
+                raise job.replay_error
+            if job.imported is not None:
+                cache, rows = job.imported
+            else:
+                cache, rows = lm.import_state(tensors, manifest, tokens, identity=encoder.identity,
+                                              base_rows=job.base_rows, **({'marks': marks} if marks is not None else {}))
             mx.eval([x for item in cache for x in item.cache if x is not None] + list(rows))
             fe_trace.og_stamp(request.request_id, 'import_eval')
             if DIGEST:

@@ -12,7 +12,7 @@ import numpy as np
 from .cache import DeepseekV41Cache
 from .config import ModelConfig
 from .dspark import make_stages
-from .encoder_replay import FORMAT, build_cache, empty_slot, replay
+from .encoder_replay import FORMAT, build_cache, empty_slot, replay_steps
 from .handoff import token_digest
 from .head import project_logits
 from .language import Block, LanguageModel, RMSNorm, hc_pre
@@ -54,7 +54,19 @@ class DecoderHalf(LanguageModel):
         return cache
 
     def import_state(self, tensors, manifest, tokens, *, identity, base_rows=None, marks=None):
-        """Import a full, lean or delta ``ds41-encoder-state-v1`` (raw wire tensors).
+        steps = DecoderHalf.import_state_steps(self, tensors, manifest, tokens, identity=identity,
+                                               base_rows=base_rows, marks=marks)
+        while True:
+            try:
+                next(steps)
+            except StopIteration as done:
+                return done.value
+
+    def import_state_steps(self, tensors, manifest, tokens, *, identity, base_rows=None, marks=None):
+        """import_state() as a generator (encoder_replay.replay_steps): yields after each replayed layer and
+        returns (cache, rows). Validation and the array import run on the first next().
+
+        Import a full, lean or delta ``ds41-encoder-state-v1`` (raw wire tensors).
 
         Returns (cache, rows): rows = layer 20's packed global KV / index K for
         positions [0, N-1), which a prefix store may keep for a later delta
@@ -144,7 +156,8 @@ class DecoderHalf(LanguageModel):
         if marks is not None:
             mx.eval(hidden, pre, slots[2], slots[3])
             marks.setdefault("og.import_arrays", time.time())
-        replay(self, cache, hidden, pre, first, tokens, **({"marks": marks} if marks is not None else {}))
+        yield from replay_steps(self, cache, hidden, pre, first, tokens, marks,
+                                seg_key=(manifest.get("identity"), manifest.get("numerics")))
         return cache, (slots[2], slots[3])
 
     def forward_boundary(self, h, pre, cache, *, start, kv=None, index=None,

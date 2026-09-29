@@ -1,0 +1,26 @@
+== truth: ffn
+c1 calib (code, 459 cyc)  old: 3.283 tok/cyc 30.60 ms 107.3 tok/s | new: 3.261 30.20 108.0  +0.68%
+c1 code-like proxy        old: 3.409 tok/cyc 30.75 ms 110.9 tok/s | new: 3.388 30.36 111.6  +0.63%
+c1 current-mix proxy      old: 2.853 tok/cyc 30.08 ms 94.9 tok/s | new: 2.832 29.60 95.7  +0.84%
+c1 prose-like proxy       old: 2.439 tok/cyc 29.53 ms 82.6 tok/s | new: 2.421 29.01 83.5  +1.01%
+c2 calib (code, 459 cyc)  old: 3.283 tok/cyc 21.95 ms 149.6 tok/s | new: 3.261 21.67 150.5  +0.65%
+c2 code-like proxy        old: 3.409 tok/cyc 22.06 ms 154.6 tok/s | new: 3.388 21.79 155.5  +0.61%
+c2 current-mix proxy      old: 2.853 tok/cyc 21.58 ms 132.2 tok/s | new: 2.832 21.24 133.3  +0.80%
+c2 prose-like proxy       old: 2.439 tok/cyc 21.18 ms 115.2 tok/s | new: 2.421 20.82 116.3  +0.94%
+c4 calib (code, 459 cyc)  old: 3.283 tok/cyc 18.37 ms 178.7 tok/s | new: 3.224 17.56 183.7  +2.78%  [pipe table only: 180.65 +1.10%]
+c4 code-like proxy        old: 3.409 tok/cyc 18.49 ms 184.4 tok/s | new: 3.354 17.74 189.1  +2.51%  [pipe table only: 186.29 +1.01%]
+c4 current-mix proxy      old: 2.853 tok/cyc 17.96 ms 158.9 tok/s | new: 2.786 16.91 164.8  +3.70%  [pipe table only: 161.08 +1.39%]
+c4 prose-like proxy       old: 2.439 tok/cyc 17.51 ms 139.3 tok/s | new: 2.367 16.25 145.7  +4.58%  [pipe table only: 141.65 +1.67%]
+== truth: prod
+c1 calib (code, 459 cyc)  old: 3.283 tok/cyc 31.16 ms 105.4 tok/s | new: 3.261 30.76 106.0  +0.61%
+c1 code-like proxy        old: 3.409 tok/cyc 31.30 ms 108.9 tok/s | new: 3.388 30.93 109.6  +0.57%
+c1 current-mix proxy      old: 2.853 tok/cyc 30.65 ms 93.1 tok/s | new: 2.832 30.19 93.8  +0.77%
+c1 prose-like proxy       old: 2.439 tok/cyc 30.11 ms 81.0 tok/s | new: 2.421 29.60 81.8  +0.93%
+c2 calib (code, 459 cyc)  old: 3.283 tok/cyc 22.51 ms 145.9 tok/s | new: 3.261 22.23 146.7  +0.56%
+c2 code-like proxy        old: 3.409 tok/cyc 22.61 ms 150.8 tok/s | new: 3.388 22.35 151.6  +0.52%
+c2 current-mix proxy      old: 2.853 tok/cyc 22.15 ms 128.8 tok/s | new: 2.832 21.83 129.7  +0.70%
+c2 prose-like proxy       old: 2.439 tok/cyc 21.76 ms 112.1 tok/s | new: 2.421 21.41 113.0  +0.84%
+c4 calib (code, 459 cyc)  old: 3.283 tok/cyc 18.75 ms 175.1 tok/s | new: 3.224 17.95 179.6  +2.60%  [pipe table only: 176.90 +1.03%]
+c4 code-like proxy        old: 3.409 tok/cyc 18.86 ms 180.8 tok/s | new: 3.354 18.13 185.0  +2.35%  [pipe table only: 182.46 +0.95%]
+c4 current-mix proxy      old: 2.853 tok/cyc 18.34 ms 155.5 tok/s | new: 2.786 17.31 160.9  +3.45%  [pipe table only: 157.57 +1.31%]
+c4 prose-like proxy       old: 2.439 tok/cyc 17.90 ms 136.3 tok/s | new: 2.367 16.66 142.1  +4.26%  [pipe table only: 138.40 +1.57%]

@@ -73,6 +73,13 @@ e18719e fix(split-nv): copy-engine all-reduce uses a pull protocol (remote reads
 cd54129 test(prefill-perf): time mode ovl_q plan, clean 8K/6K timings; task A variants measured
 3c631c2 fix(split-nv): overlapped halves keep their own capture mode and forward flags across hand-overs
 b4f5ea4 fix(split-nv): overlapped chunks evict out-of-window SWA slots on the unsplit schedule (at the next chunk's prepare)
+47a5f18 chore(topk-det): verbatim copies of SGLang topk_v2.cuh / topk_impl.cuh (a618602) as the base of the hook kernel
+17db791 fix(split-nv): exact deterministic top-k when the indexer threshold bin overflows (topk-det)
+020a8c7 fix(topk-det): overflow_select out of line over the global row (hot-path registers and smem unchanged)
+725cc7e test(topk-det): GPU identity/exactness/step==prefill check vs the in-tree module (guarded runner)
+45c5c2e test(topk-det): production-size timing shapes under FULL=1
+e923471 feat(topk-det): optional prefill overflow audit (SPLIT_NV_TOPK_AUDIT=1) for maintenance windows
+0802427 test(topk-det): window gate runner and repetitive-prompt id builder
 
 sglang (757e8f3..a618602):
 fca050c feat(split-nv): optional prompt-state capture hooks for encoder prefill

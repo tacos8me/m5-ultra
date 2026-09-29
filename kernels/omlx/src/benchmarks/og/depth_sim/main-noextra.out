@@ -1,0 +1,180 @@
+
+### prod c1  true C(L2..5)@8K (24.66, 26.72, 28.84, 31.35) (no extra overhead)
+  [calib all (code)]  hindsight oracle 115.19 (+9.3%)
+     old Sep25: 3.283 tok/cyc 31.16 ms 105.38 (+0.00%) L-mix 0.02/0.07/0.24/0.66
+     new c1 table: 3.261 tok/cyc 30.82 ms 105.83 (+0.43%) L-mix 0.02/0.14/0.26/0.58
+     matched table: 3.261 tok/cyc 30.82 ms 105.83 (+0.43%) L-mix 0.02/0.14/0.26/0.58
+     fixed d4 (L5): 3.318 tok/cyc 32.31 ms 102.71 (-2.53%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.952 tok/cyc 29.73 ms 99.31 (-5.76%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.253 tok/cyc 30.48 ms 106.73 (+1.29%) L-mix 0.08/0.14/0.23/0.55
+  [code-like proxy]  hindsight oracle 118.48 (+8.8%)
+     old Sep25: 3.409 tok/cyc 31.30 ms 108.94 (+0.00%) L-mix 0.02/0.06/0.22/0.69
+     new c1 table: 3.388 tok/cyc 30.98 ms 109.35 (+0.38%) L-mix 0.02/0.12/0.24/0.62
+     matched table: 3.388 tok/cyc 30.98 ms 109.35 (+0.38%) L-mix 0.02/0.12/0.24/0.62
+     fixed d4 (L5): 3.441 tok/cyc 32.31 ms 106.49 (-2.24%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 3.042 tok/cyc 29.73 ms 102.32 (-6.08%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.375 tok/cyc 30.65 ms 110.11 (+1.08%) L-mix 0.07/0.12/0.23/0.58
+  [current-mix proxy]  hindsight oracle 103.49 (+11.2%)
+     old Sep25: 2.853 tok/cyc 30.65 ms 93.09 (+0.00%) L-mix 0.04/0.11/0.31/0.53
+     new c1 table: 2.832 tok/cyc 30.24 ms 93.64 (+0.59%) L-mix 0.04/0.21/0.31/0.44
+     matched table: 2.832 tok/cyc 30.24 ms 93.64 (+0.59%) L-mix 0.04/0.21/0.31/0.44
+     fixed d4 (L5): 2.900 tok/cyc 32.30 ms 89.78 (-3.55%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.638 tok/cyc 29.72 ms 88.78 (-4.63%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.830 tok/cyc 29.96 ms 94.45 (+1.46%) L-mix 0.11/0.20/0.25/0.44
+  [prose-like proxy]  hindsight oracle 91.46 (+12.9%)
+     old Sep25: 2.439 tok/cyc 30.11 ms 81.02 (+0.00%) L-mix 0.07/0.15/0.37/0.40
+     new c1 table: 2.421 tok/cyc 29.64 ms 81.66 (+0.79%) L-mix 0.07/0.28/0.34/0.31
+     matched table: 2.421 tok/cyc 29.64 ms 81.66 (+0.79%) L-mix 0.07/0.28/0.34/0.31
+     fixed d4 (L5): 2.498 tok/cyc 32.31 ms 77.33 (-4.55%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.326 tok/cyc 29.73 ms 78.24 (-3.43%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.420 tok/cyc 29.39 ms 82.33 (+1.61%) L-mix 0.16/0.25/0.25/0.35
+
+### prod c2  true C(L2..5)@8K (17.04, 18.63, 20.01, 21.79) (no extra overhead)
+  [calib all (code)]  hindsight oracle 167.67 (+9.6%)
+     old Sep25: 3.283 tok/cyc 21.47 ms 152.94 (+0.00%) L-mix 0.02/0.07/0.24/0.66
+     new c1 table: 3.261 tok/cyc 21.23 ms 153.59 (+0.43%) L-mix 0.02/0.14/0.26/0.58
+     matched table: 3.261 tok/cyc 21.20 ms 153.85 (+0.59%) L-mix 0.03/0.12/0.29/0.56
+     fixed d4 (L5): 3.318 tok/cyc 22.28 ms 148.91 (-2.63%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.952 tok/cyc 20.44 ms 144.46 (-5.54%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.244 tok/cyc 20.95 ms 154.84 (+1.25%) L-mix 0.10/0.12/0.25/0.54
+  [code-like proxy]  hindsight oracle 172.39 (+9.0%)
+     old Sep25: 3.409 tok/cyc 21.57 ms 158.09 (+0.00%) L-mix 0.02/0.06/0.22/0.69
+     new c1 table: 3.388 tok/cyc 21.35 ms 158.70 (+0.39%) L-mix 0.02/0.12/0.24/0.62
+     matched table: 3.388 tok/cyc 21.32 ms 158.94 (+0.54%) L-mix 0.02/0.11/0.27/0.60
+     fixed d4 (L5): 3.441 tok/cyc 22.29 ms 154.40 (-2.33%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 3.042 tok/cyc 20.44 ms 148.83 (-5.85%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.373 tok/cyc 21.08 ms 160.07 (+1.25%) L-mix 0.09/0.10/0.24/0.57
+  [current-mix proxy]  hindsight oracle 150.82 (+11.6%)
+     old Sep25: 2.853 tok/cyc 21.11 ms 135.18 (+0.00%) L-mix 0.04/0.11/0.31/0.53
+     new c1 table: 2.832 tok/cyc 20.82 ms 135.97 (+0.59%) L-mix 0.04/0.21/0.31/0.44
+     matched table: 2.832 tok/cyc 20.78 ms 136.24 (+0.79%) L-mix 0.06/0.18/0.34/0.43
+     fixed d4 (L5): 2.900 tok/cyc 22.28 ms 130.18 (-3.70%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.638 tok/cyc 20.43 ms 129.15 (-4.46%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.823 tok/cyc 20.55 ms 137.37 (+1.62%) L-mix 0.14/0.16/0.26/0.43
+  [prose-like proxy]  hindsight oracle 133.49 (+13.4%)
+     old Sep25: 2.439 tok/cyc 20.72 ms 117.73 (+0.00%) L-mix 0.07/0.15/0.37/0.40
+     new c1 table: 2.421 tok/cyc 20.40 ms 118.64 (+0.77%) L-mix 0.07/0.28/0.34/0.31
+     matched table: 2.421 tok/cyc 20.35 ms 118.92 (+1.01%) L-mix 0.09/0.24/0.37/0.30
+     fixed d4 (L5): 2.498 tok/cyc 22.28 ms 112.14 (-4.75%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.326 tok/cyc 20.43 ms 113.84 (-3.30%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.418 tok/cyc 20.16 ms 119.97 (+1.90%) L-mix 0.18/0.23/0.26/0.33
+
+### prod c4  true C(L2..5)@8K (11.28, 13.15, 15.03, 16.9) (no extra overhead)
+  [calib all (code)]  hindsight oracle 229.01 (+15.0%)
+     old Sep25: 3.283 tok/cyc 16.49 ms 199.08 (+0.00%) L-mix 0.02/0.07/0.24/0.66
+     new c1 table: 3.261 tok/cyc 16.22 ms 201.07 (+1.00%) L-mix 0.02/0.14/0.26/0.58
+     matched table: 3.203 tok/cyc 15.44 ms 207.38 (+4.17%) L-mix 0.11/0.25/0.19/0.46
+     fixed d4 (L5): 3.318 tok/cyc 17.39 ms 190.78 (-4.17%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.952 tok/cyc 15.46 ms 191.00 (-4.06%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.150 tok/cyc 15.07 ms 208.98 (+4.97%) L-mix 0.21/0.21/0.14/0.44
+  [code-like proxy]  hindsight oracle 234.24 (+14.1%)
+     old Sep25: 3.409 tok/cyc 16.60 ms 205.35 (+0.00%) L-mix 0.02/0.06/0.22/0.69
+     new c1 table: 3.388 tok/cyc 16.35 ms 207.20 (+0.90%) L-mix 0.02/0.12/0.24/0.62
+     matched table: 3.333 tok/cyc 15.64 ms 213.14 (+3.79%) L-mix 0.09/0.23/0.18/0.50
+     fixed d4 (L5): 3.441 tok/cyc 17.40 ms 197.80 (-3.68%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 3.042 tok/cyc 15.46 ms 196.78 (-4.18%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.287 tok/cyc 15.26 ms 215.34 (+4.86%) L-mix 0.19/0.20/0.13/0.48
+  [current-mix proxy]  hindsight oracle 209.77 (+18.3%)
+     old Sep25: 2.853 tok/cyc 16.09 ms 177.38 (+0.00%) L-mix 0.04/0.11/0.31/0.53
+     new c1 table: 2.832 tok/cyc 15.75 ms 179.77 (+1.35%) L-mix 0.04/0.21/0.31/0.44
+     matched table: 2.761 tok/cyc 14.76 ms 187.04 (+5.44%) L-mix 0.19/0.31/0.19/0.32
+     fixed d4 (L5): 2.900 tok/cyc 17.39 ms 166.79 (-5.97%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.638 tok/cyc 15.45 ms 170.78 (-3.72%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.723 tok/cyc 14.47 ms 188.22 (+6.11%) L-mix 0.29/0.24/0.14/0.32
+  [prose-like proxy]  hindsight oracle 189.01 (+21.2%)
+     old Sep25: 2.439 tok/cyc 15.64 ms 155.94 (+0.00%) L-mix 0.07/0.15/0.37/0.40
+     new c1 table: 2.421 tok/cyc 15.26 ms 158.61 (+1.71%) L-mix 0.07/0.28/0.34/0.31
+     matched table: 2.340 tok/cyc 14.07 ms 166.28 (+6.63%) L-mix 0.29/0.34/0.17/0.20
+     fixed d4 (L5): 2.498 tok/cyc 17.39 ms 143.67 (-7.87%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.326 tok/cyc 15.45 ms 150.54 (-3.47%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.335 tok/cyc 13.93 ms 167.67 (+7.52%) L-mix 0.39/0.23/0.16/0.22
+
+### ffn c1  true C(L2..5)@8K (24.07, 26.1, 28.19, 30.84) (no extra overhead)
+  [calib all (code)]  hindsight oracle 117.53 (+9.5%)
+     old Sep25: 3.283 tok/cyc 30.60 ms 107.28 (+0.00%) L-mix 0.02/0.07/0.24/0.66
+     new c1 table: 3.261 tok/cyc 30.19 ms 108.05 (+0.71%) L-mix 0.02/0.14/0.29/0.55
+     matched table: 3.261 tok/cyc 30.19 ms 108.05 (+0.71%) L-mix 0.02/0.14/0.29/0.55
+     fixed d4 (L5): 3.318 tok/cyc 31.80 ms 104.35 (-2.73%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.952 tok/cyc 29.08 ms 101.52 (-5.37%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.246 tok/cyc 29.85 ms 108.73 (+1.35%) L-mix 0.08/0.14/0.25/0.53
+  [code-like proxy]  hindsight oracle 120.85 (+9.0%)
+     old Sep25: 3.409 tok/cyc 30.75 ms 110.88 (+0.00%) L-mix 0.02/0.06/0.22/0.69
+     new c1 table: 3.388 tok/cyc 30.36 ms 111.61 (+0.66%) L-mix 0.02/0.12/0.27/0.59
+     matched table: 3.388 tok/cyc 30.36 ms 111.61 (+0.66%) L-mix 0.02/0.12/0.27/0.59
+     fixed d4 (L5): 3.441 tok/cyc 31.80 ms 108.20 (-2.42%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 3.042 tok/cyc 29.08 ms 104.59 (-5.67%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.373 tok/cyc 30.04 ms 112.29 (+1.27%) L-mix 0.07/0.12/0.24/0.57
+  [current-mix proxy]  hindsight oracle 105.67 (+11.4%)
+     old Sep25: 2.853 tok/cyc 30.08 ms 94.85 (+0.00%) L-mix 0.04/0.11/0.31/0.53
+     new c1 table: 2.832 tok/cyc 29.59 ms 95.71 (+0.90%) L-mix 0.04/0.21/0.34/0.42
+     matched table: 2.832 tok/cyc 29.59 ms 95.71 (+0.90%) L-mix 0.04/0.21/0.34/0.42
+     fixed d4 (L5): 2.900 tok/cyc 31.79 ms 91.22 (-3.83%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.638 tok/cyc 29.07 ms 90.75 (-4.32%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.827 tok/cyc 29.32 ms 96.44 (+1.67%) L-mix 0.12/0.20/0.26/0.43
+  [prose-like proxy]  hindsight oracle 93.46 (+13.1%)
+     old Sep25: 2.439 tok/cyc 29.53 ms 82.62 (+0.00%) L-mix 0.07/0.15/0.37/0.40
+     new c1 table: 2.421 tok/cyc 28.98 ms 83.52 (+1.09%) L-mix 0.07/0.28/0.36/0.29
+     matched table: 2.421 tok/cyc 28.98 ms 83.52 (+1.09%) L-mix 0.07/0.28/0.36/0.29
+     fixed d4 (L5): 2.498 tok/cyc 31.80 ms 78.57 (-4.90%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.326 tok/cyc 29.08 ms 79.98 (-3.19%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.417 tok/cyc 28.73 ms 84.14 (+1.84%) L-mix 0.16/0.25/0.27/0.32
+
+### ffn c2  true C(L2..5)@8K (16.45, 18.01, 19.36, 21.28) (no extra overhead)
+  [calib all (code)]  hindsight oracle 172.66 (+10.0%)
+     old Sep25: 3.283 tok/cyc 20.91 ms 156.99 (+0.00%) L-mix 0.02/0.07/0.24/0.66
+     new c1 table: 3.261 tok/cyc 20.62 ms 158.18 (+0.76%) L-mix 0.02/0.14/0.29/0.55
+     matched table: 3.261 tok/cyc 20.57 ms 158.55 (+0.99%) L-mix 0.03/0.13/0.31/0.53
+     fixed d4 (L5): 3.318 tok/cyc 21.77 ms 152.40 (-2.93%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.952 tok/cyc 19.79 ms 149.20 (-4.96%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.240 tok/cyc 20.33 ms 159.36 (+1.51%) L-mix 0.10/0.12/0.27/0.51
+  [code-like proxy]  hindsight oracle 177.46 (+9.4%)
+     old Sep25: 3.409 tok/cyc 21.02 ms 162.22 (+0.00%) L-mix 0.02/0.06/0.22/0.69
+     new c1 table: 3.388 tok/cyc 20.74 ms 163.36 (+0.70%) L-mix 0.02/0.12/0.27/0.59
+     matched table: 3.388 tok/cyc 20.70 ms 163.71 (+0.92%) L-mix 0.02/0.11/0.29/0.57
+     fixed d4 (L5): 3.441 tok/cyc 21.78 ms 158.02 (-2.59%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 3.042 tok/cyc 19.79 ms 153.72 (-5.24%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.369 tok/cyc 20.47 ms 164.62 (+1.48%) L-mix 0.09/0.10/0.26/0.55
+  [current-mix proxy]  hindsight oracle 155.52 (+11.9%)
+     old Sep25: 2.853 tok/cyc 20.54 ms 138.93 (+0.00%) L-mix 0.04/0.11/0.31/0.53
+     new c1 table: 2.832 tok/cyc 20.19 ms 140.24 (+0.94%) L-mix 0.04/0.21/0.34/0.42
+     matched table: 2.832 tok/cyc 20.13 ms 140.65 (+1.24%) L-mix 0.06/0.19/0.36/0.39
+     fixed d4 (L5): 2.900 tok/cyc 21.77 ms 133.23 (-4.10%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.638 tok/cyc 19.78 ms 133.39 (-3.98%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.813 tok/cyc 19.86 ms 141.64 (+1.95%) L-mix 0.15/0.16/0.30/0.39
+  [prose-like proxy]  hindsight oracle 137.80 (+13.7%)
+     old Sep25: 2.439 tok/cyc 20.14 ms 121.15 (+0.00%) L-mix 0.07/0.15/0.37/0.40
+     new c1 table: 2.421 tok/cyc 19.76 ms 122.51 (+1.12%) L-mix 0.07/0.28/0.36/0.29
+     matched table: 2.421 tok/cyc 19.69 ms 122.95 (+1.49%) L-mix 0.09/0.25/0.39/0.27
+     fixed d4 (L5): 2.498 tok/cyc 21.77 ms 114.76 (-5.27%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.326 tok/cyc 19.78 ms 117.58 (-2.94%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.416 tok/cyc 19.52 ms 123.78 (+2.17%) L-mix 0.18/0.23/0.29/0.30
+
+### ffn c4  true C(L2..5)@8K (10.81, 12.72, 14.63, 16.54) (no extra overhead)
+  [calib all (code)]  hindsight oracle 235.78 (+15.7%)
+     old Sep25: 3.283 tok/cyc 16.11 ms 203.76 (+0.00%) L-mix 0.02/0.07/0.24/0.66
+     new c1 table: 3.261 tok/cyc 15.79 ms 206.61 (+1.40%) L-mix 0.02/0.14/0.29/0.55
+     matched table: 3.190 tok/cyc 14.94 ms 213.50 (+4.78%) L-mix 0.13/0.25/0.18/0.44
+     fixed d4 (L5): 3.318 tok/cyc 17.03 ms 194.81 (-4.39%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.952 tok/cyc 15.06 ms 196.08 (-3.77%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.142 tok/cyc 14.58 ms 215.47 (+5.75%) L-mix 0.23/0.22/0.12/0.43
+  [code-like proxy]  hindsight oracle 241.01 (+14.7%)
+     old Sep25: 3.409 tok/cyc 16.23 ms 210.11 (+0.00%) L-mix 0.02/0.06/0.22/0.69
+     new c1 table: 3.388 tok/cyc 15.92 ms 212.81 (+1.28%) L-mix 0.02/0.12/0.27/0.59
+     matched table: 3.322 tok/cyc 15.15 ms 219.28 (+4.36%) L-mix 0.11/0.23/0.18/0.48
+     fixed d4 (L5): 3.441 tok/cyc 17.04 ms 201.98 (-3.87%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 3.042 tok/cyc 15.06 ms 202.01 (-3.86%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 3.274 tok/cyc 14.79 ms 221.28 (+5.31%) L-mix 0.20/0.21/0.13/0.46
+  [current-mix proxy]  hindsight oracle 216.48 (+19.1%)
+     old Sep25: 2.853 tok/cyc 15.70 ms 181.75 (+0.00%) L-mix 0.04/0.11/0.31/0.53
+     new c1 table: 2.832 tok/cyc 15.30 ms 185.01 (+1.80%) L-mix 0.04/0.21/0.34/0.42
+     matched table: 2.743 tok/cyc 14.21 ms 193.02 (+6.21%) L-mix 0.21/0.31/0.17/0.31
+     fixed d4 (L5): 2.900 tok/cyc 17.03 ms 170.31 (-6.29%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.638 tok/cyc 15.05 ms 175.32 (-3.54%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.706 tok/cyc 13.93 ms 194.28 (+6.89%) L-mix 0.31/0.25/0.13/0.31
+  [prose-like proxy]  hindsight oracle 195.52 (+22.2%)
+     old Sep25: 2.439 tok/cyc 15.25 ms 159.98 (+0.00%) L-mix 0.07/0.15/0.37/0.40
+     new c1 table: 2.421 tok/cyc 14.81 ms 163.46 (+2.18%) L-mix 0.07/0.28/0.36/0.29
+     matched table: 2.319 tok/cyc 13.48 ms 172.01 (+7.52%) L-mix 0.32/0.34/0.15/0.19
+     fixed d4 (L5): 2.498 tok/cyc 17.03 ms 146.71 (-8.30%) L-mix 0.00/0.00/0.00/1.00
+     fixed d3: 2.326 tok/cyc 15.05 ms 154.54 (-3.40%) L-mix 0.00/0.00/1.00/0.00
+     dinkelbach: 2.322 tok/cyc 13.37 ms 173.76 (+8.61%) L-mix 0.40/0.25/0.15/0.20

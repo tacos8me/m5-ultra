@@ -42,6 +42,7 @@ exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime 
   -e SPLIT_NV_TRACE="${SPLIT_NV_TRACE:-}" -e SPLIT_NV_DEV="${SPLIT_NV_DEV:-}" -e SPLIT_NV_TRIM="${SPLIT_NV_TRIM-1}" -e SPLIT_NV_B12X="${SPLIT_NV_B12X-1}" \
   -e SPLIT_NV_OG_MOE="${SPLIT_NV_OG_MOE-1}" -e SPLIT_NV_SPIN_S="${SPLIT_NV_SPIN_S-0.2}" \
   -e SPLIT_NV_PF_OVERLAP="${SPLIT_NV_PF_OVERLAP-0}" -e SPLIT_NV_CE_AR="${SPLIT_NV_CE_AR-0}" -e SPLIT_NV_Q_NOCOPY="${SPLIT_NV_Q_NOCOPY-0}" \
+  -e SPLIT_NV_TOPK_DET="${SPLIT_NV_TOPK_DET-1}" -e SPLIT_NV_TOPK_AUDIT="${SPLIT_NV_TOPK_AUDIT:-}" \
   -v "$ROOT":/home/ian/split-nv:ro \
   -v /home/ian/models/DeepSeek-V4.1-Flash-original:/home/ian/models/DeepSeek-V4.1-Flash-original:ro \
   "${SGLANG_MOUNT[@]}" \

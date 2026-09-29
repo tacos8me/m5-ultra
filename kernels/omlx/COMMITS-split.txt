@@ -1,7 +1,7 @@
 Applies on top of deepseek-v41.patch (head ef88391e):
 base: ef88391e
-head: 2a70d1b0 (branch ds41-probe, served as llama-swap ds41; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
-      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe)
+head: b16205ac (branch ds41-next2, served as llama-swap ds41; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
+      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe, then ds41-ffn + ds41-ttft2 merged as ds41-next2)
 
 5b17cbbc perf: keep DeepSeek V4.1 decode KV growth in place across extract and rollback
 88cfffd9 perf: score DeepSeek V4.1 decode index keys in one lazy tile
@@ -94,3 +94,12 @@ f7a48ef2 perf(ds41-fe): text-only prepare_inputs through the piece cache; privat
 0c476bc8 docs(ds41-probe): PROBE-MERGE-READY (counters, go/no-go, identity, deploy/rollback)
 8476793c feat(ds41-probe): stats-only copy-lock pre-send probe (DS41_OG_SPEC_PROBE)
 1bc1271a perf(ds41-woa): lossless byte storage for wo_a at verify widths 2-5
+
+2a70d1b0..b16205ac (no merges):
+03b2f5a6 docs(ds41-ffn): FFN-MERGE-READY (bitwise evidence, timings, projections, deploy/rollback); attn_out opt-in
+e333dcb7 perf(ds41-ttft2): faster Mac tail replay, detokenizer reuse, admission slices
+8afa2e14 perf(ds41-ffn): wo_a + wo_b input FP8 in one launch; wq_b + query RoPE in one launch (bitwise)
+f54d9810 test(ds41-ffn): bitwise unit tests for ffn_fuse/attn_in; keep Attention._input_projections signature
+18a120a4 perf(ds41-ffn): recalibrated depth-controller C(L) + fused-pair (c3+) table
+bc3d7087 perf(ds41-ffn): attention input pre-norm + FP8 + wq_a/wkv in two launches (bitwise)
+c2274ebd perf(ds41-ffn): fused FFN sublayer for decode/verify rows (bitwise)

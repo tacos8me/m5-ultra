@@ -36,7 +36,7 @@ from .mtp import DSparkMixin
 from .quantization import QuantizedProjection, pack_activation, quantize_activation
 from .routing import combine_sorted_experts
 from . import attn_fusions, decode_fusions, decode_topk, growth, affine_gather, fast_rope, moe_decode
-from . import hc_fuse, woa_compact
+from . import attn_in, attn_out, hc_fuse, woa_compact
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,11 @@ DS41_DECODE_ASYNC = int(os.environ.get("DS41_DECODE_ASYNC", "4"))
 VERIFY_TILE = int(os.environ.get("DS41_VERIFY_TILE", "0"))
 # Candidate-layer top-k for decode rows by exact radix select instead of a full argsort.
 DS41_INDEX_RADIX_CAND = os.environ.get("DS41_INDEX_RADIX_CAND", "0") == "1"  # off: aborts on tiny candidate sets (test_official_prefill_decode), gain ~0.08 ms
+# Sorted MXFP4 expert blocks of 8 rows instead of 16 below the large-block route count (the Mac tail
+# replay: 32-170 rows). Every block variant computes each output as the same sequential fp32 chain over
+# k (steel BlockMMA), so the rows are bitwise equal; 8-row blocks pad less (~5 rows per expert at 128
+# rows): gate/up 4.6 -> 3.7 ms, down 2.3 -> 1.8 ms per layer. 0 = the 16-row blocks.
+DS41_MOE_BM8 = os.environ.get("DS41_MOE_BM8", "1") == "1"
 _verify_scope_depth = [0]
 
 
@@ -496,8 +501,14 @@ class Attention(nn.Module):
             and DS41_FAST_ROPE
             and x.dtype == mx.bfloat16
         )
+        q = None
         if projections is None:
-            query, kv_input = self._input_projections(x)
+            # hc_fuse.block_forward leaves the FP8 round trip of x (attn_in) in shared.
+            stash = shared.pop("attn_in_xq", None)
+            if stash is not None and stash[0] is x:
+                query, kv_input = attn_in.input_projections(stash[1], self.wq_a, self.wkv)
+            else:
+                query, kv_input = self._input_projections(x)
             if (
                 fuse
                 and _prequantized(self.wq_b)
@@ -506,19 +517,26 @@ class Attention(nn.Module):
                 # One FP8 round trip of qr feeds wq_b and the indexer's wq_b.
                 qr, qr8 = attn_fusions.rms_quant(query, self.q_norm.weight, self.q_norm.eps, True)
                 shared["qr8"] = (qr, qr8)
-                q_input = self.wq_b.project_quantized(qr8)
+                if DS41_FAST_ROPE and attn_in.wqb_rope_supported(
+                        self.wq_b, qr8, c.n_heads, c.head_dim, rope_params(c, bool(ratio))[0]):
+                    # wq_b and the query RoPE in one launch (attn_in).
+                    q = attn_in.wqb_rope(qr8, self.wq_b, *rope_tables(start, length, c, bool(ratio)),
+                                         c.n_heads, c.head_dim)
+                else:
+                    q_input = self.wq_b.project_quantized(qr8)
             else:
                 qr = self.q_norm(query)
                 q_input = self.wq_b(qr)
         else:
             qr, kv_input, q_input = projections
-        q = rope_range(
-            q_input.reshape(1, length, c.n_heads, c.head_dim),
-            start,
-            length,
-            c,
-            bool(ratio),
-        )
+        if q is None:
+            q = rope_range(
+                q_input.reshape(1, length, c.n_heads, c.head_dim),
+                start,
+                length,
+                c,
+                bool(ratio),
+            )
         old = cache[1]
         # CED clears the stale window whenever bounded replay skips tokens.
         old_len = min(start, c.window_size, 0 if old is None else int(old.shape[1]))
@@ -666,6 +684,10 @@ class Attention(nn.Module):
                 axis=1,
             )
         elif decode_fusions.grouped_gemv_supported(grouped, weight):
+            if not return_projected and attn_out.supported(self.wo_b, grouped, weight):
+                # wo_a plus the FP8 round trip of wo_b's input in one launch (attn_out).
+                return self.wo_b.project_quantized(
+                    attn_out.grouped_gemv_q(self.wo_a, grouped, weight).flatten(-2))
             projected = woa_compact.grouped_gemv(self.wo_a, grouped, weight)
         else:
             projected = mx.einsum("bsgd,grd->bsgr", grouped, weight)
@@ -800,6 +822,8 @@ class Expert(nn.Module):
             if kinds[0] is not None and all(kind == kinds[0] for kind in kinds):
                 block_kind = kinds[0]
                 bm, variant = _block_config(indices.size, block_kind)
+                if block_kind == "mxfp4" and DS41_MOE_BM8 and (bm, variant) == (16, 1):
+                    bm, variant = 8, 0
                 meta, count = _build_mxfp4_blocks(indices, self.w1.num_experts, bm)
                 block_plan = (meta, count, variant)
 

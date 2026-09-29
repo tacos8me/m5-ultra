@@ -244,13 +244,21 @@ def eligible(block, h, pre, verify_tile):
 
 def block_forward(block, h, pre, cache, shared, start, image_mask, prebuilt_end=None):
     """Block.__call__ for short rows (no CED tail): four hc launches instead of eight."""
+    from . import attn_in, ffn_fuse
     c = block._config
-    mix_a, x = project_pre_norm(h, pre, block.hc_attn_fn, block.attn_norm.weight, c.norm_eps, block.attn_norm.eps)
+    if attn_in.eligible(block.attn, h):
+        mix_a, x, xq = attn_in.project_pre_norm_q(h, pre, block.hc_attn_fn, block.attn_norm.weight, c.norm_eps,
+                                                  block.attn_norm.eps)
+        shared["attn_in_xq"] = (x, xq)
+    else:
+        mix_a, x = project_pre_norm(h, pre, block.hc_attn_fn, block.attn_norm.weight, c.norm_eps, block.attn_norm.eps)
     a = block.attn(x, cache, shared, start, prebuilt_end=prebuilt_end)
     if EARLY_SUBMIT and not shared.get("hc_submitted"):
         shared["hc_submitted"] = True
         mx.async_eval(a)
     h, ap = post_mix(a, h, mix_a, block.hc_attn_scale, block.hc_attn_base, c.hc_eps, c.hc_sinkhorn_iters)
+    if ffn_fuse.eligible(block, h, image_mask):
+        return ffn_fuse.ffn_forward(block, h, ap)
     mix_f, x = project_pre_norm(h, ap, block.hc_ffn_fn, block.ffn_norm.weight, c.norm_eps, block.ffn_norm.eps)
     f = block.ffn(x, image_mask)
     return post_mix(f, h, mix_f, block.hc_ffn_scale, block.hc_ffn_base, c.hc_eps, c.hc_sinkhorn_iters)

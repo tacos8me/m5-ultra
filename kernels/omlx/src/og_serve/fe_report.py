@@ -10,12 +10,13 @@ the imported Mac state) are compared across phases for the same prompt.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import statistics
 
 HOME = Path.home()
-FE = HOME/'llm/ds41/fe'
+FE = Path(os.environ.get("FE_LOGS", str(HOME/"llm/ds41/fe")))
 
 STAGES = [  # (name, start key, end key); keys prefixed 's.' come from the supervisor, 'c.' from the client
     ('client->sup', 'c.t0', 's.recv'), ('sup body+parse', 's.recv', 's.parsed'), ('sup->worker', 's.sent', 'http_start'),

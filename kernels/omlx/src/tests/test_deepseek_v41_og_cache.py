@@ -101,11 +101,12 @@ def state_blob(tokens, *, delta_from=0, lean=False, seed=0, numerics=None, omit_
 def replays(monkeypatch):
     calls = []
 
-    def fake_replay(lm, cache, hidden, pre, first, tokens):
+    def fake_replay_steps(lm, cache, hidden, pre, first, tokens, marks=None, seg_key=None):
         calls.append((np.array(hidden.view(mx.uint16)), np.array(pre), first, len(tokens)))
-        return cache
+        return
+        yield
 
-    monkeypatch.setattr(pipe_decoder, "replay", fake_replay)
+    monkeypatch.setattr(pipe_decoder, "replay_steps", fake_replay_steps)
     return calls
 
 
