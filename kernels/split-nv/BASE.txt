@@ -1,9 +1,12 @@
-split-nv engine (own code, src/): 1074e0b (branch polish = topk-det + robust + fair + stale; deployed as systemd user unit split-nv-engine, running the
+split-nv engine (own code, src/): a3b3007 (branch polish2 = topk-det + robust + fair + stale + fast-restart + preempt-1m; deployed as systemd user unit split-nv-engine, running the
   image built from this Dockerfile, with SPLIT_NV_PF_OVERLAP=1 SPLIT_NV_Q_NOCOPY=1: prefill chunks run as two halves so
   one half's TP2 all-reduce overlaps the other half's compute; byte-identical), and an exact, deterministic indexer
   top-k when more than 2048 scores tie in the threshold bin (hooks/split_nv/topk_det.py; identical output otherwise), plus
   SPLIT_NV_IDX_LOWMEM=1 SPLIT_NV_PREEMPT=1 SPLIT_NV_BYPASS_TOKENS=16384: decode steps and short prompts preempt a long
-  prefill between layers (hooks/split_nv/preempt.py, fair.py; byte-identical), and a lower-peak indexer top-k. Engine numerics unchanged since c75a0a2 (og-s4.4).
+  prefill between layers (hooks/split_nv/preempt.py, fair.py; byte-identical), and a lower-peak indexer top-k. SPLIT_NV_ENGRAM_KEEP=1 keeps the Engram host tables in SysV
+  shared memory across engine restarts (crash restart ~100 s instead of ~200-270 s; tools/engram_keep.py verify checks
+  them byte for byte), and SPLIT_NV_GC_FREEZE=1 freezes warm-up objects out of Python's cyclic GC (worst decode gap
+  during a 1M prefill 505 -> 82 ms). Engine numerics unchanged since c75a0a2 (og-s4.4).
 
 Base image: lmsysorg/sglang:dev-dsv41@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
   (torch 2.13.0+cu130, flashinfer 0.6.18+cu130 git 69ff11fc). The Dockerfile applies two patches:

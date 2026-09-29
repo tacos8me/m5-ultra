@@ -49,10 +49,19 @@ class Window:
         self.step_s = 0.0
         self.steps = 0
         self.busy = False
+        self.t_point = None  # host time of the last point (rank-local): head = open -> first point, gap = point -> point
+        self.head_s = None
+        self.max_gap_s = 0.0
+        self.max_lag_s = 0.0  # longest wait for the GPU LAG points back (prefill work a step would queue behind)
 
     def point(self):
         if self.busy:  # never nested (an inline step's own forward, if it had points)
             return
+        now = time.perf_counter()
+        if self.t_point is None:
+            self.head_s = now - self.t0
+        else:
+            self.max_gap_s = max(self.max_gap_s, now - self.t_point)
         k = self.k
         self.k += 1
         if not self.rank0:
@@ -61,17 +70,26 @@ class Window:
                 raise RuntimeError(f"preempt: expected point {k}, got {msg!r:.200}")
             for cmd in msg[2]:
                 self._run(cmd)
+            self.t_point = time.perf_counter()
             return
         if self.lag > 0:
             ev = torch.cuda.Event()
             ev.record()
             self.events.append(ev)
             if len(self.events) > self.lag:
+                t = time.perf_counter()
                 self.events.pop(0).synchronize()
+                self.max_lag_s = max(self.max_lag_s, time.perf_counter() - t)
         jobs = self.take(self)
         cmds = [j.cmd for j in jobs]
         for conn in self.peers:
             conn.send(("pp", k, cmds))
+        try:
+            self._run_jobs(jobs)
+        finally:
+            self.t_point = time.perf_counter()
+
+    def _run_jobs(self, jobs):
         for i, job in enumerate(jobs):
             job.t_get = job.t_bcast = time.perf_counter()
             try:

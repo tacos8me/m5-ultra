@@ -12,6 +12,7 @@ Exit code 0 = every byte check passed.
 import argparse
 import hashlib
 import json
+import multiprocessing
 import os
 import statistics
 import sys
@@ -58,6 +59,51 @@ class Decoder(threading.Thread):
         self.s.close()
 
 
+def _decoder_main(host, port, tokens, n, L, think, conn, ready, stop):
+    args = argparse.Namespace(host=host, port=port)
+    d = Decoder(args, tokens, n, L, think)
+    ready.set()
+    d.stop = stop
+    d.run()
+    d.s.close()
+    conn.send((d.idle, d.samples))
+    conn.close()
+
+
+class DecoderProc:
+    """A Decoder in its own process: the gate's own work in this process (receiving and parsing a ~0.9 GB STAT blob at
+    1M: bytes copies of up to 300 MB that hold the GIL for ~130 ms each) must not show up as decode step latency."""
+
+    def __init__(self, args, tokens, n, L, think):
+        ctx = multiprocessing.get_context("fork")
+        self.ready, self.stop = ctx.Event(), ctx.Event()
+        self.rx, tx = ctx.Pipe(duplex=False)
+        self.p = ctx.Process(target=_decoder_main, args=(args.host, args.port, tokens[:n + L], n, L, think, tx,
+                                                          self.ready, self.stop), daemon=True)
+        self.p.start()
+        if not self.ready.wait(120):
+            raise RuntimeError("decoder process did not open its session")
+        self.idle = self.samples = None
+
+    def start(self):
+        pass  # already stepping
+
+    def close(self):
+        self.stop.set()
+        self.idle, self.samples = self.rx.recv()
+        self.p.join(30)
+        self.ref = {dg for dg, _, _ in self.idle}
+
+
+def tail(samples, t0, t1):
+    """Step latencies (ms) completed while the long prompt was open, with the gaps over 100/200 ms and the five
+    longest (latency ms, seconds after the open started, seconds before it returned)."""
+    during = [(lat, t) for _, lat, t in samples if t0 + 0.3 < t < t1 - 0.3]
+    top = sorted(during, reverse=True)[:5]
+    return {"during_over_100ms": sum(lat > 0.1 for lat, _ in during), "during_over_200ms": sum(lat > 0.2 for lat, _ in during),
+            "top": [[round(lat * 1e3, 1), round(t - t0, 2), round(t1 - t, 2)] for lat, t in top]}
+
+
 def check(args, ids_path, n, label, out):
     tokens = load_ids(ids_path)
     opts = {}
@@ -93,13 +139,16 @@ def main():
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=10052)
     ap.add_argument("--out")
+    ap.add_argument("--inproc", action="store_true", help="decoders as threads of this process (the old measurement)")
+    ap.add_argument("--samples", help="append every decoder sample (t - open start, latency, before open end) here")
     args = ap.parse_args()
     h0 = health()
-    res = {"mode": args.mode, "fair_before": h0.get("fair")}
+    res = {"mode": args.mode, "n": args.n, "decoders_inproc": args.inproc, "fair_before": h0.get("fair")}
     ok = True
     if args.mode == "decode":
         dec_tokens = load_ids(args.dec_ids)
-        decs = [Decoder(args, dec_tokens, args.dec_n - 17 * i, args.L, args.think) for i in range(args.decoders)]
+        make = Decoder if args.inproc else DecoderProc
+        decs = [make(args, dec_tokens, args.dec_n - 17 * i, args.L, args.think) for i in range(args.decoders)]
         for d in decs:
             d.start()
         time.sleep(1.0)
@@ -120,7 +169,11 @@ def main():
                 "during_n": len(during), "during_steps_per_s": round(len(during) / max(1e-9, t1 - t0 - 0.6), 2),
                 "during_median_ms": round(statistics.median(during) * 1e3, 1) if during else None,
                 "during_p90_ms": round(sorted(during)[int(0.9 * len(during))] * 1e3, 1) if during else None,
-                "during_max_ms": round(max(during) * 1e3, 1) if during else None}
+                "during_max_ms": round(max(during) * 1e3, 1) if during else None, **tail(d.samples, t0, t1)}
+            if args.samples:
+                with open(args.samples, "a") as f:
+                    f.write(json.dumps({"n": args.n, "decoder": i, "inproc": args.inproc, "open_s": res["long"]["open_s"],
+                                        "samples": [[round(t - t0, 4), round(lat * 1e3, 2)] for _, lat, t in d.samples]}) + "\n")
     else:
         out = {}
         th = threading.Thread(target=check, args=(args, args.ids, args.n, "long", out))

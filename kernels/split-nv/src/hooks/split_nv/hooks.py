@@ -475,4 +475,6 @@ def install():
             cap.on_write_group(layer, pooled, group_pos)
 
     B.DeepseekV4AttnBackend._low_ratio_write_group = write_group
+    from split_nv import engram_keep
+    engram_keep.install()  # SPLIT_NV_ENGRAM_KEEP=1 only: Engram host tables in SysV segments that survive restarts
     print("[split-nv] hooks installed", flush=True)

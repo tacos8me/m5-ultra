@@ -26,11 +26,11 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import torch
 
-from split_nv import preempt, topk_det
+from split_nv import preempt, stallwatch, topk_det
 from split_nv.fair import PrefillGate
 from split_nv.imagekeys import parse_images, prefix_digest, prompt_keys
 from split_nv.perf_flags import flag
-from split_nv.prefix_cache import PrefixIndex, _atomic_save, _load
+from split_nv.prefix_cache import PrefixIndex, _atomic_save, _load, budget_bytes
 from split_nv.state_pack import (FORMAT, ENCODER_LAYERS, NUMERICS, SOURCE, RowChunks, TokenMap, assemble_parts, dtype_name,
                                  row_names, serialize_parts, tensor_bytes)
 
@@ -204,6 +204,17 @@ def tree_head(root):
         return ""
 
 
+def hard_exit(code):
+    """os._exit(code) from rank 0, after asking engine.main (SIGUSR2) to SIGKILL the other ranks right now, so their
+    teardown (GPU context, ~190 GiB of pinned Engram mappings each) runs alongside this one instead of after it."""
+    if os.environ.get("SPLIT_NV_FAST_EXIT", "1") == "1":
+        try:
+            os.kill(os.getppid(), signal.SIGUSR2)
+        except OSError:
+            pass
+    os._exit(code)
+
+
 def fatal_cuda_error(e):
     text = str(e)
     return any(m in text for m in ("device-side assert", "illegal memory access", "CUDA error: an illegal",
@@ -214,14 +225,21 @@ class Busy(RuntimeError):
     """Retryable refusal (capacity, draining)."""
 
 
+def new_pstats():
+    """Preemption counters (/health fair.preempt). park_*: how long parked STEPs waited for a point or the chunk end;
+    share_denied: points that had parked STEPs but no decode share left; timing: rank 0's per-chunk maxima (engine)."""
+    return {"chunks": 0, "inline_steps": 0, "after_chunk_steps": 0, "share_denied": 0, "park_max_ms": 0.0,
+            "park_over_100": 0, "park_over_200": 0}
+
+
 class Job:
-    __slots__ = ("cmd", "done", "result", "error", "t_get", "t_bcast", "t_exec")
+    __slots__ = ("cmd", "done", "result", "error", "t_get", "t_bcast", "t_exec", "t_park")
 
     def __init__(self, cmd):
         self.cmd = cmd
         self.done = threading.Event()
         self.result = self.error = None
-        self.t_get = self.t_bcast = self.t_exec = None
+        self.t_get = self.t_bcast = self.t_exec = self.t_park = None
 
     def wait(self):
         self.done.wait()
@@ -275,7 +293,7 @@ class Streamer:
 
 
 class Front:
-    def __init__(self, engine, args):
+    def __init__(self, engine, args, cache_loader=None):
         self.engine = engine
         self.args = args
         self.jobs = queue.PriorityQueue()
@@ -287,9 +305,13 @@ class Front:
         self.identity = os.environ.get("SPLIT_NV_IDENTITY", "split-nv:sglang-757e8f35+hooks:fp8-original:enc0-20:consistent-v1")
         text = json.loads(open(os.environ["SPLIT_NV_CONFIG"]).read())["text_config"]
         self.token_map = TokenMap(os.path.dirname(os.environ["SPLIT_NV_CONFIG"]), text["engram_compressed_vocab_size"])
-        gib = os.environ.get("SPLIT_NV_CACHE_GIB") or os.environ.get("SPLIT_NV_CACHE_GB") or "64"
-        self.cache = PrefixIndex(NUMERICS, int(float(gib) * (1 << 30)))
-        log(f"prefix cache: {self.cache.summary()}")
+        if cache_loader is not None:  # built during the model load (prefix_cache.IndexLoader)
+            self.cache, waited = cache_loader.get()
+            log(f"prefix cache: {self.cache.summary()} (index built in {cache_loader.seconds:.1f}s during the model "
+                f"load, waited {waited:.1f}s)")
+        else:
+            self.cache = PrefixIndex(NUMERICS, budget_bytes())
+            log(f"prefix cache: {self.cache.summary()}")
         self.min_resume = int(os.environ.get("SPLIT_NV_CACHE_MIN_RESUME", "1024"))
         self.draining = False
         self.drain_s = float(os.environ.get("SPLIT_NV_DRAIN_S", "30"))
@@ -317,7 +339,7 @@ class Front:
         self.pq_lock = threading.Lock()
         self.pq_open = False  # a preemptible chunk is running: STEPs park here and run between its layers
         self.pq = []
-        self.pstats = {"chunks": 0, "inline_steps": 0, "after_chunk_steps": 0}
+        self.pstats = new_pstats()
         self.trim_min = int(os.environ.get("SPLIT_NV_TRIM_MIN_TOKENS", "0") or 0)
         engine.preempt_take = self._take_parked
         c128 = getattr(engine.steps.be, "online_c128_mtp", None)
@@ -362,6 +384,7 @@ class Front:
                             left, self.pq = self.pq, []
                         # STEPs parked too late for a point of this chunk run now, before anything else
                         self.pstats["after_chunk_steps"] += len(left)
+                        self._park_waits(left, "after chunk")
                         for j in left:
                             self._execute(j)
             finally:
@@ -371,11 +394,34 @@ class Front:
         """Rank 0's preemption source (split_nv.preempt): the STEPs parked since the last point, if this chunk's
         decode share allows."""
         with self.pq_lock:
-            if not self.pq or not win.share_ok(float(flag("preempt_share", preempt.SHARE))):
+            if not self.pq:
+                return []
+            if not win.share_ok(float(flag("preempt_share", preempt.SHARE))):
+                self.pstats["share_denied"] = self.pstats.get("share_denied", 0) + 1
                 return []
             jobs, self.pq = self.pq, []
         self.pstats["inline_steps"] += len(jobs)
+        self._park_waits(jobs, f"point {win.k - 1}", win)
         return jobs
+
+    def _park_waits(self, jobs, where, win=None):
+        """Waits of parked STEPs (park -> released to a point or to the chunk's end): max, >100/>200 ms counts, and a
+        log line for each wait >= SPLIT_NV_PARK_LOG_MS (150) naming where it was released and the chunk's timings."""
+        now = time.perf_counter()
+        st = self.pstats
+        for j in jobs:
+            if j.t_park is None:
+                continue
+            ms = (now - j.t_park) * 1e3
+            st["park_max_ms"] = max(st.get("park_max_ms", 0.0), round(ms, 1))
+            st["park_over_100"] = st.get("park_over_100", 0) + (ms > 100)
+            st["park_over_200"] = st.get("park_over_200", 0) + (ms > 200)
+            if ms >= float(os.environ.get("SPLIT_NV_PARK_LOG_MS", "150")):
+                w = win or getattr(self.engine, "last_window", None)
+                extra = "" if w is None else (
+                    f", chunk head {1e3 * (w.head_s or 0):.0f} ms, max point gap {1e3 * w.max_gap_s:.0f} ms, max lag wait "
+                    f"{1e3 * w.max_lag_s:.0f} ms, share used {w.step_s:.2f}s of {time.perf_counter() - w.t0:.2f}s")
+                log(f"preempt: STEP parked {ms:.0f} ms, released {where}{extra}")
 
     def _parkable(self, cmd):
         if cmd[0] != "step":
@@ -395,6 +441,7 @@ class Front:
             with self.pq_lock:
                 parked = self.pq_open
                 if parked:
+                    job.t_park = time.perf_counter()
                     self.pq.append(job)
             if parked:
                 job.done.wait()
@@ -427,7 +474,7 @@ class Front:
                 # A sticky CUDA error (device-side assert, illegal access) poisons the context: every later job
                 # would fail while /health still said ok. Exit so the unit restarts the engine.
                 log("FATAL CUDA error: exiting for a restart")
-                os._exit(4)
+                hard_exit(4)
         finally:
             self.current = None
             job.done.set()
@@ -458,7 +505,7 @@ class Front:
             cur = self.current
             if cur is not None and time.monotonic() - cur[1] > self.job_timeout:
                 log(f"WATCHDOG: GPU job {cur[0]} running {time.monotonic() - cur[1]:.0f}s > {self.job_timeout:.0f}s; exiting")
-                os._exit(3)
+                hard_exit(3)
 
     def contended(self, sid):
         """Another session stepped within the last second: it is decoding and waits on every prefill chunk."""
@@ -711,7 +758,8 @@ class Front:
                     "prefill_perf": {k: os.environ.get(f"SPLIT_NV_{k.upper()}", "0") == "1"
                                      for k in ("pf_overlap", "ce_ar", "q_nocopy")},
                     "topk_det": topk_det.digest() if topk_det.installed() else False,
-                    **({"fair": {"gate": self.gate.summary(), "preempt": dict(self.pstats) if self.preempt_on else False,
+                    **({"stallwatch": stallwatch.summary()} if stallwatch.enabled() else {}),
+                    **({"fair": {"gate": self.gate.summary(), "preempt": dict(self.pstats, **getattr(self.engine, "preempt_timing", {})) if self.preempt_on else False,
                                  "trim_min_tokens": self.trim_min}}
                        if self.preempt_on or self.gate.bypass_tokens or self.trim_min else {})}
 
@@ -771,7 +819,7 @@ class Front:
                     if self.path.startswith("/admin/crash"):
                         log(f"admin crash from {self.client_address[0]}")
                         self._json(200, {"ok": True, "action": "exit(1) now"})
-                        os._exit(1)
+                        hard_exit(1)
                     return self._json(404, {"error": "not found"})
                 if self.path.startswith("/v1/cache/clear"):
                     self.rfile.read(int(self.headers.get("Content-Length", "0")))
@@ -871,7 +919,7 @@ class Front:
             while self.open_conns and time.monotonic() < deadline:
                 time.sleep(0.2)
             log(f"drain done ({self.open_conns} connection(s) left); exiting")
-            os._exit(0)
+            hard_exit(0)
 
         threading.Thread(target=run, daemon=True).start()
 

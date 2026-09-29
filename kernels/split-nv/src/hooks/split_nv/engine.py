@@ -136,6 +136,10 @@ class Engine:
         self.preempt_peers = None  # rank 0: connections to the other ranks; others: the connection from rank 0
         self.preempt_take = None  # rank 0: the front end's parked-step source
         self.last_preempt = None  # (points, inline steps, step seconds) of the last preemptible chunk
+        self.last_window = None  # its preempt.Window (timings for split_nv.front's parked-STEP log)
+        # per-chunk maxima over preemptible chunks (ms): open -> first point, point -> point host time, wait for the GPU
+        # LAG points back, last point -> chunk done (rows copied, grid blocks written)
+        self.preempt_timing = {"head_max_ms": 0.0, "point_gap_max_ms": 0.0, "lag_wait_max_ms": 0.0, "tail_max_ms": 0.0}
         self.memlog = os.environ.get("SPLIT_NV_MEMLOG") == "1"
         self.mem_t = {}
         if os.environ.get("SPLIT_NV_MEM_FRACTION"):
@@ -428,6 +432,7 @@ class Engine:
             finally:
                 preempt.close_window()
             self.last_preempt = (win.k, win.steps, win.step_s)
+            self.last_window = win
         else:
             self._extend_split(sess, chunk, split, lambda a, n: self._replace_rows(sid, a, n))
         torch.cuda.synchronize()
@@ -444,6 +449,13 @@ class Engine:
                 if sess.length % 8192:
                     raise RuntimeError(f"grid entry at {sess.length}")
                 self.store.write_entry(sess, key)
+        if preemptible:
+            pt = self.preempt_timing
+            for name, v in (("head_max_ms", win.head_s), ("point_gap_max_ms", win.max_gap_s),
+                            ("lag_wait_max_ms", win.max_lag_s),
+                            ("tail_max_ms", time.perf_counter() - (win.t_point or win.t0))):
+                if v is not None:
+                    pt[name] = max(pt[name], round(v * 1e3, 1))
         return rows, dt
 
     def cmd_prefill_end(self, sid, keep_capture=False):
@@ -573,6 +585,9 @@ class Engine:
             return self.cmd_memstats(*cmd[1:])
         if kind == "trim":
             return self.cmd_trim()
+        if kind == "gc_freeze":
+            from split_nv import stallwatch
+            return stallwatch.freeze()
         if kind == "exec" and os.environ.get("SPLIT_NV_DEV") == "1":
             # Localhost-only numerics development hook: the same code runs on every rank.
             ns = self.__dict__.setdefault("_dev_ns", {"engine": self, "torch": torch, "os": os, "json": json})
@@ -589,8 +604,23 @@ class Engine:
 
 # --------------------------------------------------------------------------------------------- process entry
 def rank_main(server_args, port_args, gpu_id, tp_rank, conns):
+    cache_loader = None
+    if tp_rank == 0 and os.environ.get("SPLIT_NV_CACHE_PRELOAD", "1") == "1" and not os.environ.get("SPLIT_NV_SELFTEST"):
+        # rank 0's prefix index only reads files: build it while the model loads (joined by Front)
+        from split_nv.prefix_cache import IndexLoader, budget_bytes
+        from split_nv.state_pack import NUMERICS
+        cache_loader = IndexLoader(NUMERICS, budget_bytes())
     engine = Engine(server_args, port_args, gpu_id, tp_rank)
     engine.preempt_peers = conns
+    from split_nv import stallwatch
+    if stallwatch.enabled():
+        def ctx():
+            from split_nv import preempt
+            w = preempt._win
+            cur = getattr(engine, "_front_current", lambda: None)()
+            return (f"rank {tp_rank}, gpu job {cur[0] if cur else None}"
+                    + (f", in a preemptible chunk at point {w.k}" if w is not None else ""))
+        stallwatch.install(ctx)
     if tp_rank != 0:
         # Commands arrive over a local pipe from rank 0 (~20 us vs ~0.3 ms for a gloo broadcast). Within SPLIT_NV_SPIN_S
         # of a STEP the pipe is busy-polled: a blocking recv after the ~25 ms idle of a c1 cycle wakes a cold core
@@ -615,8 +645,9 @@ def rank_main(server_args, port_args, gpu_id, tp_rank, conns):
                     os._exit(4)
     from split_nv.front import Front, install_signals
 
-    front = Front(engine, server_args)
+    front = Front(engine, server_args, cache_loader)
     front.peers = conns
+    engine._front_current = lambda: front.current
     threading.Thread(target=front.gpu_loop, daemon=True).start()
     selftest = os.environ.get("SPLIT_NV_SELFTEST")
     if selftest == "numerics":
@@ -673,6 +704,8 @@ def rank_main(server_args, port_args, gpu_id, tp_rank, conns):
         front.submit(("prefill", 0, [100 + (i * 7919) % 100000 for i in range(n)], False))
         front.submit(("close", 0))
     log(f"warm-up done (prefill warm-up {time.perf_counter() - t0:.1f}s)")
+    if os.environ.get("SPLIT_NV_GC_FREEZE", "0") == "1":
+        front.submit(("gc_freeze",))  # every rank: warm-up objects out of the cyclic GC (split_nv.stallwatch)
     if engine.vision:
         vision_check(front)
     install_signals(front)
@@ -745,22 +778,49 @@ def main():
             if procs[0].is_alive():
                 os.kill(procs[0].pid, signal.SIGTERM)
 
+    rank0_exiting = []
+
+    def on_rank0_exit(*_):
+        # rank 0 is about to os._exit (front.hard_exit): start the other ranks' teardown now, in parallel with its own
+        rank0_exiting.append(1)
+        kill_ranks(procs[1:], "rank 0 exiting")
+
     signal.signal(signal.SIGTERM, on_term)
+    signal.signal(signal.SIGUSR2, on_rank0_exit)
     # A completed self-test or failed rank must not leave its peer resident.
     while not wait([p.sentinel for p in procs], timeout=1):
         if deadline and time.monotonic() > deadline[0]:
             break
-    exited = [p for p in procs if not p.is_alive()]
-    code = next((p.exitcode for p in exited if p.exitcode), 0)
-    for p in procs:
-        if p.is_alive():
-            p.terminate()
-    for p in procs:
-        p.join(timeout=5)
-        if p.is_alive():
+    t0 = time.monotonic()
+    # No rank holds state worth a graceful stop here: rank 0 has exited (drained, crashed or tripped the watchdog) or
+    # overran the drain budget; the others only replay rank 0's commands, and prefix-cache entries become visible
+    # only after both ranks flushed (a killed write leaves a .tmp that the next start deletes).
+    # (rank 0 itself is left to finish its own os._exit when it announced it, so its exit code survives)
+    kill_ranks(procs[1:] if rank0_exiting else procs,
+               "a rank exited" if not deadline or time.monotonic() <= deadline[0] else "drain budget exceeded")
+    for i, p in enumerate(procs):
+        p.join()
+        log(f"rank {i} reaped {time.monotonic() - t0:.1f}s after the first exit (exit code {p.exitcode})")
+    sys.exit(exit_code([p.exitcode for p in procs]))
+
+
+def kill_ranks(procs, why):
+    alive = [p for p in procs if p.exitcode is None]
+    if alive:
+        log(f"{why}: SIGKILL to {len(alive)} rank process(es)")
+    for p in alive:
+        try:
             p.kill()
-            p.join()
-    sys.exit(code)
+        except (OSError, AttributeError):
+            pass
+
+
+def exit_code(codes):
+    """The unit's exit status: rank 0's own code (0 drain, 1 admin crash, 3 watchdog, 4 fatal CUDA error), else the
+    first failing rank's; a rank this process killed (negative) counts as a failure only if nothing exited cleanly."""
+    if codes[0] is not None and codes[0] >= 0:
+        return codes[0]
+    return next((c for c in codes[1:] if c is not None and c > 0), 1)
 
 
 if __name__ == "__main__":

@@ -88,6 +88,16 @@ c81f1dd feat(fair): prefill/decode fairness and GPU memory prototypes (all defau
 5c47019 fix(og-gate): refs record a digest of the OPEN and step tokens; check refuses a ref recorded from other step tokens
 6d91821 test(robust): Front fixture carries the fair attributes (gate, preempt_on, trim_min, pstats) set in __init__
 1074e0b fix(fair window): short prompt uses ids-131072 like the 8193 reference
+a93a0ca perf(restart): cache bytecode outside the source trees (PYTHONPYCACHEPREFIX on NVMe)
+79f54f9 perf(restart): build the prefix index during the model load
+1ecbde3 perf(restart): tear the ranks down in parallel and log the teardown
+8ff5d79 perf(restart): keep the Engram host tables in SysV segments across restarts (SPLIT_NV_ENGRAM_KEEP=1, off)
+143b8d8 feat(engram keep): tools/engram_keep.py verify compares every kept byte with the source table
+d8ec197 diag(preempt-1m): attribute decode gaps during long prefills; fair_gate decoders out of process
+092f73d perf(restart): prefetch the checkpoint into the page cache during container start; SHM_LOCK kept segments
+b7f8813 chore(restart): tools/restart_timeline.py prints the phase table of every engine restart from the journal
+ce631a5 fix(engram keep): with keep off, drop kept segments nobody has attached
+589e4b6 fix(restart): leave rank 0 to its own os._exit once it announced it, so drain keeps exit code 0
 
 sglang (757e8f3..a618602):
 fca050c feat(split-nv): optional prompt-state capture hooks for encoder prefill

@@ -36,6 +36,11 @@ def cache_root(numerics):
     return os.path.join(os.environ.get("SPLIT_NV_CACHE_DIR", "/dev/shm/split-nv/cache"), numerics)
 
 
+def budget_bytes():
+    gib = os.environ.get("SPLIT_NV_CACHE_GIB") or os.environ.get("SPLIT_NV_CACHE_GB") or "64"
+    return int(float(gib) * (1 << 30))
+
+
 def _atomic_save(tensors, path, metadata=None):
     from safetensors.torch import save_file
 
@@ -414,6 +419,36 @@ class PrefixIndex:
         with self.lock:
             return dict(self.stats, entries=len(self.entries), blocks=len(self.block_refs), bytes=self.total(),
                         budget=self.budget, root=self.root)
+
+
+class IndexLoader:
+    """Builds the rank-0 PrefixIndex on a thread started with the process. The build only reads the cache's small
+    files (idx json + tok npy, ~4 GB for 2.5K entries), so it runs during the ~2 min model load instead of after it:
+    1-2 s normally, but 26-76 s (once 357 s) after a crash, when the Engram fill has pushed those cold tmpfs pages to
+    swap. Nothing else touches the cache directory before the front end starts."""
+
+    def __init__(self, numerics, budget):
+        self.t0 = time.monotonic()
+        self.index = self.error = None
+        self.seconds = 0.0
+        self.thread = threading.Thread(target=self._run, args=(numerics, budget), name="prefix-index-load", daemon=True)
+        self.thread.start()
+
+    def _run(self, numerics, budget):
+        try:
+            self.index = PrefixIndex(numerics, budget)
+        except BaseException as e:  # noqa: BLE001  (re-raised by get(), where the synchronous load would have raised)
+            self.error = e
+        finally:
+            self.seconds = time.monotonic() - self.t0
+
+    def get(self):
+        """(index, seconds this call waited for the build)."""
+        t = time.monotonic()
+        self.thread.join()
+        if self.error is not None:
+            raise self.error
+        return self.index, time.monotonic() - t
 
 
 def _unlink(path):

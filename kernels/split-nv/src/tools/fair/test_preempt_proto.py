@@ -57,6 +57,7 @@ class FakeEngine:
         self.preempt_peers = None
         self.preempt_take = None
         self.last_preempt = None
+        self.windows = []
 
     def execute(self, cmd):
         if cmd[0] == "prefill_chunk":
@@ -72,7 +73,7 @@ class FakeEngine:
                         time.sleep(LAYER_S / 2)
             finally:
                 if win:
-                    self.mod.close_window()
+                    self.windows.append(self.mod.close_window())
             return {}, 0.0
         if cmd[0] == "step":
             self.log.append(("S", cmd[1], cmd[2]))
@@ -94,7 +95,7 @@ def run(preempt_on, share=0.5, chunks=6):
     f.current = None
     f.preempt_on = preempt_on
     f.pq_lock, f.pq_open, f.pq = threading.Lock(), False, []
-    f.pstats = {"chunks": 0, "inline_steps": 0, "after_chunk_steps": 0}
+    f.pstats = F.new_pstats()
     e0.preempt_take = f._take_parked
     stop = threading.Event()
 
@@ -134,6 +135,7 @@ def run(preempt_on, share=0.5, chunks=6):
     steps0 = [x[2] for x in e0.log if x[0] == "S"]
     same = e0.log == e1.log
     once = steps0 == list(range(len(lat)))
+    run.windows = (e0.windows, e1.windows)
     return same, once, lat, pf_s, dict(f.pstats), e0.log
 
 
@@ -145,11 +147,23 @@ for pre in (False, True):
     ok &= same and once
     if pre:
         ok &= statistics.median(lat) < 0.5 * 42 * LAYER_S / 2 and st["inline_steps"] > 0
+        # attribution counters: every parked STEP's wait is recorded and bounded by ~a chunk; each rank's windows know
+        # their head (open -> first point) and the longest host gap between points (~a layer here)
+        w0, w1 = run.windows
+        gaps = [w.max_gap_s for w in w0 + w1]
+        timing_ok = (0 < st["park_max_ms"] <= 42 * LAYER_S / 2 * 1e3 * 3 and all(w.head_s is not None for w in w0 + w1)
+                     and LAYER_S / 2 * 0.8 <= max(gaps) < 0.05 and st["share_denied"] == 0)
+        print(f"  attribution: park max {st['park_max_ms']} ms, point gap max {max(gaps) * 1e3:.1f} ms, "
+              f"head max {max(w.head_s for w in w0) * 1e3:.2f} ms -> {'ok' if timing_ok else 'FAIL'}")
+        ok &= timing_ok
 # share cap: steps take at most ~share of a chunk
 same, once, lat, pf_s, st, log = run(True, share=0.1)
 chunk_time = 21 * LAYER_S
 inline = st["inline_steps"]
 print(f"share 0.1: ranks identical {same}, steps {len(lat)}, inline {inline}, after-chunk {st['after_chunk_steps']}, prefill {pf_s * 1e3:.0f} ms")
 ok &= same and once and inline * STEP_S <= 0.1 * 6 * chunk_time * 1.5 + 6 * STEP_S
+# a share-capped chunk holds STEPs back: counted as share_denied, their waits land in park_* (up to ~a chunk)
+print(f"  share 0.1 attribution: share_denied {st['share_denied']}, park max {st['park_max_ms']} ms")
+ok &= st["share_denied"] > 0 and st["park_max_ms"] > 0
 print("PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

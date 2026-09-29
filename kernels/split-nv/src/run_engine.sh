@@ -29,6 +29,19 @@ mkdir -p /dev/shm/split-nv
 # PyTorch caching-allocator options for memory windows only (e.g. garbage_collection_threshold:0.9 together with
 # SPLIT_NV_MEM_FRACTION). Never expandable_segments: the step graphs' custom all-reduce needs IPC-able segments.
 ALLOC_CONF=(); [ -n "${SPLIT_NV_ALLOC_CONF:-}" ] && ALLOC_CONF=(-e PYTORCH_CUDA_ALLOC_CONF="$SPLIT_NV_ALLOC_CONF")
+# Bytecode cache outside the source trees (the image's SGLang tree ships no .pyc): each of the 3 processes (main +
+# 2 ranks) otherwise recompiles every imported module, ~11 s -> ~5.6 s of imports per process, twice in series.
+# Timestamp-validated, so a deploy checkout (new mtimes) recompiles what changed. SPLIT_NV_PYCACHE= (empty) = old mode.
+PYCACHE=${SPLIT_NV_PYCACHE-/mnt/nvme-1/dsv41-pycache}
+if [ -n "$PYCACHE" ]; then
+  PYC=(-v "$PYCACHE":/root/.cache/pyc -e PYTHONPYCACHEPREFIX=/root/.cache/pyc)
+else
+  PYC=(-e PYTHONDONTWRITEBYTECODE=1)
+fi
+# Warm the page cache with the checkpoint tensors the ranks will load while the container starts (NVMe idle then).
+if [ "${SPLIT_NV_PREFETCH-1}" = 1 ] && [ -f "$ROOT/$MODEL/model.safetensors.index.json" ]; then
+  python3 "$ROOT"/tools/prefetch_weights.py "$ROOT/$MODEL" --threads "${SPLIT_NV_PREFETCH_THREADS:-12}" &
+fi
 exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime nvidia --ipc=host --network host \
   --stop-timeout 60 --shm-size 64g --ulimit memlock=-1 --ulimit stack=67108864 \
   -e CUDA_VISIBLE_DEVICES=0,1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e HF_HUB_OFFLINE=1 \
@@ -36,7 +49,7 @@ exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime 
   -e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 -e SGLANG_DSV41_ENGRAM_HOST_TABLE_DIR=/engram \
   -e SGLANG_DSV41_ENGRAM_PINNED="$ENGRAM_PINNED" -e SGLANG_DSV41_ENGRAM_PREWARM=1 \
   -e SGLANG_DSV41_INDEXER_LOGITS_BUDGET_MB="${SPLIT_NV_IDX_BUDGET_MB:-1024}" -e SGLANG_OPT_USE_TOPK_V2=1 \
-  -e PYTHONDONTWRITEBYTECODE=1 -e PYTHONPATH=/home/ian/split-nv/hooks \
+  "${PYC[@]}" -e PYTHONPATH=/home/ian/split-nv/hooks \
   -e SPLIT_NV_HOOKS=1 -e SPLIT_NV_CONFIG=/home/ian/split-nv/$MODEL/config.json \
   -e SPLIT_NV_DIR=/dev/shm/split-nv -e SPLIT_NV_MAX_TOKENS=1056768 -e SPLIT_NV_STEP_LOG="${SPLIT_NV_STEP_LOG:-}" \
   -e SPLIT_NV_VERSION="$VERSION" -e SPLIT_NV_SGLANG_VERSION="$SGLANG_VERSION" -e SPLIT_NV_CACHE_GB="${SPLIT_NV_CACHE_GB:-96}" -e SPLIT_NV_DRAIN_S="${SPLIT_NV_DRAIN_S:-30}" \
@@ -50,7 +63,9 @@ exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime 
   -e SPLIT_NV_BYPASS_TOKENS="${SPLIT_NV_BYPASS_TOKENS-0}" -e SPLIT_NV_BYPASS_SHARE="${SPLIT_NV_BYPASS_SHARE-0.5}" \
   -e SPLIT_NV_SHARE_CHUNK="${SPLIT_NV_SHARE_CHUNK-2048}" -e SPLIT_NV_TRIM_MIN_TOKENS="${SPLIT_NV_TRIM_MIN_TOKENS-0}" \
   -e SPLIT_NV_IDX_LOWMEM="${SPLIT_NV_IDX_LOWMEM-0}" -e SPLIT_NV_MEMLOG="${SPLIT_NV_MEMLOG:-}" -e SPLIT_NV_MEMHIST="${SPLIT_NV_MEMHIST:-}" \
+  -e SPLIT_NV_STALLWATCH="${SPLIT_NV_STALLWATCH-0}" -e SPLIT_NV_GC_FREEZE="${SPLIT_NV_GC_FREEZE-0}" -e SPLIT_NV_PARK_LOG_MS="${SPLIT_NV_PARK_LOG_MS-150}" \
   -e SPLIT_NV_MEM_FRACTION="${SPLIT_NV_MEM_FRACTION:-}" "${ALLOC_CONF[@]}" \
+  -e SPLIT_NV_ENGRAM_KEEP="${SPLIT_NV_ENGRAM_KEEP-0}" -e SPLIT_NV_ENGRAM_ASYNC_REGISTER="${SPLIT_NV_ENGRAM_ASYNC_REGISTER-1}" \
   -v "$ROOT":/home/ian/split-nv:ro \
   -v /home/ian/models/DeepSeek-V4.1-Flash-original:/home/ian/models/DeepSeek-V4.1-Flash-original:ro \
   "${SGLANG_MOUNT[@]}" \
