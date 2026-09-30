@@ -89,6 +89,9 @@
   .facts dt { color: var(--dim); } .facts dd { margin: 0; text-align: right; }
   .facts dd span { color: var(--ghost); font-size: 12.5px; margin-left: 6px; }
   .prose p { margin: 0 0 12px; }
+  .how { list-style: none; padding: 0; margin: 0; }
+  .how li { margin: 0 0 10px; }
+  .how b { color: var(--fg); font-weight: 600; }
   .prose code { font: 13px ui-monospace, "SF Mono", Menlo, monospace; color: var(--fg); }
   .foot { color: var(--dim); font-size: 12.5px; border-top: 1px solid var(--rule); padding-top: 18px; }
   .foot p { margin: 0 0 8px; }
@@ -287,17 +290,18 @@
 
   <section class="prose">
     <h2>How it runs</h2>
-    <p>The box prefills layers 0–20 over the whole prompt and streams the state to the Mac in 8K chunks while it works; each chunk runs as two halves so one half's all-reduce between the GPUs overlaps the other half's compute, with byte-identical results, and the two GPUs split the long-context indexer's rows instead of both computing all of them (1M prefill 59.5 → 53.9&nbsp;s).
-    The Mac replays the last rows through layers 20–39, then each decode step crosses the link twice: draft tokens go to
-    the box, which returns 41&nbsp;KB of hidden state per row. Two requests pipeline, so each machine works on one while the
-    other finishes the next. From three requests up they run as fused pairs: the Mac verifies and drafts a pair in one pass,
-    reading the weights once, while the box runs the other pair's steps; the drafter reads its 1.3&nbsp;GB output head in MXFP8 through the same row-invariant kernel for single and batched drafts.
-    While a long prompt prefills, other requests' decode steps preempt it between layers, and short prompts go ahead of
-    long ones: a decoder keeps about 19 steps/s on the box during a 128K prefill (7 before), and an 8K prompt queued behind
-    a 128K one gets its box prefill done in 0.5&nbsp;s (5.5&nbsp;s before), with byte-identical outputs.</p>
-    <p>A step on the box is bit-identical to prefilling the same rows, including rejected drafts, so a box engine restart
-    mid-answer rebuilds the session and the text continues unchanged. If the box stays down, clients get a retryable
-    error; no other model ever stands in.</p>
+    <ul class="how">
+      <li><b>Prefill.</b> The box runs layers 0–20 over the whole prompt in 8K chunks and streams the state to the Mac as it
+      goes. The GPUs overlap their all-reduce with compute and split the indexer's rows (1M: 59.5 → 53.9&nbsp;s).</li>
+      <li><b>Decode.</b> The Mac replays the tail through layers 20–39. Each step is one round trip: draft tokens out,
+      41&nbsp;KB of hidden state per row back.</li>
+      <li><b>Concurrency.</b> Two requests pipeline across the machines. From three up, the Mac verifies and drafts fused
+      pairs, reading the weights once per pair.</li>
+      <li><b>Fairness.</b> Decode steps and short prompts preempt a long prefill between layers: a decoder keeps ~19
+      steps/s during a 128K prefill, and an 8K prompt queued behind it waits 0.5&nbsp;s.</li>
+      <li><b>Exact.</b> A box step is bit-identical to prefilling the same rows, so a restart mid-answer continues with the
+      same text. If the box stays down, clients get a retryable error; no other model stands in.</li>
+    </ul>
   </section>
 
   <footer class="foot">
