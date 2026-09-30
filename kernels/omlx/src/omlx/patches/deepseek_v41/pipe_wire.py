@@ -11,6 +11,15 @@ import struct
 import time
 import zlib
 
+try:
+    from . import dspark_wire as dw
+except ImportError:  # loaded standalone by file path (og_serve CPU tests)
+    import importlib.util as _util
+    from pathlib import Path as _Path
+    _spec = _util.spec_from_file_location('dspark_wire', _Path(__file__).with_name('dspark_wire.py'))
+    dw = _util.module_from_spec(_spec)
+    _spec.loader.exec_module(dw)
+
 FRAME = struct.Struct('<4sIQ')
 STEP = struct.Struct('<IIH')
 STPR = struct.Struct('<IIHIf')
@@ -27,6 +36,10 @@ SPIN_S = float(os.environ.get('DS41_OG_SPIN_MS', '60'))/1000
 # 128 KB default window, so the box stalled mid-payload for an ACK round trip
 # (payload 0.76 -> 0.05 ms, roundtrip - box 1.72 -> 1.16 ms at 5 rows). 0 = OS default.
 RCVBUF = int(os.environ.get('DS41_OG_RCVBUF_KB', '4096')) * 1024
+# Per-socket send buffer of sessions granted box drafting (STEPD carries ~30 KB of taps per committed row, up to
+# 154 KB): above the 128 KB default, sendall blocked 0.5-0.7 ms on full-accept cycles waiting for the box's ACKs
+# (og_serve/stepd_netbench: send 0.54-0.79 -> 0.04-0.06 ms at 154 KB). Transport only; 0 = OS default.
+SNDBUF = int(os.environ.get('DS41_OG_SNDBUF_KB', '1024')) * 1024
 IDENTITY = 'split-nv:sglang-757e8f35+hooks:fp8-original:enc0-20'
 # Mid-stream recovery: a lost box session (link drop, engine restart) is
 # re-opened on the committed tokens with OPEN state "none" and the failed STEP
@@ -55,6 +68,27 @@ class BoxLost(ConnectionError):
 
 class BoxBusy(RuntimeError):
     """The box refused an OPEN with a retryable ERR (draining, or no KV/session room yet)."""
+
+
+class StepdError(RuntimeError):
+    """A STEPD answered by ERR (STEPD-SPEC.md §11 hard error: the box closed the session). `code` is the box's."""
+
+    def __init__(self, header):
+        self.code = header.get('code') if isinstance(header, dict) else None
+        super().__init__('Encoder STEPD failed: ' + str(header)[:200])
+
+
+# ACK.dspark fields the client relies on (STEPD-SPEC.md §3); a grant that differs is treated as no grant.
+GRANT = dict(ver=dw.VER, width=dw.WIDTH, ring=dw.RING, min_ctx=dw.MIN_CTX, tap_dim=dw.TAP_DIM, key_dim=dw.KEY_DIM,
+             stages=dw.STAGES)
+
+
+def grant_ok(grant):
+    return isinstance(grant, dict) and all(grant.get(k) == v for k, v in GRANT.items())
+
+
+# STEPD-SPEC.md errata E1 / V2.1: the STEPD request travels as b"DSTP".
+STEPD_TAG = dw.TAG_STEPD
 
 
 def wait_limit(exc):
@@ -114,7 +148,7 @@ def frame(sock):
     if hlen > 4<<20 or plen > 2<<30:
         raise ValueError('Encoder frame exceeds limit')
     raw = receive(sock, hlen)
-    head = bytes(raw) if tag == b'STPR' else json.loads(raw) if hlen else {}
+    head = bytes(raw) if tag in (b'STPR', b'STPD') else json.loads(raw) if hlen else {}
     return tag, head, plen
 
 
@@ -130,6 +164,12 @@ class EncoderSession:
         self.history = array('I')
         self.images = []  # og_images.Image of the OPEN; a rebuilt session gets them again
         self.recoveries = []
+        # DSpark on the box (STEPD-SPEC.md, stepd.py). dspark_request: the OPEN "dspark" object (None: never ask,
+        # the default and the whole flag-off path); dspark: the ACK grant; stepd: the request's stepd.BoxDraft.
+        self.dspark_request = self.dspark = self.dspark_off = self.stepd = None
+        self._stepd = None  # the STEPD in flight (dict), alongside _pending
+        self._ready = None  # (keep, ids, raw, timing): a received box-drafted step, used by the next ensure/recv
+        self.last_stpd = None
 
     def _connect(self, timeout=120):
         self.sock = socket.create_connection((self.host, self.port), timeout=5)
@@ -183,6 +223,8 @@ class EncoderSession:
             header['cache'] = 1
         if stream:
             header['stream'] = 1
+        if self.dspark_request is not None:
+            header['dspark'] = self.dspark_request
         images = list(images or ())
         tail = b''
         if images:
@@ -203,6 +245,7 @@ class EncoderSession:
         if tag != b'ACK ' or not ack.get('ok') or n:
             raise refused(tag, ack, 'Encoder open')
         self.session = int(ack['session'])
+        self._grant(ack)
         self.open_info = dict(resumed_tokens=int(ack.get('resumed_tokens') or 0),
                               ack_s=time.perf_counter()-start, delta_requested=int(delta_from), t_ack=time.time())
         tensors, manifest, total = {}, None, 0
@@ -265,19 +308,43 @@ class EncoderSession:
                 raise RuntimeError('Unexpected encoder frame: '+str((tag,h)))
         raise TimeoutError('Encoder prefill deadline')
 
-    def send_step(self, tokens, keep):
-        """Queue one STEP; the box computes while the caller does other work."""
+    def _grant(self, ack):
+        """ACK of an OPEN that asked for dspark: the grant (§3), or why not. Without it RING/STEPD are never sent."""
+        if self.dspark_request is None:
+            return
+        grant = ack.get('dspark')
+        self.dspark = grant if grant_ok(grant) else None
+        self.dspark_off = None if self.dspark else str(ack.get('dspark_off') or ('bad_grant' if grant else 'no_grant'))
+        if self.dspark and SNDBUF and getattr(self, 'sock', None) is not None:
+            try:
+                self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SNDBUF)
+            except OSError:
+                pass
+
+    def send_step(self, tokens, keep, taps=b''):
+        """Queue one STEP; the box computes while the caller does other work.
+
+        taps: BF16 rows of the positions [keep - n, keep) the step commits (STEPD-SPEC.md V2.2, grants with
+        step_taps): the box appends them to its DSpark ring. The default sends today's STEP bytes."""
         if self.session is None or not 1 <= len(tokens) <= 5 or not 0 <= keep <= self.length:
             raise ValueError('Invalid step/rollback')
         if getattr(self, '_pending', None) is not None:
             raise ValueError('Step already in flight')
-        payload = struct.pack('<%dI' % len(tokens), *tokens)
+        if taps and (not (self.dspark or {}).get('step_taps') or len(taps) % dw.TAP_ROW_BYTES):
+            raise ValueError('STEP taps without a step_taps grant')
+        self._ready = None  # an unused box-drafted reply: the box rolls back to `keep` like for any STEP
+        payload = struct.pack('<%dI' % len(tokens), *tokens) + bytes(taps)
         self._pending = (len(tokens), keep, time.perf_counter(), tuple(tokens))
         self.history[keep:] = array('I', tokens)
         send(self.sock,b'STEP',STEP.pack(self.session,keep,len(tokens)),payload)
 
     def ensure_step(self, tokens, keep):
-        """Send this STEP unless the identical one is already in flight (pre-sent)."""
+        """Send this STEP unless the identical one is already in flight (pre-sent) or received (box-drafted)."""
+        ready = self._ready
+        if ready is not None:
+            if ready[0] == keep and ready[1] == tuple(tokens):
+                return True
+            self._ready = None
         pending = self._pending
         if pending is not None and pending[1] == keep and pending[3] == tuple(tokens):
             return True
@@ -288,6 +355,13 @@ class EncoderSession:
 
     def recv_step(self, idle=None):
         """idle: optional callable run on each spin iteration while the reply is in flight."""
+        if self._ready is not None:
+            _, _, raw, timing = self._ready
+            self._ready = None
+            return raw, timing
+        if self._stepd is not None:  # a STEPD's reply (explicit step, or a stale box-drafted one being consumed)
+            _, raw, timing = self.recv_stepd(idle)
+            return raw, timing
         rows_sent, keep, start, _ = self._pending
         waited = time.perf_counter()
         deadline = waited + SPIN_S
@@ -315,6 +389,86 @@ class EncoderSession:
         self.send_step(tokens, keep)
         return self.recv_step()
 
+    # ---- DSpark on the box (STEPD-SPEC.md v1); only with the ACK grant ------------------------------
+    def send_ring(self, offset, keys, taps, keys_rows, taps_rows):
+        """RING (§4): the box ring becomes exactly positions [offset - keys_rows - taps_rows, offset). No reply."""
+        if self.session is None or self.dspark is None:
+            raise ValueError('RING without a dspark grant')
+        header, payload = dw.encode_ring(self.session, offset, keys, taps, keys_rows, taps_rows)
+        send(self.sock, b'RING', header, payload)
+        return len(payload)
+
+    def send_stepd(self, keep, anchor, *, nver=0, a=0, mode=dw.MODE_BOX, dmax=dw.WIDTH, flags=0,
+                   argmax=(), explicit=(), taps=b''):
+        """STEPD (§5): commit to `keep` (accept-checked against the pending step when nver > 0), append the taps
+        to the box ring, then step [anchor] + box drafts (mode 0) / + explicit (mode 1) / alone (mode 2)."""
+        if self.session is None or self.dspark is None:
+            raise ValueError('STEPD without a dspark grant')
+        if self._pending is not None:
+            raise ValueError('Step already in flight')
+        if not 0 <= keep <= self.length or (mode == dw.MODE_EXPLICIT and not 1 <= len(explicit) <= dw.MAX_EXPLICIT):
+            raise ValueError('Invalid STEPD')
+        self._ready = None
+        header, payload = dw.encode_stepd(self.session, keep, anchor, nver, a, mode, dmax, flags,
+                                          argmax, explicit, taps)
+        ids = ((anchor, *explicit) if mode == dw.MODE_EXPLICIT else (anchor,) if mode == dw.MODE_BONUS else None)
+        self._pending = (len(ids) if ids else 0, keep, time.perf_counter(), ids)
+        self._stepd = dict(mode=mode, keep=keep, anchor=anchor, dmax=dmax, nver=nver, a=a)
+        self.history[keep:] = array('I', ids or (anchor,))
+        send(self.sock, STEPD_TAG, header, payload)
+        return len(payload)
+
+    def recv_stepd(self, idle=None):
+        """The STPD of the STEPD in flight: (info, raw rows, timing). info is the decoded §7 header plus `ids`, the
+        step's rows ([anchor] + drafts[:depth] / + explicit / alone). ERR raises StepdError (session closed)."""
+        _, keep, start, expected = self._pending
+        sent = self._stepd
+        waited = time.perf_counter()
+        deadline = waited + SPIN_S
+        while time.perf_counter() < deadline and not select.select([self.sock], [], [], 0)[0]:
+            if idle is not None:
+                idle()
+        tag, h, n = frame(self.sock)
+        header_at = time.perf_counter()
+        if tag == b'ERR ':
+            raise StepdError(h)
+        if tag != dw.TAG_STPD:
+            raise RuntimeError('Encoder STEPD failed: ' + str((tag, h))[:200])
+        info = dw.decode_stpd_header(h)
+        rows = info['L']
+        if ((info['session'], info['length_after'], info['payload_bytes'], n) !=
+                (self.session, keep + rows, rows * ROW_BYTES, rows * ROW_BYTES)
+                or not 1 <= rows <= dw.MAX_ROWS or info['depth'] != rows - 1):
+            raise ValueError('Encoder STEPD step/session boundary mismatch')
+        if not math.isfinite(info['box_s']) or info['box_s'] < 0:
+            raise ValueError('Invalid encoder timing')
+        used = info['mode_used']
+        if used == dw.MODE_BOX and sent['mode'] == dw.MODE_BOX and rows >= 2 and info['ndraft'] == dw.WIDTH:
+            ids = (sent['anchor'], *info['drafts'][:rows - 1])
+        elif used == dw.MODE_EXPLICIT and sent['mode'] == dw.MODE_EXPLICIT and rows == len(expected):
+            ids = expected
+        elif used == dw.MODE_BONUS and rows == 1 and sent['mode'] in (dw.MODE_BOX, dw.MODE_BONUS):
+            ids = (sent['anchor'],)
+        else:
+            raise ValueError(f'Encoder STPD mode {used} / {rows} rows does not answer STEPD mode {sent["mode"]}')
+        raw = receive(self.sock, n)
+        self._pending = self._stepd = None
+        self.length = keep + rows
+        self.history[keep:] = array('I', ids)
+        done = time.perf_counter()
+        elapsed = done - start
+        info.update(ids=ids, keep=keep, mode=sent['mode'])
+        self.last_stpd = info
+        timing = dict(rows=rows, start=keep, box_s=info['box_s'], roundtrip_s=elapsed, wait_s=done - waited,
+                      transport_host_s=elapsed - info['box_s'], payload_s=done - header_at, bytes=n)
+        if self.stepd is not None:
+            self.stepd.on_reply(info)
+        return info, raw, timing
+
+    def hold_ready(self, info, raw, timing):
+        """Keep a received box-drafted step for the verify that sends exactly (keep, ids) next (ensure_step)."""
+        self._ready = (info['keep'], tuple(info['ids']), raw, timing)
+
     # ---- mid-stream recovery -------------------------------------------------------------------
     def _drop(self):
         if self.sock is not None:
@@ -323,6 +477,7 @@ class EncoderSession:
             except OSError:
                 pass
         self.sock, self.session, self._pending = None, None, None
+        self._stepd = self._ready = None
 
     def reopen(self, keep, next_token):
         """Open a new session holding exactly history[:keep] (box prefill, OPEN state "none")."""
@@ -335,6 +490,8 @@ class EncoderSession:
                       token_sha256=hashlib.sha256(payload).hexdigest(), state='none', request_id='resume')
         if REOPEN_CACHE:
             header['cache'] = 1
+        if self.dspark_request is not None:
+            header['dspark'] = self.dspark_request  # §10.4: ask again; the new session has no ring
         images = [im for im in getattr(self, 'images', ()) if im.start + im.length <= keep]
         tail = b''
         if images:
@@ -345,11 +502,12 @@ class EncoderSession:
         if tag != b'ACK ' or not ack.get('ok') or n:
             raise refused(tag, ack, 'Encoder reopen')
         self.session, self.length, self.history = int(ack['session']), keep, prefix
+        self._grant(ack)
         self.sock.settimeout(STEP_TIMEOUT)
         return ack
 
-    def recover(self, tokens, keep, error, since=None):
-        """Rebuild a lost session at `keep` and resend STEP(tokens, keep).
+    def recover(self, tokens, keep, error, since=None, resend=None):
+        """Rebuild a lost session at `keep` and resend STEP(tokens, keep) (or call resend(self) instead).
 
         Waits for the box up to RESUME_WAIT_S from `since` (connection refused/unreachable); a box
         that accepts the connection but fails the reopen or step RESUME_TRIES times is lost too.
@@ -357,6 +515,8 @@ class EncoderSession:
         since = since or time.monotonic()
         failures, last = 0, error
         logger.warning('ds41-og box session %s lost at %d tokens (%r); rebuilding', self.session, keep, error)
+        if self.stepd is not None:
+            self.stepd.on_lost(error)
         while True:
             self._drop()
             t0 = time.perf_counter()
@@ -367,7 +527,12 @@ class EncoderSession:
             else:
                 try:
                     ack = self.reopen(keep, tokens[0])
-                    self.send_step(tokens, keep)
+                    if self.stepd is not None:
+                        self.stepd.on_reopen(self)
+                    if resend is not None:
+                        resend(self)
+                    else:
+                        self.send_step(tokens, keep)
                     record = dict(keep=keep, wait_s=round(time.monotonic()-since, 3), prefill_s=ack.get('prefill_s'),
                                   resumed_tokens=ack.get('resumed_tokens'),
                                   reopen_s=round(time.perf_counter()-t0, 3), error=repr(error)[:160], t=time.time())

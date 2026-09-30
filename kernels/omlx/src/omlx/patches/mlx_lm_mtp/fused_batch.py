@@ -65,6 +65,8 @@ def _advance_dspark(batch, batch_state, host):
     ]
     if len(pending) < 2 or os.environ.get("DS41_BATCH_VERIFY", "1") == "0":
         return False
+    if any(bg._box_pending(state) for _, state in pending):
+        return False  # remotely drafted blocks resolve in the per-request cycle
     # Bounded workspace; longer drafts (context-copy) and larger batches
     # retain the exact independent path. Checked before any cache extraction.
     lengths = [1 + int(state.drafts.shape[0]) for _, state in pending]
@@ -109,10 +111,10 @@ def _advance_groups(batch, batch_state, host):
         state = batch_state.states[uid]
         if state.queue:
             continue
-        if not state.chain or state.next_main is None or state.drafts is None:
+        if not state.chain or state.next_main is None or (state.drafts is None and not bg._box_pending(state)):
             return False
         pending.append((index, state))
-    groups = host.mtp_verify_groups([1 + int(state.drafts.shape[0]) for _, state in pending])
+    groups = host.mtp_verify_groups([bg._verify_rows(state) for _, state in pending])
     if not groups:
         return False
     batched_head.flush(batch_state)
@@ -126,6 +128,8 @@ def _advance_groups(batch, batch_state, host):
         if len(rows) == 1:
             bg._run_verify_cycle(rows[0][1], rows[0][2])
         else:
+            for _, row, state in rows:
+                bg._resolve_box_drafts(row, state)
             inputs = [
                 mx.concatenate([state.next_main, state.drafts])[None, :] for _, _, state in rows
             ]

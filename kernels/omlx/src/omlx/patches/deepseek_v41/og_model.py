@@ -39,7 +39,7 @@ import time
 import mlx.core as mx
 import mlx.nn as nn
 
-from . import fast_encode, fe_trace, growth, og_cache, og_failover, og_fused, og_images, pipe_wire, spec_probe, woa_compact
+from . import fast_encode, fe_trace, growth, og_cache, og_failover, og_fused, og_images, pipe_wire, spec_probe, stepd, woa_compact
 from .cache import DeepseekV41Cache
 from .pipe_decoder import DecoderHalf, load_decoder
 from .pipe_session import PipelineDepthController, open_remote
@@ -54,6 +54,7 @@ STATS = dict(opened=0, open_failed=0, open_retries=0, closed=0, steps=0, box_s=0
              box_resumed=0, box_resumed_tokens=0, delta_opens=0, delta_rows=0, delta_retries=0,
              import_failed=0, import_fallbacks=0, kickoff_sent=0, kickoff_errors=0, fused_calls=0, fused_steps=0, draft_batches=0)
 spec_probe.bind(STATS)  # retired copy-lock pre-send probe (DS41_OG_SPEC_PROBE=1 to re-enable): spec_probe_* keys
+stepd.bind(STATS)  # DSpark on the box (DS41_OG_BOX_DRAFT=1): box_draft_* keys
 BOX_CACHE = os.environ.get('DS41_OG_BOX_CACHE', '1') == '1'
 STATE = os.environ.get('DS41_OG_STATE', 'lean')
 STREAM = os.environ.get('DS41_OG_STREAM', '1') == '1'
@@ -127,6 +128,9 @@ def close_session(sid):
 def close_request(request_id):
     sid = REQUESTS.pop(request_id, None)
     if sid is not None:
+        ctl = getattr(SESSIONS.get(sid), 'stepd', None)
+        if ctl is not None:
+            logger.info('ds41-og box-draft %s: %s', request_id, ctl.summary())
         if spec_probe.ENABLED:
             encoder = SESSIONS.get(sid)
             if encoder is not None:
@@ -260,10 +264,16 @@ class OgLanguageModel(DecoderHalf):
         ids_list = [list(ids) for ids in ids_list]
         fuse = (len(caches) > 1 and all(states is not None for states in states_list)
                 and og_fused.eligible(self, [len(ids) for ids in ids_list]))
+        if stepd.ENABLED:
+            for encoder in sessions:
+                encoder._og_fused = fuse  # STEPD FUSED bit: only when this request really verifies in a fused pair
         if spec_probe.ENABLED:
             _probe_steps(sessions, ids_list, starts)
         try:
             for encoder, ids, start in zip(sessions, ids_list, starts):
+                ctl = encoder.stepd
+                if ctl is not None and encoder._pending is None and ctl.pending_explicit(start):
+                    ctl.presend(encoder, start, ids)  # this block as STEPD mode 1 (keeps the box ring current)
                 STATS['present_hits'] += encoder.ensure_step_safe(ids, start)
             out, items = [], []
             for encoder, ids, start, cache, states in zip(sessions, ids_list, starts, caches, states_list):
@@ -278,6 +288,8 @@ class OgLanguageModel(DecoderHalf):
                     logits, hidden = self.forward_boundary(
                         **arrays, cache=cache, start=start, verify=states is not None, verify_states=states)
                     cache[0]._pipe1_verify = None
+                    if stepd.ENABLED and states is not None:
+                        _prefetch_taps(encoder, start, len(ids), hidden)
                     out.append((logits, hidden))
                 STATS['steps'] += 1
                 STATS['rows'] += len(ids)
@@ -296,6 +308,9 @@ class OgLanguageModel(DecoderHalf):
                 out = self.forward_boundaries(items)
                 for cache in caches:
                     cache[0]._pipe1_verify = None
+                if stepd.ENABLED:
+                    for encoder, ids, start, (_, hidden) in zip(sessions, ids_list, starts, out):
+                        _prefetch_taps(encoder, start, len(ids), hidden)
                 STATS['fused_calls'] += 1
                 STATS['fused_steps'] += len(items)
         except BoxLost as exc:
@@ -353,6 +368,10 @@ class OgLanguageModel(DecoderHalf):
         after another, each pre-sending its next STEPs after its drafts, so the box computes one
         pair's steps while the Mac verifies and drafts the other pair.
         """
+        if stepd.ENABLED and 1 < len(lengths) < FUSE_MIN and _box_drafting():
+            # Box drafting: verify the requests one by one, so each STEPD leaves right after its own verify and the
+            # box drafts + steps it while the Mac verifies the other request (DSPARK-BOX §4.2).
+            return [[i] for i in range(len(lengths))]
         if not og_fused.ENABLED or len(lengths) < FUSE_MIN:
             return None
         groups, pair = [], []
@@ -420,6 +439,62 @@ class OgLanguageModel(DecoderHalf):
         # No eval here: the next verify forward consumes these slices, so the
         # rollback costs no host sync (27a9b621; lost in the 45ef51f8 rebase).
         return True
+
+    def mtp_box_prepare(self, gen_batch, state, hidden_rows, committed):
+        """batch_generator._dspark_prepare hook (DS41_OG_BOX_DRAFT=1, stepd.py). True: this cycle's block is set here
+        (the box drafts it, or the copy ids went out as STEPD mode 1); None: today's Mac drafter runs (its ring is
+        current then, and presend sends the block as STEPD mode 1 when the box ring is being kept)."""
+        if not stepd.ENABLED:
+            return None
+        t0 = time.perf_counter()
+        try:
+            encoder = session_of(gen_batch.prompt_cache)
+        except RuntimeError:
+            return None
+        ctl = encoder.stepd
+        if ctl is None:
+            return None
+        try:
+            return _box_prepare(self, gen_batch, state, hidden_rows, committed, encoder, ctl, t0)
+        except Exception:  # noqa: BLE001 -- drafting only: fall back to today's path for the rest of the request
+            logger.exception('ds41-og box drafting failed; this request continues on the Mac drafter')
+            stepd.count('errors')
+            ctl.stick('box_error')
+            _box_mac_ring(self, state, ctl, end=int(state.hist_offset))  # today's code appends this cycle's rows
+            state.box_pending = None
+            return None
+
+    def mtp_box_resolve(self, gen_batch, state):
+        """Before the verify of a box-drafted block: its drafts from the STPD (the rows wait in the encoder), or the
+        Mac drafts the block itself when the box did not (bonus-only reply, kill switch, hard error)."""
+        from ..mlx_lm_mtp import batch_generator as bg
+        state.box_pending = None
+        encoder = session_of(gen_batch.prompt_cache)
+        ctl = encoder.stepd
+        keep = gen_batch.prompt_cache[0].size()
+        try:
+            drafts = ctl.resolve(encoder, self._gpu_warm()) if ctl is not None else None
+        except BoxLost as exc:
+            STATS['box_lost'] += 1
+            og_failover.note_lost(exc)
+            raise
+        if drafts:
+            state.drafts = mx.array(drafts, dtype=mx.uint32)
+            state.draft_lps = [None] * len(drafts)
+            state.draft_accept_lps = [None] * len(drafts)
+            state.draft_source = 'box'
+            return
+        # The Mac drafts this block (cost policy, width 4) from its rebuilt ring, exactly as _dspark_next_drafts.
+        from .dspark import proposal_forward
+        if ctl is not None:
+            _box_mac_ring(self, state, ctl)
+        anchor = state.next_main.reshape(1, 1)
+        width = state.controller.max_depth
+        logits, _ = proposal_forward(self, anchor, state.mtp_cache, width, cost_policy=True)
+        state.draft_source = 'dspark'
+        bg._dspark_finish(gen_batch, state, (self, width, anchor, True), logits, None)
+        if ctl is not None and encoder._pending is None:  # else _remote sends the plain STEP
+            ctl.redraft(encoder, keep, [int(state.next_main.item())] + [int(x) for x in state.drafts.tolist()])
 
 
 class OgModel(nn.Module):
@@ -519,9 +594,10 @@ class Job(threading.Thread):
     DS41_OG_RESUME_TRIES times.
     """
 
-    def __init__(self, host, port, request_id, tokens, images=None, wake=None):
+    def __init__(self, host, port, request_id, tokens, images=None, wake=None, dspark=False):
         super().__init__(name=f'ds41-og-open-{request_id}', daemon=True)
         self.host, self.port, self.request_id, self.tokens = host, port, request_id, list(tokens)
+        self.dspark = dspark  # ask the box for DSpark drafting (stepd.wants); only with DS41_OG_BOX_DRAFT=1
         self.wake = wake  # wakes the idle engine loop when the open is done (else it polls every 50 ms)
         self.images = list(images or ())
         # Prefix keys for the Mac row store: token ids, image-content keys inside image spans (og_images).
@@ -537,6 +613,8 @@ class Job(threading.Thread):
 
     def _open(self, delta_from):
         self.encoder = EncoderSession(self.host, self.port)
+        if self.dspark:
+            self.encoder.dspark_request = dspark_request()
         if self.cancelled:  # abort() ran before this encoder existed: nothing interrupted it
             raise ConnectionAbortedError('request cancelled')
         self.result = open_remote(self.encoder, self.tokens, self.request_id,
@@ -666,7 +744,9 @@ class OgPrefill:
         return True
 
     def launch(self, scheduler, request, tokens, images=None):
-        job = Job(self.host, self.port, request.request_id, tokens, images, wake=opened_wake(scheduler) if WAKE else None)
+        ask = {'dspark': True} if stepd.wants(getattr(request, 'sampling_params', None), len(tokens)) else {}
+        job = Job(self.host, self.port, request.request_id, tokens, images, wake=opened_wake(scheduler) if WAKE else None,
+                  **ask)
         job.arrival = time.time() - (time.monotonic() - getattr(request, 'arrival_time', time.monotonic()))
         job.deferred = time.time()
         fe_trace.og_stamp(request.request_id, 'arrival', job.arrival)
@@ -805,6 +885,14 @@ class OgPrefill:
             STATS['import_fallbacks'] += 1
         if job.copy_prompt is not None:
             encoder._og_copy_prompt = job.copy_prompt
+        if encoder.dspark_request is not None:
+            stepd.count('asked')
+            if encoder.dspark is not None:
+                encoder.stepd = stepd.BoxDraft()
+                stepd.count('granted')
+            else:
+                stepd.count('fallback_no_grant')
+                logger.info('ds41-og %s: box drafting not granted (%s)', request.request_id, encoder.dspark_off)
         sid = register(encoder)
         cache[SID_LAYER][6] = mx.array([[sid]], mx.int64)
         mx.eval(cache[SID_LAYER][6])
@@ -920,6 +1008,177 @@ def _probe_steps(sessions, ids_list, starts):
         logger.debug('ds41-og spec probe observe failed', exc_info=True)
 
 
+# ---- DSpark on the box (stepd.py, DS41_OG_BOX_DRAFT=1) ------------------------------------------------------------
+_DSPARK_REQUEST = []
+
+
+def dspark_request():
+    """OPEN.dspark from the served cost tables (once); None if they do not form a valid request."""
+    if not _DSPARK_REQUEST:
+        try:
+            value = stepd.open_request(PipelineDepthController.costs, PipelineDepthController.fused_costs)
+        except (TypeError, ValueError):
+            logger.exception('ds41-og box drafting: the cost tables do not form an OPEN dspark request; not asking')
+            value = None
+        _DSPARK_REQUEST.append(value)
+    return _DSPARK_REQUEST[0]
+
+
+def _box_drafting():
+    """Some session is in its box-drafting era (the Mac ring is not being appended)."""
+    return any(getattr(e, 'stepd', None) is not None and e.stepd.sticky is None and not e.stepd.mac_current
+               for e in list(SESSIONS.values()))
+
+
+def _box_capable(gen_batch, state):
+    """Why this request cannot be box-drafted (None: it can): the box drafts greedy, processor-free blocks with
+    the cost policy at width 4 (DSPARK-BOX §2.6). The extra draft sources (DS41_EXTRA_DRAFT, tool prompts) are not a
+    reason: their proposals pre-empt the box per cycle (_box_prepare), as they pre-empt the Mac drafter."""
+    from ..mlx_lm_mtp import batch_generator as bg
+    if not bg._is_greedy(gen_batch):
+        return 'sampling'
+    if bg._proc_list(gen_batch) is not None:
+        return 'processors'
+    controller = state.controller
+    if controller is None or not getattr(controller, 'cost_policy', False) or controller.max_depth != stepd.WIDTH:
+        return 'cost_policy'
+    return None
+
+
+def _box_keys(caches):
+    """The Mac GPU DSpark ring: (BF16 bits [STAGES, K, KEY_DIM] oldest first, end position)."""
+    import numpy as np
+    offsets = {int(c.offset) for c in caches}
+    if len(caches) != stepd.STAGES or len(offsets) != 1:
+        raise ValueError('DSpark stage rings diverged')
+    rows = []
+    for c in caches:
+        if c.keys is None:
+            rows.append(np.zeros((0, stepd.KEY_DIM), np.uint16))
+            continue
+        keys = c._chronological(c.keys)
+        keys = keys if keys.dtype == mx.bfloat16 else keys.astype(mx.bfloat16)
+        rows.append(np.array(keys.view(mx.uint16)).reshape(-1, stepd.KEY_DIM))
+    if len({r.shape[0] for r in rows}) != 1:
+        raise ValueError('DSpark stage rings hold different row counts')
+    return np.stack(rows), offsets.pop()
+
+
+def _box_rebuild(host, keys, taps, end):
+    """A Mac GPU DSpark ring holding [end - K - T, end): the keys verbatim, then the taps appended as every cycle does."""
+    caches = host.make_mtp_cache()
+    k, t = keys.shape[1], taps.shape[0]
+    start = end - k - t
+    if k:
+        for stage, cache in enumerate(caches):
+            cache.append(mx.array(keys[stage]).view(mx.bfloat16)[None, None], start_offset=start)
+    if t:
+        host.dspark_append_context(mx.array(taps).view(mx.bfloat16)[None], caches,
+                                   start_offset=None if k else start)
+    mx.eval([c.keys for c in caches if c.keys is not None])
+    return caches
+
+
+def _box_mac_ring(host, state, ctl, end=None):
+    """Rebuild the Mac ring from the host ring (through `end`, default all it holds) when the box drafted last."""
+    def rebuild(keys, taps, end):
+        state.mtp_cache = _box_rebuild(host, keys, taps, end)
+    ctl.ensure_mac_ring(rebuild, end)
+
+
+def _prefetch_taps(encoder, start, rows, hidden):
+    """Box drafting: evaluate this verify's DSpark taps (BF16 bits) together with the verify, so reading the committed
+    rows for the STEPD after the accept is a host copy, not a second GPU round trip on the c1 critical path. Only a
+    scheduling change: the same kernels on the same inputs (the taps are the verify's own layer 37-39 hiddens)."""
+    ctl = encoder.stepd
+    encoder._og_taps = None
+    if hidden is None or ctl is None or ctl.sticky is not None:
+        return
+    if not ctl.ring.offset and start + rows < stepd.PRIME_CTX:
+        return  # today's path until 896: no taps are read
+    bits = hidden.view(mx.uint16)
+    mx.async_eval(bits)
+    encoder._og_taps = (start, bits)
+
+
+def _box_prepare(host, gen_batch, state, hidden_rows, committed, encoder, ctl, t0=None):
+    reason = _box_capable(gen_batch, state)
+    if reason is not None:
+        ctl.stick(reason)
+    committed_ids = [int(x) for x in committed.tolist()]
+    n, base = len(committed_ids), int(state.hist_offset)
+    last = state.__dict__.pop('last_verify', None)
+    verify = None
+    if last is not None:  # (m, argmax of every verified row, their drafts, the verified row-0 token)
+        m, targets, drafts, main = last
+        ids_prev = [int(main.item())] + [int(x) for x in drafts]
+        verify = (len(targets), int(m), [int(x) for x in targets], ids_prev)
+    budget = int(gen_batch.max_tokens[0]) - int(gen_batch._num_tokens[0]) - len(state.queue) - 1
+    read = {}
+
+    def taps_fn():
+        import numpy as np
+        if hidden_rows.dtype != mx.bfloat16:
+            raise ValueError(f'DSpark taps are {hidden_rows.dtype}, the wire carries BF16')
+        stash, encoder._og_taps = getattr(encoder, '_og_taps', None), None
+        if stash is not None and stash[0] == base and stash[1].shape[1] >= n:
+            taps = np.asarray(stash[1])[0, :n]  # _prefetch_taps: evaluated with the verify
+        else:
+            taps = np.array(hidden_rows.reshape(-1, stepd.TAP_DIM).view(mx.uint16))
+        read['taps'] = taps
+        return taps
+
+    def propose_fn():
+        """This cycle's Mac proposal, exactly as _dspark_prepare makes it over the Mac drafter: the extra source
+        (a Tracker for tool prompts only, appended every cycle with the committed rows' taps) first, then the copy
+        index. Box era only (base >= 1024); the Mac era runs _dspark_prepare's own code."""
+        copy = state.copy_index
+        if copy is None:
+            return None, None
+        from . import draft_sources
+        if not hasattr(state, 'extra_source_tracker'):
+            state.extra_source_tracker = draft_sources.create(host, copy)
+        tracker = state.extra_source_tracker
+        if tracker is not None:
+            tracker.append(committed_ids, _tap_features(read.get('taps'), hidden_rows))
+        copy.append(committed_ids)
+        draft, source = (tracker.propose(copy._buf[max(0, copy.n - 64):copy.n].tolist(), budget)
+                         if tracker is not None else (None, None))
+        if not draft:
+            draft, source = copy.propose(budget), 'copy'
+        read['source'] = source
+        return (list(draft), source) if draft else (None, None)
+
+    def rebuild_fn(keys, taps, end):
+        state.mtp_cache = _box_rebuild(host, keys, taps, end)
+
+    action, ids = ctl.prepare(encoder, owner=state, base=base, n=n, anchor=committed_ids[-1], verify=verify,
+                              taps_fn=taps_fn, mac_keys_fn=lambda: _box_keys(state.mtp_cache), rebuild_fn=rebuild_fn,
+                              propose_fn=propose_fn, sessions=len(SESSIONS),
+                              fused=bool(getattr(encoder, '_og_fused', False)), budget=budget, t0=t0)
+    if action == 'box':
+        state.drafts, state.draft_lps, state.draft_accept_lps = None, [], []
+        state.box_pending, state.draft_source = True, 'box'
+    elif action in ('copy', 'extra'):
+        state.drafts = mx.array(ids, dtype=mx.uint32)
+        state.draft_lps = [None] * len(ids)
+        state.draft_accept_lps = [None] * len(ids)
+        state.draft_source = read['source']
+    else:
+        return None
+    state.hist_offset += n
+    return True
+
+
+def _tap_features(taps, hidden_rows):
+    """The extra source's input rows (draft_sources.Tracker.append reads hidden[0, :, ::64]): the BF16 taps already
+    read for the STEPD as float32 [1, n, TAP_DIM] (the same values bf16 -> float gives), else the MLX rows."""
+    import numpy as np
+    if taps is None:
+        return hidden_rows
+    return (np.asarray(taps, np.uint16).astype(np.uint32) << 16).view(np.float32)[None]
+
+
 def presend(gen_batch, state):
     """After a request's accept+draft, send its next verify rows to the box at once.
 
@@ -929,8 +1188,8 @@ def presend(gen_batch, state):
     request ended, or the loop issues different rows) is consumed or dropped
     with its session; STEP's `keep` rewinds the box either way.
     """
-    if state.next_main is None or state.drafts is None or state.queue is None:
-        return
+    if getattr(state, 'box_pending', None) or state.next_main is None or state.drafts is None or state.queue is None:
+        return  # box_pending: the STEPD went out with the accept (mtp_box_prepare)
     host = language_model_of(gen_batch.model)
     if not isinstance(host, OgLanguageModel):
         return
@@ -950,7 +1209,9 @@ def presend(gen_batch, state):
             STATS['spec_probe_errors'] += 1
             logger.debug('ds41-og spec probe observe failed', exc_info=True)
     if encoder._pending is None:
-        encoder.send_step(ids, keep)
+        ctl = encoder.stepd
+        if ctl is None or not ctl.presend(encoder, keep, ids):
+            encoder.send_step(ids, keep)
     if probe:
         # After the send: the box computes this step meanwhile, so the prediction costs no c1 time.
         try:

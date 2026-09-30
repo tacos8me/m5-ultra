@@ -127,3 +127,13 @@ aa147ab feat(dspark): box STEPD/RING job and OPEN/ACK capability behind SPLIT_NV
 e80f975 feat(dspark): SPEC v2 additions for the Mac client b0b1a444 (all backward compatible, wire ver 1)
 9bbad4c test(dspark): STEPD end to end over TCP on two fake ranks; one-command CPU suite
 6e85d7e test(dspark): box-local STEPD byte gate for the window; free the BF16 head by default with the FP8 draft head
+
+6e85d7e..bf17aa4 (no merges):
+eb3109b fix(dspark): RING runs at prefill preemption points; per-kind park counters for STEP vs STEPD
+c0a4458 test(dspark): W11 fairness harness per active decoder-second (window); CPU test
+84c656d perf(dspark): drafter graph on its own stream so the step bookkeeping overlaps it (c1 box RTT)
+f2e7d12 test(dspark): fairness scenario sends a prebuilt RING at a fresh chunk start (was flaky 1 in 4)
+f3dae33 feat(dspark): /health dspark reports the drafter job's launch / prepare / wait medians
+9be832b docs(dspark): the RING park comment gives the measured chunk time (~0.4 s per 8K chunk)
+6d5ba2a perf(net): TCP_QUICKACK before every read of a large request frame (STEPD taps, RING, STEP + taps, OPEN)
+bf17aa4 test(net): quickack_netbench.py, the TCP_QUICKACK link check with the real front read path

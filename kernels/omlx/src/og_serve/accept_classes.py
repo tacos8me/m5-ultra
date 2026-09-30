@@ -14,6 +14,10 @@ Classes, 4 prompts each (built once from this machine's stdlib and this tree's d
   sum8k  ~8K tokens of English docs + a five-bullet summary request
   tool   a stdlib module + write_file/run_tests tools; the answer is a tool call with a long argument
   cjk    README.zh/ja/ko of this tree + a request to answer in Chinese / Japanese / Korean
+ACCEPT_SET=followup (DSpark-on-box follow-up, DSPARK-FOLLOWUP-MAC.md): a superset frozen into
+accept-prompts-followup.json: the 20 above, cjk grown to 12 (README.zh/ja/ko x 4 questions in each language) and tool
+grown to 8 (4 more stdlib modules, the same tools), so the CJK class gates on 12 prompts and the tool-schema class
+(the DS41_EXTRA_DRAFT tracker's traffic) on 8. compare also prints each class's per-prompt ratio sd / se.
 Requests are non-streaming and sequential. Each one's og worker summary line (MTP[..] tokens, cycles, accept,
 copy) is read from og-child.log: the lines appended while it ran must hold exactly one MTP line, else the
 request is retried once (other traffic), then marked contaminated and left out of the sums.
@@ -27,6 +31,7 @@ import json
 import os
 from pathlib import Path
 import re
+import statistics
 import sys
 import time
 import urllib.request
@@ -34,7 +39,8 @@ import urllib.request
 HERE = Path(__file__).resolve().parent
 TREE = HERE.parent
 OUT = Path(os.environ.get('ACCEPT_OUT', str(Path.home()/'llm/ds41/next4')))
-PROMPTS = OUT/'accept-prompts.json'
+SET = os.environ.get('ACCEPT_SET', '')
+PROMPTS = OUT/('accept-prompts-followup.json' if SET == 'followup' else 'accept-prompts.json')
 CHILD_LOG = Path(os.environ.get('DS41_OG_LOGS', str(Path.home()/'llm/ds41/og/logs')))/'og-child.log'
 MTP = re.compile(r'MTP\[\d+\] finish=(\S+) tokens=(\d+) cycles=(\d+) tok/cycle=[\d.]+ accept=(\d+)/(\d+)')
 COPY = re.compile(r'copy\[cycles=(\d+) accept=(\d+)/(\d+)\]')
@@ -60,8 +66,17 @@ CJK_Q = [('README.zh.md', '请用中文详细介绍上面文档描述的项目�
          ('README.ja.md', '上の文書が説明しているプロジェクトについて、目的、主な機能、使い方を日本語で詳しく説明してください。'),
          ('README.ko.md', '위 문서가 설명하는 프로젝트의 목적, 주요 기능, 사용 방법을 한국어로 자세히 설명해 주세요.'),
          ('README.zh.md', '请用中文写一篇关于上述项目设计理念的评论文章，使用连贯的段落，不要使用列表。')]
+CJK_MORE = [('README.zh.md', '请用中文向一位刚入门的开发者解释上述项目的工作原理，并举例说明典型的使用场景。'),
+            ('README.zh.md', '请用中文总结上述文档的要点，然后讨论这个项目可能面临的挑战和改进方向。'),
+            ('README.ja.md', '上の文書のプロジェクトの設計思想について、箇条書きを使わずに、まとまった段落の日本語で論評を書いてください。'),
+            ('README.ja.md', '初心者の開発者に向けて、上のプロジェクトの仕組みを日本語で説明し、典型的な利用例を挙げてください。'),
+            ('README.ja.md', '上の文書の要点を日本語でまとめ、このプロジェクトが直面しうる課題と改善の方向性を論じてください。'),
+            ('README.ko.md', '위 프로젝트의 설계 철학에 대해 목록을 쓰지 말고 이어지는 문단으로 한국어 논평을 써 주세요.'),
+            ('README.ko.md', '입문 개발자를 위해 위 프로젝트의 작동 원리를 한국어로 설명하고 대표적인 사용 사례를 들어 주세요.'),
+            ('README.ko.md', '위 문서의 요점을 한국어로 요약한 뒤, 이 프로젝트가 겪을 수 있는 과제와 개선 방향을 논의해 주세요.')]
 CODE_FILES = ['heapq.py', 'json/decoder.py', 'contextlib.py', 'fnmatch.py']
 TOOL_FILES = ['calendar.py', 'base64.py', 'glob.py', 'textwrap.py']
+TOOL_MORE = ['shlex.py', 'numbers.py', 'fractions.py', 'difflib.py']
 DOCS = ['docs/MoE_Expert_Offload.md', 'docs/heterogeneous-cluster.md', 'docs/TESTING.md', 'docs/distributed-cluster.md',
         'README.md', 'docs/oQ_Quantization.md', 'docs/usage-analytics.md', 'docs/rdma-links.md']
 
@@ -92,12 +107,12 @@ def build():
         order = docs[i:] + docs[:i]
         items.append(dict(cls='sum8k', name=f'docs@{i}', messages=[{'role': 'user', 'content':
                      '\n\n---\n\n'.join(order)[:32000] + '\n\nSummarize the documents above in five bullet points.'}]))
-    for name in TOOL_FILES:
+    for name in TOOL_FILES + (TOOL_MORE if SET == 'followup' else []):
         src = (lib/name).read_text()[:14000]
         items.append(dict(cls='tool', name=name, tools=TOOLS, messages=[{'role': 'user', 'content':
                      f'File: {name}\n```python\n{src}\n```\n\nWrite a thorough pytest module for the code above and '
                      f'save it with the write_file tool as tests/test_{Path(name).stem}.py.'}]))
-    for i, (doc, question) in enumerate(CJK_Q):
+    for i, (doc, question) in enumerate(CJK_Q + (CJK_MORE if SET == 'followup' else [])):
         items.append(dict(cls='cjk', name=f'{doc}#{i}', messages=[{'role': 'user', 'content':
                      prose_of((TREE/doc).read_text())[:9000] + '\n\n' + question}]))
     return items
@@ -218,14 +233,21 @@ def compare(args):
     dirty = [f"{r['cls']}/{r['name']}" for r in base['records'] + var['records'] if 'cycles' not in r]
     print(json.dumps(dict(identical=not diff, differing=diff, under_1024=short, contaminated=dirty)))
     ok &= not diff and not short
+    vby = {(r['cls'], r['name']): r for r in var['records']}
     for cls, b in base['summary'].items():
         v = var['summary'].get(cls) or {}
         ratio = (v['tok_per_cycle'] / b['tok_per_cycle']) if b.get('tok_per_cycle') and v.get('tok_per_cycle') else None
         passed = ratio is not None and ratio >= 1 - args.max_drop
         ok &= passed
+        per = [(vby[k]['tokens'] / vby[k]['cycles']) / (r['tokens'] / r['cycles']) for k, r in by.items()
+               if k[0] == cls and r.get('cycles') and vby.get(k, {}).get('cycles')]
+        sd = statistics.stdev(per) if len(per) > 1 else None
         print(json.dumps(dict(cls=cls, base=b['tok_per_cycle'], variant=v.get('tok_per_cycle'),
                               ratio=round(ratio, 4) if ratio else None, accept_base=b['accept'],
-                              accept_variant=v.get('accept'), cycles=[b['cycles'], v.get('cycles')], pass_=passed)))
+                              accept_variant=v.get('accept'), cycles=[b['cycles'], v.get('cycles')],
+                              copy_cycles=[b.get('copy_cycles'), v.get('copy_cycles')], n=len(per),
+                              prompt_ratio_sd=round(sd, 4) if sd else None,
+                              ratio_se=round(sd / len(per) ** 0.5, 4) if sd else None, pass_=passed)))
     print(json.dumps(dict(accept_gate_ok=ok, max_drop=args.max_drop)))
     return 0 if ok else 1
 

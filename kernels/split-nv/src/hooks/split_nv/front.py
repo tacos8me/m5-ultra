@@ -52,6 +52,15 @@ MAX_PAYLOAD = int(os.environ.get("SPLIT_NV_MAX_PAYLOAD_MB", "1024")) << 20
 # sessions -- and their KV, up to a 1M context each -- allocated forever (the connection thread blocks in recv with no
 # timeout). Probes are answered by the peer's kernel, so a live but idle client is never cut. 0 = off.
 KEEPALIVE_S = int(os.environ.get("SPLIT_NV_KEEPALIVE_S", "30"))
+# TCP_QUICKACK before every read of a large request frame (STEPD with taps, RING, STEP + taps, OPEN): without it the
+# kernel delays the ACKs of a ~100 KB upload until the application reads, and the Mac's send stalls in ~200/400 us
+# bursts: 1.05-1.5 ms per 92-154 KB of STEPD taps vs 0.08-0.23 ms with it, 8.9 vs 3.4 ms for a 3.9 MB RING
+# (Mac netbench, DSPARK-FOLLOWUP-MAC.md s0). Linux clears the mode again, so it is re-armed before each recv. Frames
+# up to QUICKACK_MIN payload bytes (a plain STEP: 4-32 B) are read exactly as before. Transport only: no byte changes.
+# Env SPLIT_NV_QUICKACK=0 or the live perf flag {"quickack": false} turns it off.
+TCP_QUICKACK = getattr(socket, "TCP_QUICKACK", None)
+QUICKACK = os.environ.get("SPLIT_NV_QUICKACK", "1") == "1" and TCP_QUICKACK is not None
+QUICKACK_MIN = int(os.environ.get("SPLIT_NV_QUICKACK_MIN", "4096"))
 
 
 def idx_lowmem_summary():
@@ -89,11 +98,21 @@ def log(*a):
         print("[engine]", *a, flush=True)
 
 
-def recv_exact(conn, n):
+def quickack(plen):
+    """Whether a request frame with plen payload bytes is read with TCP_QUICKACK (see QUICKACK)."""
+    return QUICKACK and plen > QUICKACK_MIN and bool(flag("quickack", True))
+
+
+def recv_exact(conn, n, quickack=False):
     buf = bytearray(n)
     view = memoryview(buf)
     got = 0
     while got < n:
+        if quickack:
+            try:
+                conn.setsockopt(socket.IPPROTO_TCP, TCP_QUICKACK, 1)  # not sticky on Linux: before every read
+            except OSError:
+                pass  # a dead socket: the read below reports it
         k = conn.recv_into(view[got:], min(n - got, 4 << 20))
         if k == 0:
             return None
@@ -246,9 +265,17 @@ class DsSession:
 
 def new_pstats():
     """Preemption counters (/health fair.preempt). park_*: how long parked STEPs waited for a point or the chunk end;
-    share_denied: points that had parked STEPs but no decode share left; timing: rank 0's per-chunk maxima (engine)."""
+    share_denied: points that had parked STEPs but no decode share left; timing: rank 0's per-chunk maxima (engine);
+    by_kind: per job kind (step, stepd (Mac drafts / append only), stepd_draft (box drafts), ring) the jobs run at a
+    point (inline) or after their chunk, and their summed / longest park, so a window can compare STEPD with STEP."""
     return {"chunks": 0, "inline_steps": 0, "after_chunk_steps": 0, "share_denied": 0, "park_max_ms": 0.0,
-            "park_over_100": 0, "park_over_200": 0}
+            "park_over_100": 0, "park_over_200": 0, "by_kind": {}}
+
+
+def job_kind(cmd):
+    if cmd[0] == "stepd":
+        return "stepd_draft" if cmd[8] else "stepd"
+    return cmd[0]
 
 
 class Job:
@@ -413,7 +440,7 @@ class Front:
                             left, self.pq = self.pq, []
                         # STEPs parked too late for a point of this chunk run now, before anything else
                         self.pstats["after_chunk_steps"] += len(left)
-                        self._park_waits(left, "after chunk")
+                        self._park_waits(left, "after chunk", where_key="after_chunk")
                         for j in left:
                             self._execute(j)
             finally:
@@ -433,15 +460,20 @@ class Front:
         self._park_waits(jobs, f"point {win.k - 1}", win)
         return jobs
 
-    def _park_waits(self, jobs, where, win=None):
+    def _park_waits(self, jobs, where, win=None, where_key="inline"):
         """Waits of parked STEPs (park -> released to a point or to the chunk's end): max, >100/>200 ms counts, and a
         log line for each wait >= SPLIT_NV_PARK_LOG_MS (150) naming where it was released and the chunk's timings."""
         now = time.perf_counter()
         st = self.pstats
+        by = st.setdefault("by_kind", {})
         for j in jobs:
             if j.t_park is None:
                 continue
             ms = (now - j.t_park) * 1e3
+            k = by.setdefault(job_kind(j.cmd), {"inline": 0, "after_chunk": 0, "park_ms_sum": 0.0, "park_ms_max": 0.0})
+            k[where_key] += 1
+            k["park_ms_sum"] = round(k["park_ms_sum"] + ms, 1)
+            k["park_ms_max"] = max(k["park_ms_max"], round(ms, 1))
             st["park_max_ms"] = max(st.get("park_max_ms", 0.0), round(ms, 1))
             st["park_over_100"] = st.get("park_over_100", 0) + (ms > 100)
             st["park_over_200"] = st.get("park_over_200", 0) + (ms > 200)
@@ -453,6 +485,15 @@ class Front:
                 log(f"preempt: STEP parked {ms:.0f} ms, released {where}{extra}")
 
     def _parkable(self, cmd):
+        if cmd[0] == "ring":
+            # ("ring", sid, slot, offset, keys, kr, taps, tr): index writes into the drafter's ring table plus
+            # append-graph replays -- no step forward. Parked like a graph STEP, so a RING sent during another
+            # session's long prefill (a request crossing 896 or admitted by the bypass, a re-prime after the kill
+            # switch or a ring fault, a crash recovery) runs at the next point instead of waiting for the whole chunk
+            # (~0.4 s for an 8K chunk) and then holding up the next one. Drafts only: the ring's bytes are the same
+            # either way.
+            D = self.engine.dspark
+            return D is not None and (not cmd[7] or "append" in D.graphs)
         if cmd[0] == "stepd":
             # ("stepd", sid, slot, keep, anchor, app_base, n_app, taps, draft, W, dmax, costs, explicit, expect)
             steps, D = self.engine.steps, self.engine.dspark
@@ -473,8 +514,9 @@ class Front:
         return steps.engine.use_graph and slot.graph is not None  # graph steps only (no eager forward inside a chunk)
 
     def run_now(self, cmd):
-        """Execute a STEP on the calling (connection) thread: no hand-off to gpu_loop and back, each of which costs
-        a thread wake-up on a cold core. Waits only for the GPU job already running; ahead of queued jobs."""
+        """Execute a STEP (or STEPD / RING) on the calling (connection) thread: no hand-off to gpu_loop and back, each
+        of which costs a thread wake-up on a cold core. Waits only for the GPU job already running; ahead of queued
+        jobs. During a preemptible prefill chunk a parkable job runs at the chunk's next point instead."""
         job = Job(cmd)
         if self.pq_open and self._parkable(cmd):
             with self.pq_lock:
@@ -1123,8 +1165,9 @@ class Front:
                 if hlen > MAX_HEADER or plen > MAX_PAYLOAD:
                     send_frame(conn, b"ERR ", {"error": f"frame too large (header {hlen}, payload {plen})", "retry": False})
                     break
-                header = recv_exact(conn, hlen) if hlen else b""
-                payload = recv_exact(conn, plen) if plen else b""
+                qa = quickack(plen)
+                header = recv_exact(conn, hlen, qa) if hlen else b""
+                payload = recv_exact(conn, plen, qa) if plen else b""
                 if tag == b"OPEN":
                     h = json.loads(header)
                     n = int(h.get("prompt_tokens") or 0) if h.get("images") else plen // 4
@@ -1396,10 +1439,16 @@ class Front:
         if drafted:
             st["drafter_ms"].append(round(info["drafter_ms"], 3))
             del st["drafter_ms"][:-512]
+            if info.get("split_ms"):
+                sp = st.setdefault("split_ms", [])
+                sp.append(info["split_ms"])
+                del sp[:-512]
         if os.environ.get("SPLIT_NV_STEP_LOG") or flag("step_log", False):
+            sp = info.get("split_ms")
             log(f"session {sid} stepd keep={keep} nver={nver} a={a} mode={mode}->{mode_used} L={L} reason={reason} "
                 f"app={n_app if append else 0} box={box_s * 1e3:.2f}ms drafter={info['drafter_ms']:.2f}ms "
-                f"total={(time.perf_counter() - t0) * 1e3:.2f}ms")
+                + (f"(launch {sp[0]:.3f} prepare {sp[1]:.3f} wait {sp[2]:.3f}) " if sp else "")
+                + f"total={(time.perf_counter() - t0) * 1e3:.2f}ms")
 
     def step_taps(self, conn, sid, keep, ids, taps):
         """SPEC V2.2: STEP(keep, ids) of a granted session with the committed rows' taps [keep - n, keep) after the ids:
@@ -1434,10 +1483,14 @@ class Front:
         D = self.engine.dspark
         ms = sorted(self.dsp_stats["drafter_ms"])
         pct = (lambda q: ms[min(len(ms) - 1, int(q * len(ms)))] if ms else None)
+        sp = self.dsp_stats.get("split_ms") or []
+        med = (lambda i: sorted(x[i] for x in sp)[len(sp) // 2] if sp else None)  # noqa: E731
         return {"loaded": D is not None, "flag": bool(flag("dspark", True)), "sessions": len(self.dsp),
                 "free_slots": len(self.dsp_free), **({"drafter": D.summary(), "load": getattr(D, "load_info", None)} if D else {}),
-                **{k: v for k, v in self.dsp_stats.items() if k != "drafter_ms"},
-                "drafter_ms_p50": pct(0.5), "drafter_ms_p90": pct(0.9)}
+                **{k: v for k, v in self.dsp_stats.items() if k not in ("drafter_ms", "split_ms")},
+                "drafter_ms_p50": pct(0.5), "drafter_ms_p90": pct(0.9),
+                # the drafter job's host timeline (engine.cmd_stepd): launch, step bookkeeping, wait for the draft
+                "launch_ms_p50": med(0), "prepare_ms_p50": med(1), "wait_ms_p50": med(2)}
 
 
 def install_signals(front):

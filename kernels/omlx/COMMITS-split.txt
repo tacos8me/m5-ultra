@@ -1,7 +1,7 @@
 Applies on top of deepseek-v41.patch (head ef88391e):
 base: ef88391e
-head: 0c1ac7c6 (branch ds41-next4, served as llama-swap ds41 with DS41_DRAFT_HEAD=mxfp8; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
-      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe, then ds41-ffn + ds41-ttft2 merged as ds41-next2, then ds41-robust + ds41-c4 merged as ds41-next3, then ds41-next4)
+head: a3d73c53 (branch ds41-stepd, served as llama-swap ds41 with DS41_OG_BOX_DRAFT=1 DS41_DRAFT_HEAD=mxfp8; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
+      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe, then ds41-ffn + ds41-ttft2 merged as ds41-next2, then ds41-robust + ds41-c4 merged as ds41-next3, then ds41-next4, then ds41-stepd)
 
 5b17cbbc perf: keep DeepSeek V4.1 decode KV growth in place across extract and rollback
 88cfffd9 perf: score DeepSeek V4.1 decode index keys in one lazy tile
@@ -123,3 +123,14 @@ e1092c4a chore(ds41): retire the copy-lock spec_probe (DS41_OG_SPEC_PROBE defaul
 e431b964 security(ds41-og): supervisor forwards only an allow-list to the oMLX child
 26645024 feat(ds41): MXFP8 draft head through the M-invariant rows kernel (DS41_DRAFT_HEAD=mxfp8, default off)
 e67d98d0 fault_soak: phase B non-streaming hang-up at 2 s so it cancels mid-decode
+
+0c1ac7c6..a3d73c53 (no merges):
+a3d73c53 test(ds41-og): accept_classes ACCEPT_SET=followup (12 CJK, 8 tool-schema prompts); per-prompt ratio sd
+66806ee9 test(ds41-og): stepd_netbench --no-spin (front.py's blocking recv at c2+)
+84fdc89b test(ds41-og): follow-up tests; fake box reads the kill switch once per job; STEPD upload netbench
+ea956b96 feat(ds41-og): box drafting follow-up: c1 path, per-cycle extra source, NO_TAPS during PF_ACTIVE
+0b6e71c2 test(ds41-og): fake box and tests for STEPD errata E1 + v2; interop with the box front
+6bfd0ed3 feat(ds41-og): box drafting follows STEPD-SPEC.md errata E1 + v2 (box 6e85d7e)
+b0b1a444 test(ds41-og): in-tree CPU suite runner (og_serve/cpu_suite.sh)
+badf6b1e test(ds41-og): fake box speaks STEPD v1; CPU end-to-end and unit tests
+898b2391 feat(ds41-og): DSpark drafting on the box, Mac client (STEPD-SPEC.md v1)

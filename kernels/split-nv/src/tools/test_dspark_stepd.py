@@ -28,7 +28,10 @@ Scenarios:
 - a crash-restart continuation (fresh box: nver>0 -> no_pending ERR; reopen + RING + kickoff nver=0);
 - accept mismatch -> ERR + closed;
 - pf_active;
-- parkable STEPD commands.
+- parkable STEPD and RING commands;
+- fairness during another session's preemptible prefill (real Front job queue, gpu_loop and layer preemption, rank 1 in
+  its own thread with its own preempt module): plain STEP, box-drafted STEPD and Mac-drafted STEPD decoders run at the
+  chunks' points with the same progress, a re-prime RING runs at a point (not after the chunk), PF_ACTIVE is set.
 usage: CUDA_VISIBLE_DEVICES= python tools/test_dspark_stepd.py
 """
 import hashlib
@@ -202,6 +205,9 @@ class FakeDrafter:
         q = 0.3 + 0.6 * ((keep * 7) % 10) / 10
         self.pending = (toks, [0.97, 0.9, q, 0.25][:W_])
         self.calls["drafts"] += 1
+
+    def drain(self):
+        pass
 
     def collect(self, W_):
         toks, probs = self.pending
@@ -428,8 +434,8 @@ class Mac:
         self.last = (r, p)
         return r, p
 
-    def ring(self, offset, k_rows, t_rows, bad_digest=False):
-        """Re-prime from the Mac's own state: keys (positions [offset-k-t, offset-t)) then taps (the rest)."""
+    def ring_frame(self, offset, k_rows, t_rows, bad_digest=False):
+        """A re-prime RING from the Mac's own state: keys (positions [offset-k-t, offset-t)) then taps (the rest)."""
         n = k_rows + t_rows
         keys = b"".join(enc_row(self.hist[p], p, W.KEY_ROW_BYTES) for _ in range(W.STAGES)
                         for p in range(offset - n, offset - t_rows))
@@ -437,6 +443,10 @@ class Mac:
         hdr, pay = W.encode_ring(self.sid, offset, keys, taps, k_rows, t_rows)
         if bad_digest:
             hdr = json.dumps(dict(json.loads(hdr), sha256="0" * 64)).encode()
+        return hdr, pay
+
+    def ring(self, offset, k_rows, t_rows, bad_digest=False, frame=None):
+        hdr, pay = frame or self.ring_frame(offset, k_rows, t_rows, bad_digest)
         self._send(W.TAG_RING, hdr, pay)
         self.stats["rings"] += 1
 
@@ -842,10 +852,385 @@ def run_parkable():
     check("parkable: drafted STEPD with graphs", f._parkable(cmd(True, 1, 4, [])))
     check("parkable: append-only STEPD with the append graph", f._parkable(cmd(False, 2, 0, [1, 2])))
     check("not parkable: explicit width 8 (eager step)", not f._parkable(cmd(False, 0, 0, [1] * 7)))
+    ring = lambda tr: ("ring", 1, 0, 2000, bytes(3 * 4 * W.KEY_ROW_BYTES), 4, bytes(tr * W.TAP_ROW_BYTES), tr)  # noqa: E731
+    check("parkable: RING (keys + taps) with the append graph", f._parkable(ring(3)))
+    check("parkable: RING of keys only", f._parkable(ring(0)))
     D.graphs.pop(4)
     check("not parkable: drafter width without a graph", not f._parkable(cmd(True, 1, 4, [])))
+    D.graphs.pop("append")
+    check("not parkable: RING with taps but no append graph (eager append)", not f._parkable(ring(3)))
+    check("parkable: RING of keys only needs no graph", f._parkable(ring(0)))
     f.engine.dspark = None
     check("not parkable: drafter gone", not f._parkable(cmd(False, 0, 0, [1])))
+    check("not parkable: RING with the drafter gone", not f._parkable(ring(0)))
+
+
+# ------------------------------------------------------------------------------------------------ transport: TCP_QUICKACK
+class FakeConn:
+    """A connection socket that serves a prepared byte stream in <= chunk bytes per recv_into and logs every
+    setsockopt / recv_into, so the test sees whether TCP_QUICKACK was armed right before each read."""
+
+    def __init__(self, data, chunk=65536):
+        self.data, self.off, self.chunk = data, 0, chunk
+        self.log, self.out = [], bytearray()
+
+    def setsockopt(self, level, opt, val):
+        self.log.append(("opt", level, opt, val))
+
+    def recv_into(self, view, n):
+        k = min(n, self.chunk, len(self.data) - self.off)
+        view[:k] = self.data[self.off:self.off + k]
+        self.log.append(("recv", self.off, k))
+        self.off += k
+        return k
+
+    def recv(self, n, flags=0):
+        return self.data[self.off:self.off + n]
+
+    def sendall(self, b):
+        self.out += b
+
+    def close(self):
+        pass
+
+
+def qa_reads(log):
+    """[(stream offset, bytes, armed)] per recv_into: armed = the entry right before it set TCP_QUICKACK."""
+    qa = ("opt", socket.IPPROTO_TCP, F.TCP_QUICKACK, 1)
+    return [(x[1], x[2], i > 0 and log[i - 1] == qa) for i, x in enumerate(log) if x[0] == "recv"]
+
+
+def frame(tag, header, payload=b""):
+    h = header if isinstance(header, bytes) else json.dumps(header).encode()
+    return F.FRAME.pack(tag, len(h), len(payload)) + h + payload
+
+
+def run_quickack():
+    check("quickack: TCP_QUICKACK available and on by default (Linux)", F.TCP_QUICKACK is not None and F.QUICKACK)
+    # recv_exact: re-armed before every read of a multi-read payload; never when not asked
+    c = FakeConn(bytes(200_000))
+    F.recv_exact(c, 200_000, quickack=True)
+    reads = qa_reads(c.log)
+    check("quickack: recv_exact re-arms before each of its reads", len(reads) == 4 and all(r[2] for r in reads), c.log)
+    c = FakeConn(bytes(200_000))
+    F.recv_exact(c, 200_000)
+    check("quickack: recv_exact without it never sets the option", not any(x[0] == "opt" for x in c.log), c.log)
+    # handle_conn on a granted session: OPEN (4.8 KB), plain STEP, STEP + taps (92 KB), plain STEP, keys-only RING
+    # (393 KB), CLOS -> armed on every header/payload read of the large frames, never on a plain STEP or a frame head
+    prompt = prompt_of(1200, seed=41)
+    n1 = len(prompt) - 1
+    parts = [frame(b"OPEN", {"proto": 1, "identity": "t", "prompt_tokens": len(prompt), "state": "none",
+                             "dspark": {"ver": 1, "costs": COSTS}}, struct.pack(f"<{len(prompt)}I", *prompt))]
+    sid = None
+
+    def build(sid):
+        hist = list(prompt[:-1]) + [prompt[-1]]
+        fs = [("OPEN", True, parts[0])]
+        fs.append(("STEP", False, frame(b"STEP", F.STEP_HDR.pack(sid, n1, 1), struct.pack("<I", prompt[-1]))))
+        taps = b"".join(enc_row(hist[p], p, W.TAP_ROW_BYTES) for p in range(n1 + 1 - 3, n1 + 1))
+        fs.append(("STEP+taps", True, frame(b"STEP", F.STEP_HDR.pack(sid, n1 + 1, 1), struct.pack("<I", 6) + taps)))
+        fs.append(("STEP", False, frame(b"STEP", F.STEP_HDR.pack(sid, n1 + 2, 1), struct.pack("<I", 7))))
+        keys = b"".join(enc_row(0, p, W.KEY_ROW_BYTES) for _ in range(W.STAGES) for p in range(n1 + 2 - W.RING, n1 + 2))
+        hdr, pay = W.encode_ring(sid, n1 + 2, keys, b"", W.RING, 0)
+        fs.append(("RING", True, frame(W.TAG_RING, hdr, pay)))
+        fs.append(("CLOS", False, frame(b"CLOS", b"")))
+        return fs
+
+    for flags, want_armed in (({}, True), ({"quickack": False}, False)):
+        set_flags(flags)
+        f = make_front()
+        sid = f.next_sid
+        fs = build(sid)
+        data = b"".join(x[2] for x in fs)
+        c = FakeConn(data)
+        f.handle_conn(c, ("127.0.0.1", 1))
+        bounds, off = [], 0
+        for name, large, b in fs:
+            bounds.append((name, large, off, off + F.FRAME.size, off + len(b)))
+            off += len(b)
+        ok, bad = True, []
+        for o, k, armed in qa_reads(c.log):
+            name, large, a0, h_end, end = next(x for x in bounds if x[2] <= o < x[4])
+            expect = want_armed and large and o >= h_end  # frame heads (16 B) are read as before
+            if armed != expect:
+                ok, bad = False, bad + [(name, o - a0, k, armed)]
+        check(f"quickack {flags or 'default'}: armed before every header/payload read of large frames only", ok, bad)
+        tags = []
+        v = memoryview(bytes(c.out))
+        while len(v) >= F.FRAME.size:
+            t, hl, pl = F.FRAME.unpack(v[:F.FRAME.size])
+            tags.append(t)
+            v = v[F.FRAME.size + hl + pl:]
+        check(f"quickack {flags or 'default'}: replies unchanged (ACK + three STPR, no ERR)",
+              tags == [b"ACK ", b"STPR", b"STPR", b"STPR"], tags)
+        if want_armed:
+            check("quickack: the keys-only RING was applied", f.dsp_stats["rings"] == 1 and f.dsp_stats["hard_errors"] == {},
+                  f.dsp_stats)
+    set_flags({})
+
+
+def run_pf_notaps_reprime(addr, f):
+    """The Mac client since ds41-stepd ea956b96: box drafting, then during another session's prefill (PF_ACTIVE, >= 2
+    sessions) Mac-drafted STEPD mode 1 with NO_TAPS (and plain STEPs for 1-row blocks), then, two clear replies after
+    the prefill, a keys-only RING (K = 128, T = 0, offset = base) and STEPD mode 0 with the cycle's taps [base, keep)."""
+    mac = Mac(addr, prompt_of(1500, seed=43))
+    mac.open()
+    anchor = mac.start()
+    keep = len(mac.hist)
+    mac.ring(keep, W.RING, 0)
+    mac.stepd(keep, anchor, 0, 0, W.MODE_BOX, 4)
+    for _ in range(15):
+        mac.cycle(W.MODE_BOX)
+    psid = 10 ** 6 + 7
+    f.pf_need[psid] = 50000
+    seen = []
+    for i in range(12):
+        if i == 5:
+            mac.plain_cycle(with_taps=False)  # a 1-row Mac block: plain STEP, no taps (presend)
+            continue
+        r, p = mac.cycle(W.MODE_EXPLICIT, no_taps=True)
+        seen.append(r)
+        if p != expected_payload(mac.hist, len(mac.hist), mac.pending[1]):
+            check("pf no-taps: payload", False, r)
+    del f.pf_need[psid]
+    for _ in range(2):  # the Mac's two clear replies, still drafting itself without taps
+        r, _ = mac.cycle(W.MODE_EXPLICIT, no_taps=True)
+        seen.append(r)
+    check("pf no-taps: mode 1 NO_TAPS served as explicit steps, PF_ACTIVE while the prefill ran, no errors",
+          all(r["mode_used"] == W.MODE_EXPLICIT for r in seen) and all(r["flags"] & W.R_PF_ACTIVE for r in seen[:11])
+          and not any(r["flags"] & W.R_PF_ACTIVE for r in seen[11:]), [(r["mode_used"], r["flags"]) for r in seen])
+    check("pf no-taps: the ring reports not current (a gap), as the Mac expects", all(not r["flags"] & W.R_RING_OK for r in seen)
+          and all(r["reason"] == W.REASON["ring_not_ok"] for r in seen), [r["reason"] for r in seen])
+    rings0 = f.dsp_stats["rings"]
+    argmax, a, anchor = mac.verify()
+    keep = len(mac.hist)
+    nver = len(mac.pending[1])
+    base = keep - a - 1
+    mac.ring(base, W.RING, 0)  # keys only, from the Mac ring: [base - 128, base)
+    r, p = mac.stepd(keep, anchor, nver, a, W.MODE_BOX, 4, argmax, (), mac.taps_of(keep, a))
+    check("pf no-taps: keys-only RING at base + STEPD mode 0 with taps -> appended and drafted on the box",
+          r["mode_used"] == W.MODE_BOX and r["flags"] & W.R_DRAFTED and r["flags"] & W.R_RING_OK and r["reason"] == 0
+          and f.dsp_stats["rings"] == rings0 + 1, r)
+    check("pf no-taps: payload after the re-prime == the STEP function", p == expected_payload(mac.hist, keep, mac.pending[1]))
+    drafted = 0
+    for _ in range(20):
+        r, _ = mac.cycle(W.MODE_BOX)
+        drafted += bool(r["flags"] & W.R_DRAFTED and r["flags"] & W.R_RING_OK)
+    check("pf no-taps: box drafting continues with the ring current", drafted == 20, drafted)
+    mac.verify()
+    check("pf no-taps: output == greedy reference", mac.out == greedy(mac.prompt, len(mac.out)))
+    e0, e1 = f.engine, f.e1
+    s0, s1 = e0.sessions[mac.sid], e1.sessions[mac.sid]
+    check("pf no-taps: rank 0 / rank 1 identical", (s0.hist, s0.pending) == (s1.hist, s1.pending) and not f.peers[0].errors)
+    mac.close()
+
+
+# ------------------------------------------------------------------------------------------------ fairness during prefills
+LAYER_S = 0.004  # fake prefill layer (two points per layer, 21 layers: a ~84 ms chunk)
+
+
+class QPipe:
+    """The rank-0 -> rank-1 command pipe (commands and the preempt points' ("pp", k, cmds) messages, in order)."""
+
+    def __init__(self):
+        import queue
+        self.q = queue.Queue()
+
+    def send(self, obj):
+        self.q.put(obj)
+
+    def recv(self):
+        return self.q.get()
+
+
+def load_preempt_copy():
+    """Rank 1's own preempt module (its window is module-global), with run_inline as the fake engines need it."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("preempt_rank1", os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                                                                "..", "hooks", "split_nv", "preempt.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    m.run_inline = lambda engine, cmd: engine.execute(cmd)
+    return m
+
+
+class PrefillEngine(FakeEngine):
+    """FakeEngine plus a preemptible prefill chunk: 21 layers x 2 halves, each entry a preempt point (as the engine's
+    hooked forward). Every executed job is logged, so the two ranks' sequences can be compared point by point."""
+
+    def __init__(self, rank, pmod):
+        super().__init__(rank, True, nslots=6)
+        self.pmod = pmod
+        self.preempt_peers = self.preempt_take = None
+        self.log = []
+
+    def execute(self, cmd):
+        kind = cmd[0]
+        if kind == "prefill_chunk":
+            pre = len(cmd) > 5 and cmd[5]
+            win = self.pmod.open_window(self, self.tp_rank == 0, self.preempt_peers, self.preempt_take) if pre else None
+            if win is not None:
+                win.lag = 0  # no CUDA events here
+            try:
+                for layer in range(21):
+                    for half in "AB":
+                        self.pmod.point()
+                        self.log.append(("L", cmd[1], layer, half))
+                        time.sleep(LAYER_S / 2)
+            finally:
+                if win is not None:
+                    self.pmod.close_window()
+            return {}, 0.0
+        if kind in ("step", "stepd", "ring"):
+            self.log.append((F.job_kind(cmd), cmd[1], cmd[2] if kind == "step" else cmd[3]))  # keep / ring offset
+        return super().execute(cmd)
+
+
+def make_prefill_front():
+    """make_front with the real job queue, gpu_loop and layer preemption; rank 1 runs in its own thread with its own
+    preempt module, fed through one ordered pipe as rank_main is."""
+    import queue
+    f = make_front(nslots=6)
+    for name in ("submit", "submit_async"):
+        del f.__dict__[name]
+    pipe = QPipe()
+    e0, e1 = PrefillEngine(0, F.preempt), PrefillEngine(1, load_preempt_copy())
+    f.engine, f.e1, f.peers = e0, e1, [pipe]
+    f.dsp_free = list(range(6))
+    f.jobs = queue.PriorityQueue()
+    f.preempt_on = True
+    e0.preempt_peers, e0.preempt_take = [pipe], f._take_parked
+    e1.preempt_peers = pipe
+    f.r1_errors = []
+
+    def rank1():
+        while True:
+            cmd = pipe.recv()
+            if cmd is None:
+                return
+            try:
+                e1.execute(cmd)
+            except Exception as e:  # noqa: BLE001
+                f.r1_errors.append(repr(e))
+
+    threading.Thread(target=rank1, daemon=True).start()
+    threading.Thread(target=f.gpu_loop, daemon=True).start()
+    f.pipe = pipe
+    return f
+
+
+def run_prefill_fairness():
+    """Three decoders -- plain STEP (today), STEPD mode 0 (box drafts) and STEPD mode 1 + taps (Mac drafts, the
+    PF_ACTIVE era) -- cycle while another session's preemptible prefill chunks run; a fourth session re-primes with a
+    RING in the middle of a chunk. The STEPD kinds must be served at the chunks' points exactly like the STEP (parity
+    of cycles), the RING must run at a point instead of after its chunk, every STPD must carry PF_ACTIVE, both ranks
+    must run the same jobs at the same points, and every decoder's text must equal greedy decoding."""
+    saved_inline = F.preempt.run_inline
+    F.preempt.run_inline = lambda engine, cmd: engine.execute(cmd)
+    f = make_prefill_front()
+    srv = serve(f)
+    addr = srv.getsockname()
+    try:
+        plain, box, mac1, late = (Mac(addr, prompt_of(n, seed=s)) for n, s in ((1300, 31), (1400, 32), (1500, 33), (1600, 34)))
+        plain.dspark_req = None
+        for m in (plain, box, mac1, late):
+            m.open()
+        anchors = {id(m): m.start() for m in (plain, box, mac1, late)}
+        for m in (box, mac1, late):
+            keep = len(m.hist)
+            m.ring(keep, W.RING, 0)
+            m.stepd(keep, anchors[id(m)], 0, 0, W.MODE_BOX if m is box or m is late else W.MODE_EXPLICIT, 4,
+                    explicit=greedy(m.hist + [anchors[id(m)]], 3) if m is mac1 else ())
+        plain.step(len(plain.hist), [anchors[id(plain)]] + greedy(plain.hist + [anchors[id(plain)]], 3))
+        psid = 10 ** 6
+        f.pf_need[psid] = 8 * 8192  # another session's prefill is admitted and unfinished (PF_ACTIVE)
+        stop = threading.Event()
+        counts = {"plain": 0, "box": 0, "mac1": 0}
+        errors = []
+
+        def loop(name, m):
+            try:
+                while not stop.is_set():
+                    if name == "plain":
+                        m.plain_cycle(with_taps=False)
+                    elif name == "box":
+                        m.cycle(W.MODE_BOX)
+                    else:
+                        m.cycle(W.MODE_EXPLICIT)
+                    counts[name] += 1
+                    time.sleep(0.001)  # the Mac's verify
+            except Exception as e:  # noqa: BLE001
+                errors.append((name, repr(e)))
+
+        threads = [threading.Thread(target=loop, args=(n, m)) for n, m in (("plain", plain), ("box", box), ("mac1", mac1))]
+        chunks = 6
+        f.run_now(("open", psid, prompt_of(10, seed=35)))  # rank 1 opens it through the pipe
+        for t in threads:
+            t.start()
+        t0 = time.perf_counter()
+        jobs = [f.submit_async(("prefill_chunk", psid, [0] * 8192, None, 0, True), priority=1) for _ in range(chunks)]
+        # the RING (built beforehand: 1.5 MB of Python bytes): sent right after a chunk (not the first) started
+        _, a, anchor = late.verify()
+        keep = len(late.hist)
+        frame = late.ring_frame(keep, W.RING - 40, 40)
+        n0 = f.pstats["chunks"]
+        while not (f.pq_open and f.pstats["chunks"] >= max(n0, 1) + 1):
+            time.sleep(0.0002)
+        tr0 = time.perf_counter()
+        in_chunk = f.pq_open
+        late.ring(keep, W.RING - 40, 40, frame=frame)
+        r, p = late.stepd(keep, anchor, 0, 0, W.MODE_BOX, 4)
+        ring_ms = (time.perf_counter() - tr0) * 1e3
+        for j in jobs:
+            j.wait()
+        pf_s = time.perf_counter() - t0
+        stop.set()
+        for t in threads:
+            t.join()
+        del f.pf_need[psid]
+        chunk_ms = 42 * LAYER_S / 2 * 1e3
+        st = f.pstats
+        by = st.get("by_kind", {})
+        print(f"  fairness: prefill {pf_s * 1e3:.0f} ms ({chunks} chunks of ~{chunk_ms:.0f} ms), cycles {counts}, "
+              f"RING+kickoff {ring_ms:.1f} ms, by kind {json.dumps(by)}", flush=True)
+        check("fairness: no decoder error during the prefill", not errors and not f.r1_errors, (errors, f.r1_errors[:2]))
+        check("fairness: STEP, drafted STEPD and Mac-drafted STEPD all ran at points",
+              all(by.get(k, {}).get("inline", 0) > 0 for k in ("step", "stepd_draft", "stepd")), by)
+        lo = min(counts.values())
+        check("fairness: STEPD decoders progressed like the plain STEP decoder (cycles within 25%)",
+              lo > 0 and min(counts["box"], counts["mac1"]) >= 0.75 * counts["plain"], counts)
+        rk = by.get("ring", {})
+        check("fairness: the RING during a chunk ran at a point, not after the chunk (box-side park < half a chunk)",
+              in_chunk and rk.get("inline", 0) >= 1 and rk.get("after_chunk", 0) == 0
+              and rk.get("park_ms_max", 1e9) < 0.5 * chunk_ms, (in_chunk, ring_ms, rk))
+        check("fairness: the kickoff after the in-chunk RING drafted on the box", r["mode_used"] == W.MODE_BOX
+              and r["flags"] & W.R_DRAFTED and r["flags"] & W.R_RING_OK, r)
+        pf_flags = [fl for m in (box, mac1) for fl in m.flags_seen[1:]]
+        check("fairness: every STPD during the prefill carried PF_ACTIVE", pf_flags and all(fl & W.R_PF_ACTIVE for fl in pf_flags))
+        for m in (plain, box, mac1, late):
+            m.verify()
+        check("fairness: every decoder's text == greedy reference",
+              all(m.out == greedy(m.prompt, len(m.out)) for m in (plain, box, mac1, late)))
+        check("fairness: payloads of the last STPD == the STEP function", p == expected_payload(late.hist[:keep], keep, [anchor] + r["drafts"][:r["depth"]]))
+        f.pipe.send(None)
+        time.sleep(0.05)
+        e0, e1 = f.engine, f.e1
+        check("fairness: both ranks ran the same jobs at the same points", e0.log == e1.log and len(e0.log) > 42 * chunks,
+              (len(e0.log), len(e1.log)))
+        def in_chunk_at(i):  # the last layer entry before job i exists and is not its chunk's last one
+            prev = next((x for x in reversed(e0.log[:i]) if x[0] == "L"), None)
+            return prev is not None and prev[2:] != (20, "B")
+
+        jobs_in = [x[0] for i, x in enumerate(e0.log) if x[0] != "L" and in_chunk_at(i)]
+        check("fairness: decode jobs of every kind ran between prefill layers",
+              all(k in jobs_in for k in ("step", "stepd", "stepd_draft", "ring")), sorted(set(jobs_in)))
+        ri = [i for i, x in enumerate(e0.log) if x == ("ring", late.sid, keep)]
+        check("fairness: the re-prime RING ran inside a chunk, the kickoff right after it",
+              len(ri) == 1 and in_chunk_at(ri[0]) and ("stepd_draft", late.sid, keep) in e0.log[ri[0] + 1:],
+              e0.log[ri[0] - 2:ri[0] + 3] if ri else None)
+    finally:
+        F.preempt.run_inline = saved_inline
+        srv.close()
 
 
 def run_gate_client():
@@ -890,12 +1275,17 @@ def main():
     run_crossing(addr)
     run_gap_and_switch(addr, f)
     run_errors(addr, f)
+    run_pf_notaps_reprime(addr, f)
     run_restart(addr, f)
     run_slots_and_not_loaded()
+    run_quickack()
     run_parkable()
+    run_prefill_fairness()
     run_gate_client()
     st = f.dspark_summary() if hasattr(f, "dspark_summary") else {}
     check("health summary counts cycles and fallbacks", st.get("cycles", {}).get("box", 0) > 100 and st.get("fallbacks"), st)
+    check("health summary: the drafter job's launch / prepare / wait medians", all(
+        isinstance(st.get(k), float) for k in ("launch_ms_p50", "prepare_ms_p50", "wait_ms_p50")) and "split_ms" not in st, st)
     srv.close()
     ok = all(RESULTS)
     print("ALL PASS" if ok else "SOME FAILED", f"({sum(RESULTS)}/{len(RESULTS)})")

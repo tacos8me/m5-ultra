@@ -20,6 +20,10 @@ Perf recovery vs the gate-(b) job (W=4 1.78 ms, W=5 1.89 ms), each switchable fo
                                     FusedMoE (0.20 ms untuned; tools/dspark_box/microbench.py tunes and re-times it)
   SPLIT_NV_DSPARK_FREE_BF16_HEAD=1  (default) free the BF16 head shard once the FP8 copy exists (-0.31 GiB/GPU; only
                                     with hooks.TRIM, i.e. when nothing on the box computes target logits)
+  SPLIT_NV_DSPARK_STREAM=side|main  (default side; live flag dspark_side_stream) the drafter graph replays on its own
+                                    stream, after the queued work, so the step's host bookkeeping that STEPD runs
+                                    meanwhile (StepRunner.prepare) is not serialized behind it: prepare's pageable H2D
+                                    copies synchronize the stream they run on. Timing only (same graph, same inputs)
 Drafts change only which rows the Mac verifies, never their values (SPEC s0); determinism holds per input (fixed
 shapes, no atomics in the Markov reductions, rank-identical all-gathered winners).
 """
@@ -51,8 +55,10 @@ def settings():
          "moe": os.environ.get("SPLIT_NV_DSPARK_MOE", "og3"),
          "widths": tuple(int(w) for w in os.environ.get("SPLIT_NV_DSPARK_WIDTHS", str(WIDTH)).split(",") if w),
          # with the FP8 copy the BF16 shard is dead weight on the box (hooks.TRIM skips the head GEMM): -0.31 GiB/GPU
-         "free_bf16_head": os.environ.get("SPLIT_NV_DSPARK_FREE_BF16_HEAD", "1") == "1"}
-    if s["head"] not in ("fp8", "bf16") or s["markov"] not in ("fused", "ref") or s["moe"] not in ("og3", "sgl"):
+         "free_bf16_head": os.environ.get("SPLIT_NV_DSPARK_FREE_BF16_HEAD", "1") == "1",
+         "stream": os.environ.get("SPLIT_NV_DSPARK_STREAM", "side")}
+    if (s["head"] not in ("fp8", "bf16") or s["markov"] not in ("fused", "ref") or s["moe"] not in ("og3", "sgl")
+            or s["stream"] not in ("side", "main")):
         raise ValueError(f"SPLIT_NV_DSPARK_* settings {s}")
     if WIDTH not in s["widths"] or any(not 1 <= w <= BLOCK_MAX for w in s["widths"]):
         raise ValueError(f"SPLIT_NV_DSPARK_WIDTHS {s['widths']}: must include {WIDTH}, each 1..{BLOCK_MAX}")
@@ -275,7 +281,8 @@ def graph_capture(fn):
 
 # ------------------------------------------------------------------------------------------------ the drafter
 class BoxDrafter:
-    def __init__(self, model, d, rank, nslots=8, head="fp8", markov="fused", moe="og3", ckpt=CKPT, free_bf16_head=False):
+    def __init__(self, model, d, rank, nslots=8, head="fp8", markov="fused", moe="og3", ckpt=CKPT, free_bf16_head=False,
+                 stream="main"):
         from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
         from sglang.srt.layers.moe.topk import TopKOutputChecker
         from sglang.kernels.ops.layernorm.mhc import hc_combine
@@ -347,6 +354,9 @@ class BoxDrafter:
         self.fast_rope = True
         self.graphs = {}
         self.staged = None  # event after the last launch that read the pinned staging buffers
+        # the drafter's own stream (SPLIT_NV_DSPARK_STREAM=side): see the module docstring
+        self.side = torch.cuda.Stream(device=self.dev) if stream == "side" and self.dev.type == "cuda" else None
+        self.on_side = None  # the side stream of the launched, not yet collected draft
         self.stats = {"drafts": 0, "appends": 0, "rings": 0, "draft_ms_last": None}
 
     def _free_bf16_head(self, model):
@@ -616,27 +626,54 @@ class BoxDrafter:
             self._launched()
         self.stats["appends"] += n
 
+    def _side_stream(self, graphed):
+        """The stream this launch replays on: the side stream for a captured graph (eager ops would allocate on it)
+        unless the live flag dspark_side_stream is off. Each rank reads the flag itself: a rank-local timing choice
+        (same graph, same collectives in the same order on every rank; ordering is enforced per rank)."""
+        if self.side is None or not graphed:
+            return None
+        from split_nv.perf_flags import flag
+        return self.side if flag("dspark_side_stream", True) else None
+
     def launch_draft(self, slot, keep, anchor, base, n, taps, W):
-        """Append the committed rows [base, base + n) and draft W tokens at keep (one graph); returns at once."""
+        """Append the committed rows [base, base + n) and draft W tokens at keep (one graph); returns at once.
+        On the side stream the graph waits for everything queued before it (the last step, a preempted prefill's
+        segments): it then shares no time with any collective of the main stream, while the host's step
+        bookkeeping (and its main-stream copies) proceeds. collect() orders the main stream after it."""
         mv = memoryview(taps).cast("B") if n else None
-        if n > BLOCK_MAX:  # oldest rows first, append-only launches
+        if n > BLOCK_MAX:  # oldest rows first, append-only launches (main stream)
             extra = n - BLOCK_MAX
             self.run_append(slot, base, extra, mv[:extra * WIRE.TAP_ROW_BYTES])
             base, n, mv = base + extra, BLOCK_MAX, mv[extra * WIRE.TAP_ROW_BYTES:]
-        self._stage(slot, base, n, mv, anchor, keep)
         g = self.graphs.get(W)
-        if g is not None:
-            g.replay()
-        else:
-            with torch.no_grad():
-                self.full(W)
-        self._launched()
+        side = self._side_stream(g is not None)
+        ctx = contextlib.nullcontext()
+        if side is not None:
+            side.wait_stream(torch.cuda.current_stream())
+            ctx = torch.cuda.stream(side)
+        with ctx:
+            self._stage(slot, base, n, mv, anchor, keep)
+            if g is not None:
+                g.replay()
+            else:
+                with torch.no_grad():
+                    self.full(W)
+            self._launched()
+        self.on_side = side
         self.stats["drafts"] += 1
         self.stats["appends"] += n
 
+    def drain(self):
+        """The launched draft is complete and the main stream is ordered after it (the step graphs share its graph
+        memory pool: they must never overlap it)."""
+        self._wait_staging()
+        if self.on_side is not None:
+            torch.cuda.current_stream().wait_stream(self.on_side)
+            self.on_side = None
+
     def collect(self, W):
         """Wait for the launched draft; -> (tokens, max-probs) as Python lists (identical on every rank)."""
-        self._wait_staging()
+        self.drain()
         return self.h_toks[:W].tolist(), self.h_probs[:W].tolist()
 
     def ring_set(self, slot, offset, keys, kr, taps, tr):
@@ -657,7 +694,7 @@ class BoxDrafter:
 
     def summary(self):
         return {"head": self.head_mode, "markov": self.markov_mode, "moe": self.moe_mode, "slots": self.nslots,
-                "graphs": sorted(str(k) for k in self.graphs), **self.stats}
+                "side_stream": self.side is not None, "graphs": sorted(str(k) for k in self.graphs), **self.stats}
 
 
 def load(engine):
@@ -678,7 +715,8 @@ def load(engine):
         info = load_draft(d, dev)
         torch.cuda.synchronize()
         loaded = torch.cuda.memory_allocated() - a0
-        D = BoxDrafter(model, d, engine.tp_rank, s["slots"], s["head"], s["markov"], s["moe"], free_bf16_head=s["free_bf16_head"])
+        D = BoxDrafter(model, d, engine.tp_rank, s["slots"], s["head"], s["markov"], s["moe"], free_bf16_head=s["free_bf16_head"],
+                       stream=s["stream"])
         torch.cuda.synchronize()
         D.load_info = {"checkpoint_params": len(info["snap"]["params"]), "derived": len(info["derived"] or {}),
                        "weights_GiB": round(loaded / 2**30, 3),

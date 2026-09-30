@@ -222,21 +222,21 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
       <div class="node">
         <div class="nt">RTX box</div>
         <div class="hw">2× RTX PRO 6000 Blackwell</div>
-        <ul><li>Embeddings, Engram, layers 0–19</li><li>Layer-20 KV rows, vision tower</li></ul>
-        <ul class="do"><li>Prefill the whole prompt</li><li>1–5 verify rows a step, ~7&nbsp;ms</li></ul>
+        <ul><li>Embeddings, Engram, layers 0–19</li><li>DSpark drafter, vision tower</li></ul>
+        <ul class="do"><li>Prefill the whole prompt</li><li>Draft 4 tokens + run 1–5 rows, ~8.5&nbsp;ms</li></ul>
       </div>
       <div class="wire">
-        <span class="lk">prompt state, step rows</span>
+        <span class="lk">prompt state, drafts + step rows</span>
         <svg viewBox="0 0 100 10" aria-hidden="true"><path d="M2 5 H92"/><path class="hd" d="M90 1 L98 5 L90 9 z"/></svg>
         <span class="cable">10GbE</span>
         <svg viewBox="0 0 100 10" aria-hidden="true"><path d="M8 5 H98"/><path class="hd" d="M10 1 L2 5 L10 9 z"/></svg>
-        <span class="lk">draft tokens</span>
+        <span class="lk">verified tokens, taps</span>
       </div>
       <div class="node">
         <div class="nt">Mac Studio</div>
         <div class="hw">M5 Ultra, 256&nbsp;GB</div>
-        <ul><li>Layers 20–39, output head</li><li>DSpark drafter, up to 4 tokens</li></ul>
-        <ul class="do"><li>Accept, stream, draft the next rows</li><li>Prefix cache for resumed turns</li></ul>
+        <ul><li>Layers 20–39, output head</li><li>Verifies every token</li></ul>
+        <ul class="do"><li>Verify, accept, stream</li><li>Prefix cache for resumed turns</li></ul>
       </div>
     </div>
   </section>
@@ -292,10 +292,11 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
     <ul class="how">
       <li><b>Prefill.</b> The box runs layers 0–20 over the whole prompt in 8K chunks and streams the state to the Mac as it
       goes. The GPUs overlap their all-reduce with compute and split the indexer's rows (1M: 59.5 → 53.9&nbsp;s).</li>
-      <li><b>Decode.</b> The Mac replays the tail through layers 20–39. Each step is one round trip: draft tokens out,
-      41&nbsp;KB of hidden state per row back.</li>
-      <li><b>Concurrency.</b> Two requests pipeline across the machines. From three up, the Mac verifies and drafts fused
-      pairs, reading the weights once per pair.</li>
+      <li><b>Decode.</b> The Mac replays the tail through layers 20–39. Each step is one round trip: the Mac sends the
+      verified tokens, and the box accepts, drafts the next 4 (DSpark, ~1.3&nbsp;ms) and runs layers 0–19 for them. The Mac
+      verifies every token, so the text is exactly what it would draft itself.</li>
+      <li><b>Concurrency.</b> Two requests pipeline across the machines. From three up, the Mac verifies fused pairs,
+      reading the weights once per pair. Drafting on the box frees the Mac: +19% at 2 and 4 requests, +7% at one.</li>
       <li><b>Fairness.</b> Decode steps and short prompts preempt a long prefill between layers: a decoder keeps ~19
       steps/s during a 128K prefill, and an 8K prompt queued behind it waits 0.5&nbsp;s.</li>
       <li><b>Exact.</b> A box step is bit-identical to prefilling the same rows, so a restart mid-answer continues with the
@@ -308,7 +309,7 @@ html = f"""<title>DeepSeek-V4.1-Flash, Mac + RTX</title>
     load. Prefill at 8K–128K is the mean of three fresh prompts, longer points single runs that repeat within 1%. Decode
     samples swing about ±15% with speculative acceptance.</p>
     <p>The 3-bit baseline is the previous production build (Mac only, LSQ 3-bit experts), measured earlier with a similar
-    harness; ratios are indicative, not a controlled A/B. Box engine {S["deployment"]["box_engine"]}, numerics {S["deployment"]["numerics"]}; Mac build 0c1ac7c6.</p>
+    harness; ratios are indicative, not a controlled A/B. Box engine {S["deployment"]["box_engine"]}, numerics {S["deployment"]["numerics"]}; Mac build a3d73c53.</p>
     <p>Hardware: Mac Studio M5 Ultra, 80-core GPU, 256&nbsp;GB · 2× NVIDIA RTX PRO 6000 Blackwell, 96&nbsp;GB each ·
     direct 10GbE. Model: <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash">deepseek-ai/DeepSeek-V4.1-Flash</a>, original weights.</p>
   </footer>

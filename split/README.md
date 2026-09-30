@@ -20,10 +20,10 @@ So the model splits along a seam that already exists:
 
 ```
  ┌─────────────── RTX box (2x RTX PRO 6000, TP2) ───────────────┐   10GbE    ┌──────────── Mac Studio M5 Ultra ────────────┐
- │ embeddings · Engram (layers 1, 14) · layers 0-19             │ ─────────▶ │ layers 20-39 · head · DSpark drafter        │
- │ + layer-20 KV/index rows · vision tower                      │ ◀───────── │ verify · accept · draft · stream to client  │
+ │ embeddings · Engram (layers 1, 14) · layers 0-19             │ ─────────▶ │ layers 20-39 · head (verify)                │
+ │ + layer-20 KV/index rows · vision tower                      │ ◀───────── │ verify · accept · stream to client          │
  │ PREFILL: whole prompt → state streamed to the Mac            │  state     │ tail replay after prefill                    │
- │ DECODE: 1-5 verify rows per step → h19 + L20 rows (41 KB/row)│  per step  │                                              │
+ │ DECODE: DSpark draft + 1-5 rows/step → h19 + L20 (41 KB/row) │  per step  │                                              │
  └──────────────────────────────────────────────────────────────┘            └──────────────────────────────────────────────┘
 ```
 
@@ -38,8 +38,10 @@ room for 3M tokens of KV on the box and 1M-context requests on the Mac.
    DS-V4.1 vision tower on the box and are injected at the image-token positions. The state streams to the Mac in 8K
    chunks while prefill continues.
 3. **Tail replay (Mac).** Layers 20-39 run over the last ≤256 prompt rows to fill the decoder windows and prime DSpark.
-4. **Decode (both).** Each step: the Mac drafts up to 4 tokens (DSpark, verify-cost-aware depth), the box runs layers
-   0-19 for the verify rows (6-7 ms), the Mac runs layers 20-39 + head, accepts, and drafts the next rows.
+4. **Decode (both).** Each step: the Mac verifies (layers 20-39 + head) and sends the argmax ids plus the layer 37-39
+   taps of the committed rows; the box accepts, drafts up to 4 tokens (DSpark on the box, ~1.3 ms, FP8 head) and runs
+   layers 0-19 for the next verify rows, all in one job (~8.5 ms). Short contexts (<1K), sampling, copy and tool-bank
+   cycles keep the Mac drafter. The Mac verifies every token, so outputs are byte-identical either way.
    Two requests pipeline: the box works on one while the Mac works on the other. Three or four run as fused pairs:
    the Mac verifies and drafts a pair in one pass (weights read once, bit-identical per request) while the box
    runs the other pair's steps.

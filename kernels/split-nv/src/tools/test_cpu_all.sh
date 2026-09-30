@@ -18,7 +18,7 @@ run() {  # name, command...
   if "$@" >"$f" 2>&1; then echo "PASS $name ($(tail -1 "$f" | cut -c1-100))"
   else echo "FAIL $name (log $f)"; tail -5 "$f" | sed 's/^/    /'; fails=$((fails + 1)); fi
 }
-for t in test_dspark_markov test_dspark_stepd test_front_robust test_fast_restart test_rank_failstop test_imagekeys \
+for t in test_dspark_markov test_dspark_stepd test_dspark_stream test_w11_fairness test_front_robust test_fast_restart test_rank_failstop test_imagekeys \
          test_topk_det_cpu; do
   run "$t" "$PY" "tools/$t.py"
 done

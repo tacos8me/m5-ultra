@@ -83,7 +83,7 @@ Each directory keeps its upstream license.
 
 Results: [tacos8me.github.io/m5-ultra/split](https://tacos8me.github.io/m5-ultra/split/) · design notes: [`../split/README.md`](../split/README.md).
 
-- `omlx/deepseek-v41-split.patch` (applies on top of `deepseek-v41.patch`, `ef88391e..0c1ac7c6`, commit list in
+- `omlx/deepseek-v41-split.patch` (applies on top of `deepseek-v41.patch`, `ef88391e..a3d73c53`, commit list in
   `omlx/COMMITS-split.txt`): the Mac half. Original-precision layers 20-39 + head + DSpark, the pipeline decode loop,
   prefix reuse, image input, verify-cost-aware draft depth, extra draft sources, and the `og_serve/` supervisor
   (OpenAI-compatible server, failover that never swaps models, parity/soak/bench harnesses). Since f56f7ffa, all
@@ -93,7 +93,8 @@ Results: [tacos8me.github.io/m5-ultra/split](https://tacos8me.github.io/m5-ultra
   fused FFN and attention-input kernels, recalibrated draft-depth tables, a faster, resumable tail replay,
   chained box opens for queued requests, and failure handling (bounded rebuilds, context clamp, cancellable opens,
   worker restart; fault-injection soak og_serve/fault_soak.py), an MXFP8 draft head through the M-invariant rows kernel
-  (DS41_DRAFT_HEAD=mxfp8), and a supervisor that forwards only the OpenAI/Anthropic inference paths to the oMLX child. `src/` holds the
+  (DS41_DRAFT_HEAD=mxfp8), and a supervisor that forwards only the OpenAI/Anthropic inference paths to the oMLX child, and the STEPD client (og_model/stepd.py)
+  that hands drafting to the RTX box (DS41_OG_BOX_DRAFT=1) while the Mac verifies every token. `src/` holds the
   changed files.
 - `split-nv/`: the RTX half.
   - `Dockerfile` + `sglang-dsv41-split.patch` + `flashinfer-sparse-mla-sm120.patch`: the engine image from public

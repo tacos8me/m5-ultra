@@ -82,10 +82,12 @@ def load(name):
 
 load('fe_trace')
 load('fast_encode')
+load('dspark_wire')
 wire = load('pipe_wire')
 failover = load('og_failover')
 load('og_images')
 load('spec_probe')
+load('stepd')
 stub('ogtest.woa_compact', install=lambda *a, **k: None)
 og = load('og_model')
 

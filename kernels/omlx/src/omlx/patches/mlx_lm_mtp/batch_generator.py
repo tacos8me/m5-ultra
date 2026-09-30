@@ -2391,6 +2391,10 @@ def _dspark_prepare(
     host = _dspark_host(gen_batch.model)
     if host is None:
         raise _MtpStepFallback("embedded DSpark host is unavailable")
+    box = getattr(host, "mtp_box_prepare", None)
+    if box is not None and box(gen_batch, state, hidden_rows, committed):
+        # ds41-og box drafting: the host sent this block's STEPD (drafts arrive via _resolve_box_drafts).
+        return None
 
     depth = state.controller.cur if state.controller is not None else state.depth
     depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
@@ -2447,6 +2451,24 @@ def _dspark_prepare(
     )
     width = state.controller.max_depth if cost_policy else depth
     return host, width, committed[-1:].reshape(1, 1), cost_policy
+
+
+def _box_pending(state: Any) -> bool:
+    """A block the host is drafting remotely (ds41-og box drafting): its drafts arrive before its verify."""
+    return getattr(state, "box_pending", None) is not None
+
+
+def _verify_rows(state: Any) -> int:
+    """Rows of a state's next verify; a remotely drafted block counts as the widest (1 + dspark block width 4)."""
+    if state.drafts is None and _box_pending(state):
+        return 5
+    return 1 + int(state.drafts.shape[0])
+
+
+def _resolve_box_drafts(gen_batch: Any, state: Any) -> None:
+    """Fetch a remotely drafted block (or let the host draft it locally) before anything reads state.drafts."""
+    if _box_pending(state):
+        _dspark_host(gen_batch.model).mtp_box_resolve(gen_batch, state)
 
 
 def _dspark_head_kwargs(host: Any, cost_policy: Any) -> dict:
@@ -3023,7 +3045,10 @@ def _run_verify_cycle_batched(gen_batch: Any, batch_state: _MtpBatchState) -> An
     if policy is not None and policy.uids != tuple(gen_batch.uids):
         policy = None
     saved = [(state.controller, state.depth) for state in states]
-    depths = [int(state.drafts.shape[0]) if state.chain else 1 for state in states]
+    depths = [
+        (int(state.drafts.shape[0]) if state.drafts is not None else 0) if state.chain else 1
+        for state in states
+    ]
     previous = [(state.stats.cycles, state.stats.accepts) for state in states]
     requested = policy.cur if policy is not None else None
     if policy is not None:
@@ -3498,6 +3523,8 @@ def _run_verify_cycle_chain(
 
     import mlx.core as mx
 
+    if verify_result is None:
+        _resolve_box_drafts(gen_batch, state)
     if state.next_main is None or state.drafts is None:
         raise _MtpStepFallback("chain cycle entered without next_main / drafts")
 
@@ -3514,6 +3541,7 @@ def _run_verify_cycle_chain(
     # Token buffer per input position (mirrors PR 990 _step_backbone). Row j's
     # processor prefix is everything before that input position.
     prev_rows: List[Optional[Any]] = [None] * (k + 1)
+    verify_targets = None  # greedy argmax of every verified row (ds41-og box drafting sends them with the accept)
     if procs is not None:
         buf = gen_batch._token_context[0]
         prev_rows[0] = buf.update_and_fetch(state.next_main)
@@ -3570,6 +3598,7 @@ def _run_verify_cycle_chain(
         m = int(host[0])
         target_ids = host[1 : k + 2]
         draft_ids = host[k + 2 :]
+        verify_targets = target_ids
         state.stats.backbone_ms += (time.perf_counter() - t0) * 1000
         t0 = time.perf_counter()
         emit_last_id = target_ids[m] if m < k else target_ids[k]
@@ -3721,6 +3750,9 @@ def _run_verify_cycle_chain(
         prev_buf = None
         if procs is not None:
             prev_buf = gen_batch._token_context[0].tokens
+        state.last_verify = (
+            (m, verify_targets, draft_ids, state.next_main) if verify_targets is not None else None
+        )
         if draft_jobs is None:
             _chain_next_drafts(gen_batch, state, hidden_rows, committed, prev_buf)
         else:

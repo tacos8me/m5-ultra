@@ -582,12 +582,21 @@ class Engine:
         info = {"drafted": False, "toks": [], "probs": [], "drafter_ms": 0.0}
         if draft:
             D.launch_draft(slot, keep, anchor, app_base, n_app, taps, W)
-            # host bookkeeping of the step while the drafter graph runs (run() then finds it done)
-            self.steps.prepare(sess, keep, keep + self.steps.pick(1 + dmax).W)
+            t1 = time.perf_counter()
+            try:
+                # host bookkeeping of the step while the drafter graph runs (run() then finds it done); with the
+                # drafter on its side stream, prepare's synchronizing copies do not wait for the drafter
+                self.steps.prepare(sess, keep, keep + self.steps.pick(1 + dmax).W)
+            except BaseException:
+                D.drain()  # never leave the drafter graph running under a later step graph (shared graph pool)
+                raise
+            t2 = time.perf_counter()
             toks, probs = D.collect(W)
+            t3 = time.perf_counter()
             depth = min(WIRE.choose_cost_depth(probs, costs), dmax)
             ids = [anchor] + toks[:depth]
-            info.update(drafted=True, toks=toks, probs=probs, drafter_ms=(time.perf_counter() - t0) * 1e3)
+            info.update(drafted=True, toks=toks, probs=probs, drafter_ms=(t3 - t0) * 1e3,
+                        split_ms=(round((t1 - t0) * 1e3, 3), round((t2 - t1) * 1e3, 3), round((t3 - t2) * 1e3, 3)))
         else:
             if n_app:
                 D.run_append(slot, app_base, n_app, taps)
