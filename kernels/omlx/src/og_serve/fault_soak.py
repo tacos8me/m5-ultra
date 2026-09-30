@@ -12,7 +12,9 @@ tool-call and non-streaming requests) and injects, in order:
   A      0-3     none: reference run of every fixed prompt     texts recorded (temperature 0)
   B      3-5     client cancel mid-prefill (512K, at 5 s);     box sessions back to baseline <= 10 s after the cancel;
                  streaming + non-streaming disconnect mid-      Mac og/stats open_cancelled +1 (robust branch), opened ==
-                 decode                                         closed; supervisor inflight 0, client_gone +1 (robust)
+                 decode (non-streaming hangs up at 2 s, before  closed; supervisor inflight 0, client_gone +1 (robust;
+                 its ~400-token answer can finish)              counts only NON-streaming disconnects -- a streaming
+                                                                disconnect cancels the splice generator, not counted)
   C      5-10    box engine crash (POST /admin/crash) with 4   all 4 streams finish, text == phase A reference
                  streams mid-decode                             (bit-identical continuation), within 240 s of the crash;
                                                                 og/stats recoveries +4, box_lost 0, broken 0
@@ -237,18 +239,29 @@ def phase_b(base):
     time.sleep(3)
     s.cancel()
     s.wait(10)
-    # non-streaming client that hangs up after 5 s
+    # Non-streaming client that hangs up mid-decode. At 5 s it raced the answer: the 8K "five bullet points" reply is
+    # ~400 tokens and finished in ~4.7 s (soak-20260929T1353: 395 tokens, finish=stop), so nothing was cancelled and
+    # client_gone stayed 0. At 2 s (0.6 s to first step at 8K) it is ~130 tokens in.
+    gone0 = get(SUP + '/health').get('client_gone')
     body = json.dumps(dict(model=MODEL, max_tokens=2000, temperature=0,
                            messages=[{'role': 'user', 'content': prompt_text(8000, random.random())}])).encode()
     c = socket.create_connection(('127.0.0.1', 8080))
     c.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n'
               + f'Content-Length: {len(body)}\r\n\r\n'.encode() + body)
-    time.sleep(5)
+    c.settimeout(2)
+    try:
+        answered_first = bool(c.recv(1))  # any byte = the reply arrived before the hang-up (test invalid)
+    except (TimeoutError, socket.timeout):
+        answered_first = False
     c.close()
     ok &= wait_box_sessions(base['box'].get('sessions', 0), 20)
+    time.sleep(1.5)  # the supervisor polls is_disconnected() once a second
     sup = get(SUP + '/health')
-    note('B after', sup_inflight=sup.get('inflight'), client_gone=sup.get('client_gone'))
-    return ok and sup.get('inflight') == 0
+    gone = sup.get('client_gone')
+    note('B after', sup_inflight=sup.get('inflight'), client_gone=gone, client_gone_before=gone0,
+         answered_before_hangup=answered_first)
+    robust_ok = gone0 is None or (gone is not None and gone - gone0 == 1)  # counter exists only on the robust branch
+    return ok and sup.get('inflight') == 0 and not answered_first and robust_ok
 
 
 def phase_restart(ref, kind):

@@ -1,7 +1,7 @@
 """CPU-only test of split_nv.engram_keep against the real SGLang _HostTable (no GPU: cudaHostRegister is stubbed).
 
 Runs inside a GPU-less container from the production image, in a PRIVATE IPC namespace so no host segment is seen:
-  docker run --rm --network none --ipc=private --entrypoint python3 -e CUDA_VISIBLE_DEVICES= \\
+  docker run --rm --ulimit core=0 --network none --ipc=private --entrypoint python3 -e CUDA_VISIBLE_DEVICES= \\
     -e PYTHONPATH=/home/ian/split-nv/hooks -v <this tree>:/home/ian/split-nv:ro sglang-dsv41-split:6152b54 \\
     /home/ian/split-nv/tools/test_engram_keep.py
 Two TP ranks are threads sharing a barrier and a broadcast slot, like the gloo CPU group.

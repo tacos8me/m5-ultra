@@ -28,6 +28,7 @@ import numpy as np
 import torch
 
 WINDOW = 128
+MAX_ERRORS_KEPT = 8
 GRID = 8192
 GATHER_PAGES = 512
 
@@ -56,6 +57,22 @@ def _load(path):
     return load_file(path)
 
 
+def whole_file(path):
+    """Size of `path` if it is a whole safetensors file (8-byte header length, JSON header, exactly the data bytes the
+    header describes), else None: missing, truncated or not safetensors. Reads only the header."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as f:
+            n = int.from_bytes(f.read(8), "little")
+            if n <= 0 or 8 + n > size or n > 64 << 20:
+                return None
+            header = json.loads(f.read(n))
+        end = max((v["data_offsets"][1] for k, v in header.items() if k != "__metadata__"), default=0)
+        return size if size == 8 + n + end else None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+
+
 # --------------------------------------------------------------------------------------------- engine side (each rank)
 class RankStore:
     """Per-rank snapshot files; writes go through one background thread so the GPU loop only pays the D2H copy."""
@@ -66,7 +83,8 @@ class RankStore:
         self.root = cache_root(numerics)
         os.makedirs(self.root, exist_ok=True)
         self.q = queue.Queue()
-        self.errors = []
+        self.n_errors = 0  # failed writes since start (reported to rank 0 at every barrier, /health rank_errors)
+        self.errors = []  # the last MAX_ERRORS_KEPT of them
         threading.Thread(target=self._writer, daemon=True).start()
 
     def path(self, name):
@@ -78,7 +96,10 @@ class RankStore:
             try:
                 _atomic_save(*item)
             except Exception as e:  # noqa: BLE001
-                self.errors.append(repr(e))
+                # never raised: the entry's files are checked on rank 0 before it is registered (PrefixIndex.incomplete)
+                self.n_errors += 1
+                self.errors = (self.errors + [f"{item[1]}: {e!r}"])[-MAX_ERRORS_KEPT:]
+                print(f"[engine] rank {self.rank}: snapshot write {item[1]} failed: {e!r}", flush=True)
             finally:
                 self.q.task_done()
 
@@ -266,7 +287,8 @@ class PrefixIndex:
         self.block_refs = {}
         self.block_bytes = {}
         self.lock = threading.Lock()
-        self.stats = dict(lookups=0, hits=0, resumed_tokens=0, saved=0, evicted=0, loaded=0, dropped_at_load=0)
+        self.stats = dict(lookups=0, hits=0, resumed_tokens=0, saved=0, evicted=0, loaded=0, dropped_at_load=0,
+                          skipped_incomplete=0)
         self.seq = int(time.time() * 1000)
         self._load()
 
@@ -353,6 +375,26 @@ class PrefixIndex:
         arr = np.asarray(ids_prefix, dtype=np.uint64)
         with self.lock:
             return any(e.P == P and (e.capture or not capture) and np.array_equal(e.tokens, arr) for e in self.entries.values())
+
+    def incomplete(self, key, blocks, capture):
+        """Rank 0, after the barrier and before add(): the files of entry `key` and of its blocks not registered yet
+        that are missing, not whole safetensors files, or whose per-rank sizes differ where they must be equal (block
+        pages and grid entries are the same tensors on every rank; a prompt-end entry's rank-0 file adds the capture
+        state). Empty when the entry can be registered."""
+        ent = [self.p(f"ent-{key}.r{r}") for r in range(self.ranks)]
+        groups = [(ent, not capture), ([self.p(f"rows-tail-{key}")], False)]
+        with self.lock:
+            new = [b for b in dict.fromkeys(blocks) if b not in self.block_refs]
+        for b in new:
+            fs = self.block_files(b)
+            groups += [(fs[:self.ranks], True), (fs[self.ranks:], False)]
+        bad = []
+        for files, same in groups:
+            sizes = [whole_file(f) for f in files]
+            bad += [f for f, n in zip(files, sizes) if n is None]
+            if same and None not in sizes and len(set(sizes)) > 1:
+                bad += [f"{f} ({n} B)" for f, n in zip(files, sizes)]
+        return bad
 
     def add(self, key, ids, blocks, capture):
         """Register an entry whose files (and its blocks' files) are written."""

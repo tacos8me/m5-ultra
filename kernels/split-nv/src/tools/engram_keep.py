@@ -2,7 +2,7 @@
 
 The segments belong to root (created inside the engine container) and live in the host IPC namespace, so run this
 as root there, e.g. from the engine image:
-  docker run --rm --ipc=host --network none --entrypoint python3 -e PYTHONPATH=/home/ian/split-nv/hooks \\
+  docker run --rm --ulimit core=0 --ipc=host --network none --entrypoint python3 -e PYTHONPATH=/home/ian/split-nv/hooks \\
     -v /home/ian/split-nv-deploy:/home/ian/split-nv:ro -v /home/ian/models/dsv41-engram:/engram:ro \\
     sglang-dsv41-split:6152b54 /home/ian/split-nv/tools/engram_keep.py status|verify|drop [--force]
 (`ipcs -m` as any user lists them too: keys 0x53444b01 and 0x53444b0e, ~94.4 GiB each.)

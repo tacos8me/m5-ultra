@@ -161,7 +161,7 @@ class PipelineRequest:
         cost = self.controller.cost_policy and self.mtp_cache[0].offset >= 1024
         width = self.controller.max_depth if cost else self.controller.cur
         logits,_ = self.model.dspark_forward(hidden,mx.array([[committed[-1]]],mx.uint32),
-                                             self.mtp_cache,draft_length=width)
+                                             self.mtp_cache,draft_length=width,cost_policy=cost)
         previous = mx.array([committed[-1]],mx.uint32)
         tokens, probs = [], []
         for i in range(width):

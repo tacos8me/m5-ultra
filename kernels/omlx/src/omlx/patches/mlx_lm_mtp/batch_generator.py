@@ -2449,6 +2449,13 @@ def _dspark_prepare(
     return host, width, committed[-1:].reshape(1, 1), cost_policy
 
 
+def _dspark_head_kwargs(host: Any, cost_policy: Any) -> dict:
+    """``cost_policy`` for hosts whose draft head depends on it (V4.1 DS41_DRAFT_HEAD); others keep their signature."""
+    if getattr(host, "_omlx_dspark_cost_head", False):
+        return {"cost_policy": cost_policy}
+    return {}
+
+
 def _dspark_finish(
     gen_batch: Any,
     state: _MtpState,
@@ -2529,12 +2536,13 @@ def _dspark_next_drafts(
     plan = _dspark_prepare(gen_batch, state, hidden_rows, committed)
     if plan is None:
         return
-    host, width, anchor, _ = plan
+    host, width, anchor, cost_policy = plan
     logits, _ = host.dspark_forward(
         hidden_rows,
         anchor,
         state.mtp_cache,
         draft_length=width,
+        **_dspark_head_kwargs(host, bool(cost_policy)),
     )
     state.hist_offset += int(committed.shape[0])
     _dspark_finish(gen_batch, state, plan, logits, prev_buf)
@@ -2576,6 +2584,7 @@ def dspark_draft_jobs(jobs: List[tuple], depths: List[Optional[int]]) -> bool:
             [plans[i][2] for i in forward],
             [jobs[i][1].mtp_cache for i in forward],
             [plans[i][1] for i in forward],
+            **_dspark_head_kwargs(host, [bool(plans[i][3]) for i in forward]),
         )
         if len(forward) > 1 and batch is not None
         else None
@@ -2584,7 +2593,8 @@ def dspark_draft_jobs(jobs: List[tuple], depths: List[Optional[int]]) -> bool:
     if logits is None:
         logits = [
             host.dspark_forward(
-                jobs[i][2], plans[i][2], jobs[i][1].mtp_cache, draft_length=plans[i][1]
+                jobs[i][2], plans[i][2], jobs[i][1].mtp_cache, draft_length=plans[i][1],
+                **_dspark_head_kwargs(host, bool(plans[i][3])),
             )[0]
             for i in forward
         ]

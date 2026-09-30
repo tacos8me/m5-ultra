@@ -22,6 +22,7 @@ Branch `ds41-probe`: code 8476793c plus this note, on `ds41-woa` 1bc1271a (lossl
   - `note_recv` records the box wait of hit steps.
 - **`close_request`: one `ds41-og spec-probe <request_id>: ...` line per request.**
 - **Flag `DS41_OG_SPEC_PROBE`:** default `1` on this branch. `0` disables every call and leaves the ds41-woa behaviour.
+  **Retired in ds41-next4:** default `0` (NO-GO: 0.55% hits on live traffic against the 15% bar); `1` re-enables it.
 - **Test fix:** `og_serve/test_import_fallback.py` now loads `spec_probe` and stubs `woa_compact`. It already failed on ds41-woa because `woa_compact` was missing from its stub package.
 
 ## What it counts

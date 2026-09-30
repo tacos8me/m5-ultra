@@ -6,7 +6,10 @@ never enter that ring. Server acceptance/rollback is a separate integration.
 """
 
 from dataclasses import replace
+import json
 import os
+import time
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -19,23 +22,104 @@ from .quantization import quantize_activation
 
 
 DRAFT_ASYNC = os.environ.get("DS41_DRAFT_ASYNC", "1") == "1"
-# Opt-in: draft logits from an MXFP8 copy of the BF16 vocabulary head (half
-# the bytes). Drafts only steer speculation; verified tokens never change.
+# DS41_DRAFT_HEAD=mxfp8 (opt-in; default bf16, any other value = bf16): draft
+# logits of cost-policy blocks (the caller's hist_offset >= 1024) come from an
+# MXFP8 copy of the BF16 vocabulary head (half the bytes), quantized once at
+# load (install_draft_head), through og_fused's fast_qmv rows kernel in both
+# proposal_forward and proposal_forward_batch. That kernel's per-row arithmetic
+# does not depend on the row count, so a request's drafts are bitwise the same
+# alone or batched. Blocks below 1024 tokens keep the BF16 head: there the draft
+# pattern reaches T=0 text (acceptance-only depth, width-dependent index layout).
+# Drafts only steer speculation; verified tokens never change.
 DRAFT_HEAD = os.environ.get("DS41_DRAFT_HEAD", "bf16")
+_MAX_BATCH_ROWS = 8  # the short-row mHC / MoE / combine paths a width<=4 block already takes
+STATS = {}  # draft_head_* counters; og_model.load binds them into og_model.STATS (/og/stats)
 
 
-def draft_logits(model, x):
-    if DRAFT_HEAD != "mxfp8" or x.ndim != 3 or not 1 <= x.shape[1] <= 8:
-        return project_logits(x, model.head)
+def bind(stats):
+    global STATS
+    STATS = stats
+    for key in ("draft_head_mxfp8", "draft_head_mxfp8_rows", "draft_head_bf16_rows"):
+        stats.setdefault(key, 0)
+
+
+def _count(kind, rows):
+    key = f"draft_head_{kind}_rows"
+    STATS[key] = STATS.get(key, 0) + rows
+
+
+def _head_ok(model):
+    head = model.head
+    w = getattr(head, "weight", None)
+    return (
+        w is not None
+        and not hasattr(head, "bits")
+        and w.dtype == mx.bfloat16
+        and w.ndim == 2
+        and w.shape[1] % 32 == 0
+        and w.shape[1] not in (64, 128)
+    )
+
+
+def use_mxfp8(model, cost_policy):
+    """Whether the MXFP8 head serves a block (one answer for single and batched drafting)."""
+    return (
+        DRAFT_HEAD == "mxfp8"
+        and bool(cost_policy)
+        and mx.default_device() == mx.gpu
+        and _head_ok(model)
+    )
+
+
+def _draft_head(model):
+    """The MXFP8 copy of model.head (weight, scales); built once, normally at load."""
     cached = model.__dict__.get("_ds41_draft_head")
-    if cached is None or cached[0] is not model.head.weight:
+    if cached is None or cached.source is not model.head.weight:
         w, scales = mx.quantize(model.head.weight, group_size=32, bits=8, mode="mxfp8")
         mx.eval(w, scales)
-        cached = model.__dict__["_ds41_draft_head"] = (model.head.weight, w, scales)
-    _, w, scales = cached
-    return mx.quantized_matmul(
-        x, w, scales, transpose=True, group_size=32, bits=8, mode="mxfp8"
-    ).astype(mx.float32)
+        cached = model.__dict__["_ds41_draft_head"] = SimpleNamespace(
+            weight=w, scales=scales, source=model.head.weight
+        )
+    return cached
+
+
+def install_draft_head(model):
+    """og_model.load: quantize the MXFP8 draft head at load, not inside the first draft."""
+    if DRAFT_HEAD != "mxfp8":
+        return None
+    if mx.default_device() != mx.gpu or not _head_ok(model):
+        summary = dict(event="draft_head", mode="bf16", reason="head or device unsupported")
+    else:
+        begin = time.perf_counter()
+        head = _draft_head(model)
+        STATS["draft_head_mxfp8"] = 1
+        summary = dict(
+            event="draft_head",
+            mode="mxfp8",
+            shape=list(model.head.weight.shape),
+            gib=round((head.weight.nbytes + head.scales.nbytes) / 2**30, 3),
+            seconds=round(time.perf_counter() - begin, 3),
+        )
+    print(json.dumps(summary), flush=True)
+    return summary
+
+
+def _mxfp8_logits(model, x):
+    """og_fused._rows (fast_qmv rows kernel) on the MXFP8 head: FP32 logits, M-invariant."""
+    from . import og_fused
+
+    batch, width, dim = x.shape
+    rows = x.reshape(1, batch * width, dim).astype(mx.bfloat16)
+    return og_fused._rows(_draft_head(model), rows).reshape(batch, width, -1).astype(mx.float32)
+
+
+def draft_logits(model, x, cost_policy=False):
+    rows = x.size // x.shape[-1]
+    if x.ndim == 3 and rows <= _MAX_BATCH_ROWS and use_mxfp8(model, cost_policy):
+        _count("mxfp8", rows)
+        return _mxfp8_logits(model, x)
+    _count("bf16", rows)
+    return project_logits(x, model.head)
 
 
 class DSparkAttention(Attention):
@@ -219,8 +303,12 @@ def forward_spec(model, input_ids, main_hidden, cache, *, temperature=0.0):
     )
 
 
-def proposal_forward(model, input_ids, cache, draft_length=None):
-    """Compute parallel draft logits; the shared loop applies Markov biases."""
+def proposal_forward(model, input_ids, cache, draft_length=None, cost_policy=False):
+    """Compute parallel draft logits; the shared loop applies Markov biases.
+
+    cost_policy: the caller drafts this block on the cost-policy path (hist_offset >= 1024),
+    where DS41_DRAFT_HEAD=mxfp8 may serve the head (draft_logits).
+    """
     c = model._config
     width = max(1, min(draft_length or c.dspark_block_size, c.dspark_block_size))
     input_ids = input_ids.reshape(input_ids.shape[0], -1)[:, -1:]
@@ -244,14 +332,13 @@ def proposal_forward(model, input_ids, cache, draft_length=None):
             mx.async_eval(h, pre)
     final = model.mtp[-1]
     h = hc_pre(h, pre)
-    logits = draft_logits(model, final.norm(h))
+    logits = draft_logits(model, final.norm(h), cost_policy)
     return logits, h
 
 
 # Batched drafting for og_fused pairs: one DSpark decoder pass over several requests' blocks
 # (DS41_OG_DRAFT_BATCH=0 = one pass per request). Every request gets its own pass's bits.
 DRAFT_BATCH = os.environ.get("DS41_OG_DRAFT_BATCH", "1") == "1"
-_MAX_BATCH_ROWS = 8  # the short-row mHC / MoE / combine paths a width<=4 block already takes
 
 
 def _stages_ok(model):
@@ -275,10 +362,9 @@ def _stages_ok(model):
 
 
 def batch_supported(model, widths):
-    """Several blocks of one width 2..4 (<= 8 rows), BF16 draft head, the og_fused kernels on."""
+    """Several blocks of one width 2..4 (<= 8 rows), the og_fused kernels on (either draft head)."""
     return (
         DRAFT_BATCH
-        and DRAFT_HEAD != "mxfp8"
         and len(widths) > 1
         and len(set(widths)) == 1
         and 2 <= widths[0]
@@ -340,8 +426,14 @@ def _stage_batch(stage, hs, pres, bounds, caches):
     return hs, [fp for fp, _, _ in ffn]
 
 
-def proposal_forward_batch(model, anchors, caches, width):
-    """proposal_forward for several requests of one width; returns each request's draft logits."""
+def proposal_forward_batch(model, anchors, caches, width, cost_policy=None):
+    """proposal_forward for several requests of one width; returns each request's draft logits.
+
+    cost_policy: per request, as proposal_forward's (see batch_logits).
+    """
+    cost_policy = [False] * len(anchors) if cost_policy is None else list(cost_policy)
+    if len(cost_policy) != len(anchors):
+        raise ValueError("cost_policy needs one entry per request")
     c = model._config
     hs, pres, bounds = [], [], []
     for k, anchor in enumerate(anchors):
@@ -361,7 +453,26 @@ def proposal_forward_batch(model, anchors, caches, width):
         if DRAFT_ASYNC and index + 1 < len(model.mtp):
             mx.async_eval(hs, pres)
     final = model.mtp[-1]
+    return batch_logits(model, [final.norm(hc_pre(h, pre)) for h, pre in zip(hs, pres)], width, cost_policy)
+
+
+def batch_logits(model, xs, width, cost_policy):
+    """proposal_forward_batch's head: each request's (1, width, dim) normed rows -> its draft logits.
+
+    The MXFP8 and BF16 heads each run once over their requests' rows (request order kept);
+    both head kernels are M-invariant, so every request gets draft_logits' bits.
+    """
     from .og_fused import _head_rows
-    logits = _head_rows(model.head.weight, mx.concatenate(
-        [final.norm(hc_pre(h, pre)) for h, pre in zip(hs, pres)], 1))
-    return [logits[:, b:e] for b, e in bounds]
+
+    quantized = [use_mxfp8(model, policy) for policy in cost_policy]
+    out = [None] * len(xs)
+    for mxfp8 in (False, True):
+        group = [k for k, q in enumerate(quantized) if q == mxfp8]
+        if not group:
+            continue
+        x = mx.concatenate([xs[k] for k in group], 1)
+        _count("mxfp8" if mxfp8 else "bf16", x.shape[1])
+        logits = _mxfp8_logits(model, x) if mxfp8 else _head_rows(model.head.weight, x)
+        for j, k in enumerate(group):
+            out[k] = logits[:, j * width:(j + 1) * width]
+    return out

@@ -8,7 +8,10 @@ continues (CopyIndex.speculate). When the real next STEP is sent (og_model.prese
 
 Host work per cycle: a tuple compare before the send and one CopyIndex.speculate (one 5-token append
 + propose on a <=17 x 64 window) after it, i.e. while the box computes. No MLX sync, no box traffic.
-DS41_OG_SPEC_PROBE=0 disables every call.
+
+Retired (default off since ds41-next4): the go/no-go was hits/c1_cycles >= 15%; live traffic gave 0.55%
+(THREADS-2026-09-30 6c). DS41_OG_SPEC_PROBE=1 re-enables it; off, og_model makes no probe call and
+/og/stats shows spec_probe_enabled 0 with the counters at 0.
 """
 
 import logging
@@ -16,7 +19,7 @@ import os
 import time
 
 logger = logging.getLogger(__name__)
-ENABLED = os.environ.get('DS41_OG_SPEC_PROBE', '1') == '1'
+ENABLED = os.environ.get('DS41_OG_SPEC_PROBE', '0') == '1'
 MAX_ROWS = 5
 REASONS = ('partial', 'ended', 'dspark', 'copy_diff', 'concurrency', 'other')
 COUNTS = ('c1_cycles', 'copy_cycles', 'would', 'hits', 'no_pred', 'unresolved', 'errors') + tuple(

@@ -103,3 +103,27 @@ sglang (757e8f3..a618602):
 fca050c feat(split-nv): optional prompt-state capture hooks for encoder prefill
 8a44ef1 fix(split-nv): explicit os import for hook gate
 a618602 fix(dsv4 topk): radix tie select picks exactly equal values lowest index first (was atomic arrival order: nondeterministic prefill/step selections)
+
+a3b3007..6e85d7e (no merges):
+ae76a6e feat(idx-rowsplit): split the replicated prefill indexer rows across the TP ranks (SPLIT_NV_IDX_ROWSPLIT=1, off)
+c9b2a46 fix(cache): register a prefix-cache entry only when both ranks' files are whole; count rank write errors
+c550cc6 fix(cache mirror): never rsync --delete a partial cache over the only persistent copy
+6f8bbe7 chore(core dumps): --ulimit core=0 on every docker run of the image (engram_keep, topk-det, engram test)
+a377e55 fix(oom): start the engine container with --oom-score-adj -500 (SPLIT_NV_OOM_SCORE_ADJ, 0 = old behaviour)
+7337fc7 chore(window): SPLIT_NV_NSYS=<dir> starts the engine under nsys launch with every production flag
+3254634 test(dspark-box): kill-gate harnesses for DSpark on the box (window only, not run)
+2d80c5a docs(dspark-box): performance model behind DSPARK-BOX.md s4
+1454bef fix(dspark-box): gate (a) records a ballast that cannot be placed as a failed arm; footprint converges
+5d0f5ae fix(dspark-box): window.sh resumes the cache mirror timer on any exit, leaves llama-swap stopped on failures
+8629a39 fix(dspark-box): bench view keeps layers 2-3 so SGLang's pool sizer has full-token KV (layer 3 alone divided by zero)
+d2f5dcf fix(dspark-box): drafter load no longer indexes the target-sized expert map; CPU dry run proves the load
+017e757 fix(dspark-box): guard checks checkpoint-backed params only, validates derived ones; --load-only smoke
+32637aa fix(dspark-box): Markov winner pick uses index_select (0-dim tensor indexing synced to host and broke CUDA graph capture)
+f4f89ca feat(dspark): STEPD/STPD/RING v1 wire codec and decision rules (STEPD-SPEC.md, FROZEN v1)
+3e1eb76 fix(dspark): STEPD travels as tag b"DSTP" (STEPD-SPEC.md errata E1: "STEPD" does not fit the 4-byte tag)
+a750a15 feat(dspark): box drafter module with FP8 draft head, fused Markov chain and og_moe3 (perf recovery)
+bd936a4 feat(memory): fixed-size prefill indexer tiles in a private pool (SPLIT_NV_IDX_FIXED_TILES, gate (a) WARN remedy)
+aa147ab feat(dspark): box STEPD/RING job and OPEN/ACK capability behind SPLIT_NV_DSPARK=1 (STEPD-SPEC.md v1)
+e80f975 feat(dspark): SPEC v2 additions for the Mac client b0b1a444 (all backward compatible, wire ver 1)
+9bbad4c test(dspark): STEPD end to end over TCP on two fake ranks; one-command CPU suite
+6e85d7e test(dspark): box-local STEPD byte gate for the window; free the BF16 head by default with the FP8 draft head

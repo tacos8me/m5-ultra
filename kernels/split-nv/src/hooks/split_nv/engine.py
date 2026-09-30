@@ -126,6 +126,11 @@ class Engine:
         from split_nv.state_pack import NUMERICS
 
         self.store = RankStore(self, NUMERICS)
+        # DSpark drafter (SPLIT_NV_DSPARK=1; default off: nothing loaded or captured, today's engine)
+        self.dspark = None
+        from split_nv import dspark_box
+        if dspark_box.enabled():
+            self.dspark = dspark_box.load(self)
         self.vision = getattr(self.mr.model, "vision", None) is not None
         self.image_token_id = int(getattr(self.mr.model_config.hf_config, "image_token_id", 129264))
         self.use_graph = False
@@ -142,14 +147,22 @@ class Engine:
         self.preempt_timing = {"head_max_ms": 0.0, "point_gap_max_ms": 0.0, "lag_wait_max_ms": 0.0, "tail_max_ms": 0.0}
         self.memlog = os.environ.get("SPLIT_NV_MEMLOG") == "1"
         self.mem_t = {}
+        self.job_failures = 0  # commands this rank failed (rank 0: Front._execute; others: rank_main), see cmd_barrier
         if os.environ.get("SPLIT_NV_MEM_FRACTION"):
             # cap the caching allocator (cached blocks are released and the allocation retried before this is exceeded)
             torch.cuda.set_per_process_memory_fraction(float(os.environ["SPLIT_NV_MEM_FRACTION"]))
         if int(os.environ.get("SPLIT_NV_MEMHIST", "0") or 0) > 0:
             torch.cuda.memory._record_memory_history(max_entries=int(os.environ["SPLIT_NV_MEMHIST"]))
+        # Order: idx_lowmem replaces sglang's dense_indexer_topk, idx_rowsplit wraps whatever is installed then
+        # (rowsplit(lowmem)): each rank runs the low-memory tiling on its half of the rows.
         if os.environ.get("SPLIT_NV_IDX_LOWMEM") == "1":
             from split_nv import idx_lowmem
             idx_lowmem.install()
+        elif os.environ.get("SPLIT_NV_IDX_FIXED_TILES") == "1":
+            log(f"rank {tp_rank}: SPLIT_NV_IDX_FIXED_TILES=1 ignored: it is part of SPLIT_NV_IDX_LOWMEM=1 (off)")
+        from split_nv import idx_rowsplit
+        if idx_rowsplit.enabled():
+            idx_rowsplit.install()
         if os.environ.get("SPLIT_NV_TRACE"):
             from split_nv.numerics import configure
             configure(self, 'trace')
@@ -413,28 +426,32 @@ class Engine:
             return None
         return torch.cat(pos), torch.cat(rows)
 
-    def cmd_prefill_chunk(self, sid, chunk, grid=None, split=0, preemptible=False):
+    def cmd_prefill_chunk(self, sid, chunk, grid=None, split=0, preemptible=False, rowsplit=False):
         """Returns (rank 0) the packed source rows this chunk produced and its GPU seconds.
         grid = (blocks, entry key or None): save the 8K grid blocks [(bid, end)] this chunk completed, and a grid
         entry at the chunk end (which must then lie on the grid). split > 0: run the chunk as halves [0, split) and
         [split, n) with overlapped all-reduces (decided by rank 0, so every rank issues the same collectives).
-        preemptible: parked STEPs run between its layers (split_nv.preempt; decided by rank 0)."""
+        preemptible: parked STEPs run between its layers (split_nv.preempt; decided by rank 0).
+        rowsplit: the prefill indexer's rows are split across the ranks (split_nv.idx_rowsplit; decided by rank 0)."""
+        from split_nv import idx_rowsplit
+
         t0 = time.perf_counter()
         sess = self.sessions[sid]
         self._cap_use(sid)
         self.cap.tokens.append(torch.tensor(chunk, dtype=torch.int64))
         self.cap.ntok += len(chunk)
-        if preemptible:
-            from split_nv import preempt
-            win = preempt.open_window(self, self.tp_rank == 0, self.preempt_peers, self.preempt_take)
-            try:
+        with idx_rowsplit.chunk(rowsplit):
+            if preemptible:
+                from split_nv import preempt
+                win = preempt.open_window(self, self.tp_rank == 0, self.preempt_peers, self.preempt_take)
+                try:
+                    self._extend_split(sess, chunk, split, lambda a, n: self._replace_rows(sid, a, n))
+                finally:
+                    preempt.close_window()
+                self.last_preempt = (win.k, win.steps, win.step_s)
+                self.last_window = win
+            else:
                 self._extend_split(sess, chunk, split, lambda a, n: self._replace_rows(sid, a, n))
-            finally:
-                preempt.close_window()
-            self.last_preempt = (win.k, win.steps, win.step_s)
-            self.last_window = win
-        else:
-            self._extend_split(sess, chunk, split, lambda a, n: self._replace_rows(sid, a, n))
         torch.cuda.synchronize()
         dt = time.perf_counter() - t0
         self.cap.chunks.append((len(chunk), dt))
@@ -498,17 +515,86 @@ class Engine:
         return time.perf_counter() - t0
 
     def cmd_barrier(self):
-        """Returns on rank 0 only once rank 1 has executed every earlier command (then its files are read/written)."""
+        """Returns on rank 0 only once rank 1 has executed every earlier command (then its files are read/written):
+        [[snapshot write errors, failed commands] of every rank] since start. The collective always runs: a rank that
+        raised before it would leave the others blocked in it until the watchdog (300 s) restarts the engine."""
         from sglang.srt.distributed import get_tp_group
 
-        self.store.flush()
-        get_tp_group().barrier()
+        try:
+            self.store.flush()
+        except Exception as e:  # noqa: BLE001
+            self.store.n_errors += 1
+            log(f"rank {self.tp_rank}: snapshot flush failed: {e!r}")
+        return gather_counts(get_tp_group(), [self.store.n_errors, self.job_failures])
 
     def cmd_step(self, sid, keep, ids, use_graph=None):
         sess = self.sessions[sid]
         if keep > sess.length:
             raise ValueError(f"keep {keep} > session length {sess.length}")
         return self.steps.run(sess, keep, ids, use_graph=self.use_graph if use_graph is None else use_graph)
+
+    # ---- DSpark on the box (STEPD-SPEC.md; decisions are made on rank 0 and travel in the commands) -------------
+    def cmd_dspark_capture(self):
+        from sglang.srt.distributed import get_tp_group
+        from split_nv import dspark_box
+
+        t0 = time.perf_counter()
+        a0 = torch.cuda.memory_reserved()
+        res = self.dspark.capture(dspark_box.settings()["widths"])
+        log(f"rank {self.tp_rank}: dspark graphs captured in {time.perf_counter() - t0:.1f}s ({json.dumps(res)}), "
+            f"reserved +{(torch.cuda.memory_reserved() - a0) / 2**30:.3f} GiB")
+        if not all(ok for (ok,) in gather_counts(get_tp_group(), [int(not res["failed"])])):
+            # graph != eager or ranks disagree on drafts on some rank: never draft (every rank drops it alike)
+            log(f"rank {self.tp_rank}: dspark capture checks failed on a rank; drafter disabled")
+            self.dspark = None
+            res["disabled"] = True
+        if self.memlog:
+            m = self.mem_summary()
+            g = 1 << 30
+            log(f"rank {self.tp_rank} mem after dspark capture: alloc {m['allocated_bytes.all.current'] / g:.2f} GiB, "
+                f"reserved {m['reserved_bytes.all.current'] / g:.2f} GiB, device free {m['device_free'] / g:.2f} GiB")
+        return res
+
+    def cmd_ring(self, sid, slot, offset, keys, kr, taps, tr):
+        """RING (every rank): the session's ring slot becomes exactly positions [offset - kr - tr, offset)."""
+        if sid not in self.sessions:
+            raise ValueError(f"ring: no session {sid}")
+        t0 = time.perf_counter()
+        self.dspark.ring_set(slot, offset, keys, kr, taps, tr)
+        return time.perf_counter() - t0
+
+    def cmd_stepd(self, sid, slot, keep, anchor, app_base, n_app, taps, draft, W, dmax, costs, explicit, expect):
+        """One STEPD job (every rank): [append the committed rows] -> [draft W at keep] -> step [anchor] + drafts.
+        draft: the front end's decision (mode 0, drafting on, ring current, keep >= MIN_CTX, dmax >= 1); costs: the
+        c2..c5 tier for (keep, regime). Rank-local width choice: every rank holds the same all-gathered drafts and
+        max-probs, and choose_cost_depth is plain host arithmetic on them. expect = (base, nver) of the pending step
+        the front end checked the accept against (None for a kickoff): a disagreement is a bug, never a draft."""
+        from split_nv import dspark_wire as WIRE
+
+        sess = self.sessions[sid]
+        if expect is not None and (sess.pending is None or sess.pending[0] != expect[0] or len(sess.pending[1]) != expect[1]):
+            raise RuntimeError(f"stepd: pending {None if sess.pending is None else (sess.pending[0], len(sess.pending[1]))} "
+                               f"!= front end's {expect}")
+        if keep > sess.length:
+            raise ValueError(f"keep {keep} > session length {sess.length}")
+        D = self.dspark
+        t0 = time.perf_counter()
+        info = {"drafted": False, "toks": [], "probs": [], "drafter_ms": 0.0}
+        if draft:
+            D.launch_draft(slot, keep, anchor, app_base, n_app, taps, W)
+            # host bookkeeping of the step while the drafter graph runs (run() then finds it done)
+            self.steps.prepare(sess, keep, keep + self.steps.pick(1 + dmax).W)
+            toks, probs = D.collect(W)
+            depth = min(WIRE.choose_cost_depth(probs, costs), dmax)
+            ids = [anchor] + toks[:depth]
+            info.update(drafted=True, toks=toks, probs=probs, drafter_ms=(time.perf_counter() - t0) * 1e3)
+        else:
+            if n_app:
+                D.run_append(slot, app_base, n_app, taps)
+            ids = [anchor] + list(explicit)
+        out, _ = self.steps.run(sess, keep, ids, use_graph=self.use_graph)
+        info["ids"] = ids
+        return out, time.perf_counter() - t0, info
 
     def cmd_capture(self, widths):
         for W in widths:
@@ -556,7 +642,7 @@ class Engine:
             return self.cmd_prefill_begin(cmd[1])
         if kind == "prefill_chunk":
             return self.cmd_prefill_chunk(cmd[1], cmd[2], cmd[3] if len(cmd) > 3 else None, cmd[4] if len(cmd) > 4 else 0,
-                                          bool(cmd[5]) if len(cmd) > 5 else False)
+                                          bool(cmd[5]) if len(cmd) > 5 else False, bool(cmd[6]) if len(cmd) > 6 else False)
         if kind == "prefill_end":
             return self.cmd_prefill_end(cmd[1], cmd[2])
         if kind == "restore":
@@ -576,6 +662,12 @@ class Engine:
             return self.cmd_step(cmd[1], cmd[2], cmd[3], cmd[4] if len(cmd) > 4 else None)
         if kind == "capture":
             return self.cmd_capture(cmd[1])
+        if kind == "stepd":
+            return self.cmd_stepd(*cmd[1:])
+        if kind == "ring":
+            return self.cmd_ring(*cmd[1:])
+        if kind == "dspark_capture":
+            return self.cmd_dspark_capture()
         if kind == "close":
             return self.cmd_close(cmd[1])
         if kind == "sync":
@@ -600,6 +692,14 @@ class Engine:
         if kind == "extend" and os.environ.get("SPLIT_NV_SELFTEST") == "numerics":
             return self._extend(self.sessions[cmd[1]], cmd[2])
         raise ValueError(kind)
+
+
+def gather_counts(group, counts):
+    """Every rank's int list `counts` (same length on all ranks), gathered over the TP CPU (gloo) group: the barrier."""
+    t = torch.tensor(counts, dtype=torch.int64)
+    out = [torch.zeros_like(t) for _ in range(group.world_size)]
+    torch.distributed.all_gather(out, t, group=group.cpu_group)
+    return [o.tolist() for o in out]
 
 
 # --------------------------------------------------------------------------------------------- process entry
@@ -633,12 +733,13 @@ def rank_main(server_args, port_args, gpu_id, tp_rank, conns):
                 while not conns.poll() and time.monotonic() < spin_until:
                     pass
             cmd = conns.recv()
-            if cmd[0] == "step":
+            if cmd[0] in ("step", "stepd"):
                 spin_s = float(flag("r1_spin_s", spin_default))
                 spin_until = time.monotonic() + spin_s if spin_s > 0 else 0.0
             try:
                 engine.execute(cmd)
             except Exception as e:  # noqa: BLE001
+                engine.job_failures += 1
                 log(f"rank {tp_rank} job failed: {e}\n{traceback.format_exc()}")
                 from split_nv.front import fatal_cuda_error
                 if fatal_cuda_error(e):
@@ -698,6 +799,9 @@ def rank_main(server_args, port_args, gpu_id, tp_rank, conns):
         front.submit(("capture", widths))
         front.submit(("step", 0, 10, [13, 14]))
     front.submit(("close", 0))
+    if engine.dspark is not None:
+        # after the step graphs (same global graph pool); graph == eager and rank agreement checked inside
+        front.submit(("dspark_capture",))
     # Prefill kernels JIT on their first use (~3 s): warm them before accepting traffic.
     t0 = time.perf_counter()
     for n in (8194, 300):

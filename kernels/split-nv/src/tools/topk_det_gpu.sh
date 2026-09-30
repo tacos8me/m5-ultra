@@ -19,7 +19,7 @@ fi
 FREE=$(nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i "$GPU")
 [ "$FREE" -ge "$MIN_FREE_MB" ] || { echo "GPU $GPU has only $FREE MiB free"; exit 3; }
 echo "GPU $GPU free ${FREE} MiB; engine idle or down"
-exec timeout 600 docker run --rm --name topk-det-test --gpus "\"device=$GPU\"" --entrypoint python3 \
+exec timeout 600 docker run --rm --name topk-det-test --gpus "\"device=$GPU\"" --ulimit core=0 --entrypoint python3 \
   -v "$TREE":/w:ro -v "$JIT":/root/.cache/sglang -e PYTHONPATH=/w/hooks \
   -e FULL="${FULL:-0}" -e TIMING="${TIMING:-0}" -e RUNS="${RUNS:-10}" \
   "$IMAGE" /w/tools/test_topk_det_gpu.py

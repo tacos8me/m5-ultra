@@ -37,7 +37,13 @@ Failure handling (chat and text completions):
           {"error": {"code": "backend_unavailable", ...}} + [DONE], or HTTP 503
           with Retry-After for non-streaming requests.
 A child that dies mid-response (no marker) ends that response with the same
-clean error. Other paths (/v1/messages, /v1/responses, ...) are proxied as is.
+clean error. /v1/messages and /v1/responses are proxied as is.
+
+Only an allow-list reaches the child (ALLOWED: the four inference POSTs, GET /v1/models, GET /og/stats;
+DS41_OG_EXTRA_PATHS adds exact 'METHOD /path' pairs). The child binds loopback, so omlx skips its API-key
+checks for everything it serves; without the list, LAN clients reached its admin router, /v1/mcp/execute,
+/v1/websearch/fetch and model load/unload through llama-swap (/upstream/ds41/...). Anything else is a 404
+with an OpenAI-shaped error body, counted in /health (refused).
 
 Images (chat image_url parts, /v1/messages image blocks, /v1/responses input_image):
 DS41_OG_VISION=og (default) serves them on the og worker like text. The box runs
@@ -97,6 +103,23 @@ PY = str(HOME/'llm/.venv-ds41-omlx-tiles/bin/python')
 LOGS = Path(os.environ.get('DS41_OG_LOGS', str(HOME/'llm/ds41/og/logs')))
 INFERENCE = ('/v1/chat/completions', '/v1/completions', '/v1/responses', '/v1/messages')
 RESUMABLE = ('/v1/chat/completions', '/v1/completions')
+
+
+def allowed_paths(extra=''):
+    """(method, path) pairs proxied to the child. Evidence (2026-09-30): every ds41 request in the
+    llama-swap log is one of the INFERENCE POSTs (Hermes, pi, benches); llama-swap answers /v1/models itself
+    and health-checks /health (served here); the og_serve harnesses read GET /v1/models and GET /og/stats
+    through this port (api_bench, cache_bench, fault_soak)."""
+    pairs = {('POST', path) for path in INFERENCE} | {('GET', '/v1/models'), ('GET', '/og/stats')}
+    for item in filter(None, (x.strip() for x in extra.split(','))):
+        method, _, path = item.partition(' ')
+        if not path.strip().startswith('/'):
+            raise SystemExit(f'DS41_OG_EXTRA_PATHS: expected "METHOD /path", got {item!r}')
+        pairs.add((method.upper(), path.strip()))
+    return frozenset(pairs)
+
+
+ALLOWED = allowed_paths(os.environ.get('DS41_OG_EXTRA_PATHS', ''))
 DROP = {'host', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'accept-encoding',
         'content-encoding'}
 MARK = 'ds41-og-resume:'
@@ -454,7 +477,7 @@ class Supervisor:
         self.vision_at = None
         self.vision_waiting = 0
         self.stats = dict(og=0, q3=0, failovers=0, switches=0, box_lost=0, resumed=0, resume_failed=0,
-                          vision=0, vision_rejected=0,
+                          vision=0, vision_rejected=0, refused=0,
                           broken=0, divergent=0, worker_exits=0, worker_restarts=0, client_gone=0)
         self.exit_code = None
         self.restarting = None
@@ -1052,8 +1075,20 @@ def main():
                                  box_restarting=sup.box_restarting(), q3_enabled=Q3, **sup.stats),
                             status_code=200 if ok or degraded else 503)
 
+    refused = set()  # (method path) already logged once
+
     @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
     async def proxy(path: str, request: Request):
+        if (request.method, request.url.path) not in ALLOWED:
+            sup.stats['refused'] += 1
+            key = f'{request.method} {request.url.path[:120]}'
+            if key not in refused and len(refused) < 256:
+                refused.add(key)
+                LOG.warning('refused (not on the allow-list): %s', key)
+            return JSONResponse(dict(error=dict(
+                message=f'ds41-og: {request.method} {request.url.path[:200]} is not served here; '
+                        'use POST /v1/chat/completions, /v1/completions, /v1/messages or /v1/responses',
+                type='invalid_request_error', code='not_found')), status_code=404)
         if TRACE and request.url.path in INFERENCE:
             _trace.set(dict(path=request.url.path, recv=time.time()))
         body = await request.body()

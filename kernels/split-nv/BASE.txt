@@ -1,4 +1,4 @@
-split-nv engine (own code, src/): a3b3007 (branch polish2 = topk-det + robust + fair + stale + fast-restart + preempt-1m; deployed as systemd user unit split-nv-engine, running the
+split-nv engine (own code, src/): 6e85d7e (branch dspark-box-build = polish2 + polish3 + fixed-size indexer tiles + DSpark-on-box, the last off; deployed as systemd user unit split-nv-engine, running the
   image built from this Dockerfile, with SPLIT_NV_PF_OVERLAP=1 SPLIT_NV_Q_NOCOPY=1: prefill chunks run as two halves so
   one half's TP2 all-reduce overlaps the other half's compute; byte-identical), and an exact, deterministic indexer
   top-k when more than 2048 scores tie in the threshold bin (hooks/split_nv/topk_det.py; identical output otherwise), plus
@@ -7,6 +7,13 @@ split-nv engine (own code, src/): a3b3007 (branch polish2 = topk-det + robust + 
   shared memory across engine restarts (crash restart ~100 s instead of ~200-270 s; tools/engram_keep.py verify checks
   them byte for byte), and SPLIT_NV_GC_FREEZE=1 freezes warm-up objects out of Python's cyclic GC (worst decode gap
   during a 1M prefill 505 -> 82 ms). Engine numerics unchanged since c75a0a2 (og-s4.4).
+
+  Since polish3: SPLIT_NV_IDX_ROWSPLIT=1 splits the replicated prefill indexer rows across the two TP ranks
+  (hooks/split_nv/idx_rowsplit.py; 1M prefill 59.5 -> 53.9 s, byte-identical), SPLIT_NV_IDX_FIXED_TILES=1 serves the
+  prefill indexer from fixed-size tiles in a private pool (allocator retries 8 -> 0, ~7 GiB less reserved), prefix-cache
+  entries are registered only when both ranks' files are whole, and the cache mirror never rsync --deletes a partial
+  cache. hooks/split_nv/dspark_box.py + dspark_wire.py (DSpark drafter on the box, STEPD protocol) are present but
+  off (SPLIT_NV_DSPARK unset): exact and +17% at c2/c4 in a trial, not shipped (c1 flat, fairness during prefills).
 
 Base image: lmsysorg/sglang:dev-dsv41@sha256:4a5d132a06a77c8331e15845f2e925adc788b00105097ad55409afa3f4fa4860
   (torch 2.13.0+cu130, flashinfer 0.6.18+cu130 git 69ff11fc). The Dockerfile applies two patches:

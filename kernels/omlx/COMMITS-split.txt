@@ -1,7 +1,7 @@
 Applies on top of deepseek-v41.patch (head ef88391e):
 base: ef88391e
-head: 0bda9fc4 (branch ds41-next3, served as llama-swap ds41; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
-      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe, then ds41-ffn + ds41-ttft2 merged as ds41-next2, then ds41-robust + ds41-c4 merged as ds41-next3)
+head: 0c1ac7c6 (branch ds41-next4, served as llama-swap ds41 with DS41_DRAFT_HEAD=mxfp8; merges of ds41-fe, ds41-host, ds41-attn, ds41-moe,
+      ds41-batch, ds41-draft on f56f7ffa, then ds41-ttft, ds41-woa, ds41-probe, then ds41-ffn + ds41-ttft2 merged as ds41-next2, then ds41-robust + ds41-c4 merged as ds41-next3, then ds41-next4)
 
 5b17cbbc perf: keep DeepSeek V4.1 decode KV growth in place across extract and rollback
 88cfffd9 perf: score DeepSeek V4.1 decode index keys in one lazy tile
@@ -114,3 +114,12 @@ c5d530c7 perf(ds41-c4): warm the fused-pair verify shapes at worker start
 6a581b50 robust: fault-injection soak driver for a maintenance window (not run)
 6d2fffae robust: bounded step rebuilds, context clamp, cancellable OPEN, worker restart, client-gone cancel
 71e7bc52 Avoid import token lists and honour cancellation during box open
+
+0bda9fc4..0c1ac7c6 (no merges):
+0c1ac7c6 fix(trace): c4ab_trace checks the worker tree via mapped kernels (omlx-server renames its command)
+72e87294 fix(bench): head_mxfp8_bench drops the summary event key before emit
+ccb2cdbc test(ds41-next4): window harness for the MXFP8 A/B and the engine-loop-pipeline trace
+e1092c4a chore(ds41): retire the copy-lock spec_probe (DS41_OG_SPEC_PROBE default 0)
+e431b964 security(ds41-og): supervisor forwards only an allow-list to the oMLX child
+26645024 feat(ds41): MXFP8 draft head through the M-invariant rows kernel (DS41_DRAFT_HEAD=mxfp8, default off)
+e67d98d0 fault_soak: phase B non-streaming hang-up at 2 s so it cancels mid-decode

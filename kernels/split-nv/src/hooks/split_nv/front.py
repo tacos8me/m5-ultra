@@ -26,7 +26,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import numpy as np
 import torch
 
-from split_nv import preempt, stallwatch, topk_det
+from split_nv import dspark_wire as WIRE
+from split_nv import idx_rowsplit, preempt, stallwatch, topk_det
 from split_nv.fair import PrefillGate
 from split_nv.imagekeys import parse_images, prefix_digest, prompt_keys
 from split_nv.perf_flags import flag
@@ -51,6 +52,11 @@ MAX_PAYLOAD = int(os.environ.get("SPLIT_NV_MAX_PAYLOAD_MB", "1024")) << 20
 # sessions -- and their KV, up to a 1M context each -- allocated forever (the connection thread blocks in recv with no
 # timeout). Probes are answered by the peer's kernel, so a live but idle client is never cut. 0 = off.
 KEEPALIVE_S = int(os.environ.get("SPLIT_NV_KEEPALIVE_S", "30"))
+
+
+def idx_lowmem_summary():
+    from split_nv import idx_lowmem
+    return idx_lowmem.summary()
 
 
 def keepalive(conn):
@@ -225,6 +231,19 @@ class Busy(RuntimeError):
     """Retryable refusal (capacity, draining)."""
 
 
+class DsSession:
+    """Rank 0's state of a session granted box drafting (STEPD-SPEC.md): its ring slot and cost tables, a mirror of
+    the engine's pending step and length (the accept check runs here, before any GPU work), and the ring bookkeeping
+    every STEPD decision is made from. The decisions travel in the job command, so every rank executes the same."""
+    __slots__ = ("slot", "costs", "length", "pending", "ring_ok", "ring_offset", "ring_reason")
+
+    def __init__(self, slot, costs, length):
+        self.slot, self.costs, self.length = slot, costs, length
+        self.pending = None  # (base, ids) of the last STEP/STEPD
+        self.ring_ok, self.ring_offset = False, 0
+        self.ring_reason = WIRE.REASON["ring_not_ok"]  # why ring_ok is 0: ring_not_ok or ring_rejected
+
+
 def new_pstats():
     """Preemption counters (/health fair.preempt). park_*: how long parked STEPs waited for a point or the chunk end;
     share_denied: points that had parked STEPs but no decode share left; timing: rank 0's per-chunk maxima (engine)."""
@@ -340,8 +359,18 @@ class Front:
         self.pq_open = False  # a preemptible chunk is running: STEPs park here and run between its layers
         self.pq = []
         self.pstats = new_pstats()
+        self.rank_counts = None  # [[snapshot write errors, failed commands] per rank] as of the last barrier
+        self.rank_counts_t = None
         self.trim_min = int(os.environ.get("SPLIT_NV_TRIM_MIN_TOKENS", "0") or 0)
         engine.preempt_take = self._take_parked
+        # DSpark on the box (SPLIT_NV_DSPARK=1): granted sessions, ACK refusals, free ring slots, counters
+        self.dsp = {}
+        self.dsp_off = {}
+        self.dsp_lock = threading.Lock()
+        D = getattr(engine, "dspark", None)
+        self.dsp_free = list(range(D.nslots)) if D is not None else []
+        self.dsp_stats = {"granted": 0, "refused": {}, "cycles": {"box": 0, "explicit": 0, "bonus": 0, "filler": 0}, "fallbacks": {},
+                          "rings": 0, "hard_errors": {}, "drafter_ms": []}
         c128 = getattr(engine.steps.be, "online_c128_mtp", None)
         if self.preempt_on and c128 is not None and c128.enabled():
             # its per-forward state is mutated in place by a verify step's metadata init: not restorable by preempt
@@ -424,6 +453,16 @@ class Front:
                 log(f"preempt: STEP parked {ms:.0f} ms, released {where}{extra}")
 
     def _parkable(self, cmd):
+        if cmd[0] == "stepd":
+            # ("stepd", sid, slot, keep, anchor, app_base, n_app, taps, draft, W, dmax, costs, explicit, expect)
+            steps, D = self.engine.steps, self.engine.dspark
+            try:
+                slot = steps.pick(1 + max(cmd[10], len(cmd[12])))
+            except ValueError:
+                return False
+            if not (steps.engine.use_graph and slot.graph is not None) or D is None:
+                return False
+            return (cmd[9] in D.graphs) if cmd[8] else (not cmd[6] or "append" in D.graphs)
         if cmd[0] != "step":
             return False
         steps = self.engine.steps
@@ -469,6 +508,7 @@ class Front:
             job.t_exec = time.perf_counter()
         except Exception as e:  # noqa: BLE001
             job.error = f"{e}\n{traceback.format_exc()}"
+            self.engine.job_failures = getattr(self.engine, "job_failures", 0) + 1
             log("GPU job failed:", job.error)
             if fatal_cuda_error(e):
                 # A sticky CUDA error (device-side assert, illegal access) poisons the context: every later job
@@ -594,8 +634,9 @@ class Front:
                 grid = grids[k][1] if grids[k] and last else None
                 from split_nv.engine import pf_split
                 cmd = ("prefill_chunk", sid, ids[a:e], grid, pf_split(e - a))
-                if preemptible:
-                    cmd += (True,)
+                rowsplit = idx_rowsplit.decide()  # read here, on rank 0 only: every rank gets the same decision
+                if preemptible or rowsplit:
+                    cmd += (preemptible, rowsplit)
                 return self.submit_async(cmd, priority=1), a, e, k, last
 
             try:
@@ -685,10 +726,36 @@ class Front:
             info["grid_entries"].append((key, e, list(blocks)))
         return blocks
 
+    def barrier(self, priority=1):
+        """Engine barrier: every rank has executed every earlier command (its snapshot files are written). Keeps the
+        ranks' [write errors, failed commands] for /health and logs new ones of the other ranks."""
+        counts = self.submit(("barrier",), priority=priority)
+        if counts:
+            prev = self.rank_counts or [[0, 0]] * len(counts)
+            for r in range(1, len(counts)):
+                if counts[r] != prev[r]:
+                    log(f"rank {r}: {counts[r][0] - prev[r][0]} new snapshot write error(s), {counts[r][1] - prev[r][1]} "
+                        f"new failed command(s) since the last barrier (totals {counts[r]}; details in its log lines)")
+            self.rank_counts, self.rank_counts_t = counts, time.monotonic()
+        return counts
+
+    def _complete(self, key, blocks, capture):
+        """Both ranks' files of entry `key` (and of its unregistered blocks) are whole; else forget it (counted)."""
+        bad = self.cache.incomplete(key, blocks, capture)
+        if not bad:
+            return True
+        self.cache.stats["skipped_incomplete"] = self.cache.stats.get("skipped_incomplete", 0) + 1
+        log(f"prefix cache: entry {key} not registered, {len(bad)} file(s) missing or incomplete: {bad[:3]}")
+        for f in self.cache.entry_files(key):
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(f)
+        return False
+
     def save_snapshot(self, sid, ids, info):
         """After a cache=1 prefill (prefill lock held): snapshot the prompt end unless that exact prefix is cached,
         then register it and the prefill's grid entries. Entries become visible only after a barrier: both ranks'
-        files are then complete, so an OPEN right behind this one can resume from them."""
+        files are then complete, so an OPEN right behind this one can resume from them. An entry whose files are not
+        all there (a failed write on either rank) is skipped and counted, never raised: resumes stay exact."""
         P = len(ids)
         blocks, new_blocks = info["blocks"], list(info["new_blocks"])
         final = len(blocks) == P // GRID and not self.cache.covered(P, ids, capture=True)
@@ -697,9 +764,12 @@ class Front:
             key = self.cache.new_id("e")
             dt = self.submit(("snapshot", sid, key), priority=1)
             info["rows"].save(self.cache.p(f"rows-tail-{key}"), P // GRID * GRID, P)
-        self.submit(("barrier",), priority=1)
+        self.barrier()
         for gkey, g, gblocks in info["grid_entries"]:
-            self.cache.add(gkey, ids[:g], gblocks, capture=False)
+            if self._complete(gkey, gblocks, capture=False):
+                self.cache.add(gkey, ids[:g], gblocks, capture=False)
+        if final and not self._complete(key, blocks, capture=True):
+            final = False
         if final:
             self.cache.add(key, ids, blocks, capture=True)
         self.cache.forget_blocks(new_blocks)  # only those no registered entry references
@@ -725,10 +795,23 @@ class Front:
 
     def cache_clear(self):
         with self.gate.enter(None):
-            self.submit(("barrier",), priority=1)
+            self.barrier()
             return {"dropped": self.cache.clear()}
 
     # ---- health ------------------------------------------------------------------------------------------------
+    def rank_errors(self):
+        """Per rank: snapshot write errors and failed commands since start (rank 0 live, the others as of the last
+        barrier, which every cache=1 prefill ends with), plus rank 0's last write error."""
+        store = getattr(self.engine, "store", None)
+        live = [getattr(store, "n_errors", 0), getattr(self.engine, "job_failures", 0)]
+        peers = (getattr(self, "rank_counts", None) or [live])[1:]
+        t = getattr(self, "rank_counts_t", None)
+        out = {"write_errors": [live[0]] + [c[0] for c in peers], "failed_commands": [live[1]] + [c[1] for c in peers],
+               "peers_as_of_s": round(time.monotonic() - t, 1) if t else None}
+        if getattr(store, "errors", None):
+            out["last_write_error"] = store.errors[-1][:300]
+        return out
+
     def health(self):
         cur = self.current
         busy = (time.monotonic() - cur[1]) if cur else 0.0
@@ -751,14 +834,19 @@ class Front:
                     "stalest_step_s": round(now - min(steps), 1) if steps else None,
                     "gpu_mem_mib": gpu_memory(),
                     "gpu_job": cur[0] if cur else None, "gpu_job_s": round(busy, 2), "queued_jobs": self.jobs.qsize(),
-                    "cache": self.cache.summary(), "uptime_s": round(time.time() - self.t_start),
+                    "cache": self.cache.summary(), "rank_errors": self.rank_errors(), "uptime_s": round(time.time() - self.t_start),
                     "version": self.version, "sglang": os.environ.get("SPLIT_NV_SGLANG_VERSION", ""), "numerics": NUMERICS,
                     "tree_head": tree, "restart_pending": bool(tree) and not self.version.startswith(tree[:len(self.version.split("-")[0])]),
                     "dev_hook": os.environ.get("SPLIT_NV_DEV") == "1", "vision": self.engine.vision,
                     "prefill_perf": {k: os.environ.get(f"SPLIT_NV_{k.upper()}", "0") == "1"
                                      for k in ("pf_overlap", "ce_ar", "q_nocopy")},
                     "topk_det": topk_det.digest() if topk_det.installed() else False,
+                    **({"idx_rowsplit": dict(idx_rowsplit.summary(), flag=bool(flag("idx_rowsplit", True)))}
+                       if idx_rowsplit.enabled() else {}),
                     **({"stallwatch": stallwatch.summary()} if stallwatch.enabled() else {}),
+                    **({"idx_fixed_tiles": dict(idx_lowmem_summary(), flag=bool(flag("idx_fixed_tiles", True)))}
+                       if os.environ.get("SPLIT_NV_IDX_FIXED_TILES") == "1" and os.environ.get("SPLIT_NV_IDX_LOWMEM") == "1" else {}),
+                    **({"dspark": self.dspark_summary()} if os.environ.get("SPLIT_NV_DSPARK") == "1" else {}),
                     **({"fair": {"gate": self.gate.summary(), "preempt": dict(self.pstats, **getattr(self.engine, "preempt_timing", {})) if self.preempt_on else False,
                                  "trim_min_tokens": self.trim_min}}
                        if self.preempt_on or self.gate.bypass_tokens or self.trim_min else {})}
@@ -898,7 +986,7 @@ class Front:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         path = os.path.join(d, f"memstats-{stamp}")
         self.submit(("memstats", path, reset, os.path.join(d, f"memsnap-{stamp}") if snapshot else None, segments))
-        self.submit(("barrier",))
+        self.barrier(priority=0)
         out = {}
         for r in range(1 + len(self.peers)):
             f = f"{path}.rank{r}.json"
@@ -956,13 +1044,22 @@ class Front:
             if h.get("prefix_sha256") != prefix_digest(tokens, keys, delta_from, bool(images)):
                 raise ValueError("delta_from: prefix_sha256 does not match the prefix (tokens, or keys with images)")
         sid = self.new_sid()
+        self._dspark_grant(sid, h, len(tokens) - 1)
+        try:
+            return self._handle_open(conn, peer, h, tokens, images, sid, state, stream, use_cache, want_state, lean,
+                                     delta_from)
+        except BaseException:
+            self._dspark_release(sid)
+            raise
+
+    def _handle_open(self, conn, peer, h, tokens, images, sid, state, stream, use_cache, want_state, lean, delta_from):
         t0 = time.perf_counter()
         streamer = Streamer(conn, len(tokens) - 1, lean, delta_from) if stream else None
 
         def on_ready(P):
             if stream:
                 send_frame(conn, b"ACK ", {"ok": True, "session": sid, "stream": 1, "resumed_tokens": P, "numerics": NUMERICS,
-                                           "est_s": round((len(tokens) - 1 - P) / PREFILL_TOK_S, 2)})
+                                           "est_s": round((len(tokens) - 1 - P) / PREFILL_TOK_S, 2), **self._ack_extra(sid)})
 
         def on_rows(rows):
             if stream:
@@ -995,7 +1092,7 @@ class Front:
             streamer.finish(arrays, manifest)
         else:
             send_frame(conn, b"ACK ", {"ok": True, "session": sid, "prefill_s": dt, "resumed_tokens": info["resumed_tokens"],
-                                       "numerics": NUMERICS})
+                                       "numerics": NUMERICS, **self._ack_extra(sid)})
             if want_state:
                 blob = serialize_parts(arrays, manifest)
                 send_frame(conn, b"STAT", {"format": manifest["format"], "prompt_tokens": len(tokens), "bytes": len(blob),
@@ -1054,7 +1151,16 @@ class Front:
                     if sid is None:
                         break
                 elif tag == b"STEP":
+                    if len(header) == WIRE.STEPD_HDR.size and sid in self.dsp:
+                        self.stepd(conn, sid, header, payload)  # SPEC V2.1: a STEPD sent under the tag b"STEP"
+                        continue
                     s, keep, L = STEP_HDR.unpack(header)
+                    if (s == sid and sid in self.dsp and 1 <= L <= MAX_STEP_ROWS and plen > 4 * L
+                            and (plen - 4 * L) % WIRE.TAP_ROW_BYTES == 0):
+                        # SPEC V2.2: a granted session's plain STEP carrying the committed rows' taps
+                        self.step_taps(conn, sid, keep, list(struct.unpack_from("<%dI" % L, payload)),
+                                       memoryview(payload)[4 * L:])
+                        continue
                     if s != sid or L < 1 or L > MAX_STEP_ROWS or plen != 4 * L:
                         send_frame(conn, b"ERR ", {"error": f"bad STEP session={s} L={L}"})
                         break
@@ -1073,6 +1179,9 @@ class Front:
                         send_frame(conn, b"ERR ", {"error": f"step payload {len(out)} bytes for L={L}"})
                         break
                     conn.sendall(FRAME.pack(b"STPR", STPR_HDR.size, len(out)) + STPR_HDR.pack(sid, keep + L, L, len(out), box_s) + out)
+                    ds = self.dsp.get(sid)
+                    if ds is not None:  # a granted session's plain STEP: the next STEPD checks accept against it
+                        ds.pending, ds.length = (keep, ids), keep + L
                     if os.environ.get("SPLIT_NV_STEP_LOG") or flag("step_log", False):
                         tm = step.get("t")
                         ph = (" " + " ".join(f"{k}={(b - a) * 1e3:.3f}" for k, a, b in zip(tm[0::2], tm[1::2], tm[3::2])
@@ -1080,11 +1189,23 @@ class Front:
                         log(f"session {sid} step keep={keep} L={L} box={box_s * 1e3:.2f}ms total={(time.perf_counter() - t0) * 1e3:.2f}ms "
                             f"queue={(t_get - t0) * 1e3:.2f} bcast={(t_bcast - t_get) * 1e3:.2f} "
                             f"exec={(t_exec - t_bcast) * 1e3:.2f} reply={(time.perf_counter() - t_exec) * 1e3:.2f}{ph}")
+                elif tag == WIRE.TAG_STEPD:
+                    self.stepd(conn, sid, header, payload)
+                elif tag == WIRE.TAG_RING:
+                    self.ring(sid, header, payload)
                 elif tag == b"CLOS":
                     break
                 else:
                     send_frame(conn, b"ERR ", {"error": f"unknown tag {tag!r}"})
                     break
+        except WIRE.WireError as e:
+            log(f"connection {peer} session {sid}: {e}")
+            st = self.dsp_stats["hard_errors"]
+            st[e.code] = st.get(e.code, 0) + 1
+            try:
+                send_frame(conn, b"ERR ", {"error": str(e)[:500], "retry": False, "code": e.code})
+            except Exception:  # noqa: BLE001
+                pass
         except Exception as e:  # noqa: BLE001
             log(f"connection {peer}: {e}")
             try:
@@ -1094,6 +1215,7 @@ class Front:
         finally:
             if sid is not None:
                 self.last_step.pop(sid, None)
+                self._dspark_release(sid)
                 try:
                     self.submit(("close", sid))
                 except Exception as e:  # noqa: BLE001
@@ -1101,6 +1223,221 @@ class Front:
             conn.close()
             with self.conn_lock:
                 self.open_conns -= 1
+
+    # ---- DSpark on the box: STEPD / RING (STEPD-SPEC.md v1) -----------------------------------------------------------
+    def _dspark_grant(self, sid, h, length):
+        """OPEN: grant box drafting (ring slot + cost tables) or record why not, for the ACK."""
+        costs, why = WIRE.parse_open(h)
+        if costs is None and why is None:
+            return
+        if why is None:
+            if self.engine.dspark is None:
+                why = "not_loaded"
+            elif not flag("dspark", True):
+                why = "disabled"
+        with self.dsp_lock:
+            if why is None:
+                if self.dsp_free:
+                    self.dsp[sid] = DsSession(self.dsp_free.pop(0), costs, length)
+                    self.dsp_stats["granted"] += 1
+                    return
+                why = "no_slot"
+            self.dsp_off[sid] = why
+            self.dsp_stats["refused"][why] = self.dsp_stats["refused"].get(why, 0) + 1
+
+    def _ack_extra(self, sid):
+        if sid in self.dsp:
+            return {"dspark": WIRE.capability()}
+        why = self.dsp_off.pop(sid, None)
+        return {"dspark_off": why} if why else {}
+
+    def _dspark_release(self, sid):
+        with self.dsp_lock:
+            self.dsp_off.pop(sid, None)
+            ds = self.dsp.pop(sid, None)
+            if ds is not None:
+                self.dsp_free.append(ds.slot)
+                self.dsp_free.sort()
+
+    def _dspark_enabled(self):
+        return self.engine.dspark is not None and bool(flag("dspark", True))
+
+    def pf_active(self, sid):
+        """STPD PF_ACTIVE: another session's prefill is admitted and unfinished (running, queued or suspended). Runtime
+        flag dspark_pf_share > 0 (default 0: always set then) clears it while a running preemptible chunk's decode share
+        is below dspark_pf_share x preempt_share -- off by default: at c2 that rule oscillates (box drafting pushes the
+        decode share over the threshold, Mac drafting pulls it back under; SPEC V2.4)."""
+        if not (any(k != sid for k in list(self.pf_need)) or self.gate.fifo):
+            return False
+        thr = float(flag("dspark_pf_share", 0.0))
+        w = preempt._win
+        if thr <= 0 or w is None:
+            return True
+        return w.step_s >= thr * float(flag("preempt_share", preempt.SHARE)) * (time.perf_counter() - w.t0)
+
+    def ring(self, sid, header, payload):
+        """RING: prime / re-prime this session's ring. No reply; the result shows in the next STPD (RING_OK, reason)."""
+        try:
+            h = json.loads(header)
+        except ValueError:
+            raise WIRE.WireError("bad_ring", "RING header is not JSON")
+        r = WIRE.decode_ring(h if isinstance(h, dict) else {}, payload, self.max_pos)
+        if sid is None or r["session"] != sid:
+            raise WIRE.WireError("bad_session", f"RING session {r['session']} on connection session {sid}")
+        ds = self.dsp.get(sid)
+        if ds is None:
+            raise WIRE.WireError("dspark_not_granted", "RING on a session without the dspark grant")
+        self.dsp_stats["rings"] += 1
+        ds.ring_ok = False
+        if not self._dspark_enabled():
+            ds.ring_reason = WIRE.REASON["ring_not_ok"]
+            return
+        if r["digest_ok"] is False:
+            ds.ring_reason = WIRE.REASON["ring_rejected"]
+            log(f"session {sid}: RING sha256 mismatch (offset {r['offset']}): ring rejected")
+            return
+        cmd = ("ring", sid, ds.slot, r["offset"], bytes(r["keys"]), r["keys_rows"], bytes(r["taps"]), r["taps_rows"])
+        try:
+            self.run_now(cmd).wait()
+        except RuntimeError as e:
+            ds.ring_reason = WIRE.REASON["ring_rejected"]
+            log(f"session {sid}: RING job failed, ring rejected: {str(e).splitlines()[0][:300]}")
+            return
+        ds.ring_ok, ds.ring_offset, ds.ring_reason = True, r["offset"], 0
+
+    def stepd(self, conn, sid, header, payload):
+        """STEPD: accept check -> [append committed taps] -> [draft] -> step -> STPD (one GPU job on every rank)."""
+        t0 = time.perf_counter()
+        f = WIRE.decode_stepd(header, payload, self.max_pos)
+        if sid is None or f["session"] != sid:
+            raise WIRE.WireError("bad_session", f"STEPD session {f['session']} on connection session {sid}")
+        ds = self.dsp.get(sid)
+        if ds is None:
+            raise WIRE.WireError("dspark_not_granted", "STEPD on a session without the dspark grant")
+        keep, anchor, nver, a, mode, flags = f["keep"], f["anchor"], f["nver"], f["a"], f["mode"], f["flags"]
+        expect = None
+        if nver:
+            WIRE.check_accept(ds.pending, keep, anchor, nver, a, f["argmax"])
+            expect = (ds.pending[0], nver)
+        else:
+            base = ds.pending[0] if ds.pending is not None else ds.length
+            if not base <= keep <= ds.length:
+                raise WIRE.WireError("bad_keep", f"kickoff keep {keep} outside [{base}, {ds.length}]")
+        enabled = self._dspark_enabled()
+        n_app = f["ntaps"]
+        app_base = keep - n_app
+        append = False
+        if not enabled:
+            if ds.ring_ok:
+                ds.ring_ok, ds.ring_reason = False, WIRE.REASON["ring_not_ok"]
+        elif nver and not n_app:  # NO_TAPS: the committed rows never reach the ring
+            if ds.ring_ok:
+                ds.ring_ok, ds.ring_reason = False, WIRE.REASON["ring_not_ok"]
+        elif n_app:
+            if ds.ring_ok and ds.ring_offset == app_base:
+                append = True
+            elif ds.ring_ok:  # a gap (a plain STEP in between, or a RING at another offset)
+                ds.ring_ok, ds.ring_reason = False, WIRE.REASON["ring_not_ok"]
+        ring_cur = ds.ring_ok and (append or ds.ring_offset == keep)
+        dmax = max(0, min(f["dmax"], self.max_pos - keep - 1))
+        if not enabled:
+            reason = WIRE.REASON["disabled"]
+        elif not ring_cur:
+            reason = ds.ring_reason or WIRE.REASON["ring_not_ok"]
+        elif mode == WIRE.MODE_BOX and keep < WIRE.MIN_CTX:
+            reason = WIRE.REASON["short_context"]
+        elif mode == WIRE.MODE_BOX and dmax < 1:
+            reason = WIRE.REASON["dmax_zero"]
+        else:
+            reason = 0
+        draft = mode == WIRE.MODE_BOX and reason == 0
+        # SPEC V2.3: a mode 0 fallback at >= MIN_CTX answers [anchor, anchor] (a filler draft; any draft is exact), so the
+        # Mac verify stays on its L >= 2 path; short context, dmax 0 and the context end stay bonus only
+        filler = mode == WIRE.MODE_BOX and not draft and reason in (1, 2, 5) and keep >= WIRE.MIN_CTX and dmax >= 1
+        costs = WIRE.tier(ds.costs["fused" if flags & WIRE.F_FUSED else "pipe"], keep) if draft else None
+        explicit = f["explicit"] if mode == WIRE.MODE_EXPLICIT else ([anchor] if filler else [])
+        cmd = ("stepd", sid, ds.slot, keep, anchor, app_base, n_app if append else 0, bytes(f["taps"]) if append else b"",
+               draft, WIRE.WIDTH, dmax if draft else 0, costs, explicit, expect)
+        self.last_step[sid] = time.monotonic()
+        job = self.run_now(cmd) if flag("inline", True) else self.submit_async(cmd)
+        step, box_s, info = job.wait()
+        ids = info["ids"]
+        L = len(ids)
+        out = step["payload"]
+        if step["L"] != L or len(out) != L * STEP_ROW_BYTES:
+            raise RuntimeError(f"stepd payload {len(out)} bytes for L={L}")
+        ds.pending, ds.length = (keep, ids), keep + L
+        if append:
+            ds.ring_offset = keep
+        drafted = info["drafted"]
+        rflags = ((WIRE.R_DRAFTED if drafted else 0) | (WIRE.R_PF_ACTIVE if self.pf_active(sid) else 0)
+                  | (WIRE.R_RING_OK if ring_cur else 0) | (0 if enabled else WIRE.R_DISABLED))
+        if drafted or filler:
+            mode_used = WIRE.MODE_BOX
+        elif mode == WIRE.MODE_EXPLICIT:
+            mode_used = WIRE.MODE_EXPLICIT
+        else:
+            mode_used = WIRE.MODE_BONUS
+        if drafted:
+            drafts, maxprob = info["toks"], info["probs"]
+        elif filler:
+            drafts, maxprob = [anchor] * WIRE.WIDTH, [0.0] * WIRE.WIDTH
+        else:
+            drafts, maxprob = (), ()
+        hdr = WIRE.encode_stpd_header(sid, keep, L, box_s, a if nver else WIRE.A_BOX_NONE, mode_used, rflags, reason,
+                                      drafts=drafts, maxprob=maxprob, drafter_ms=info["drafter_ms"])
+        conn.sendall(FRAME.pack(WIRE.TAG_STPD, len(hdr), len(out)) + hdr + out)
+        st = self.dsp_stats
+        kind = "filler" if filler else ("box", "explicit", "bonus")[mode_used]
+        st["cycles"][kind] = st["cycles"].get(kind, 0) + 1
+        if mode == WIRE.MODE_BOX and not drafted:
+            name = WIRE.REASONS.get(reason, str(reason))
+            st["fallbacks"][name] = st["fallbacks"].get(name, 0) + 1
+        if drafted:
+            st["drafter_ms"].append(round(info["drafter_ms"], 3))
+            del st["drafter_ms"][:-512]
+        if os.environ.get("SPLIT_NV_STEP_LOG") or flag("step_log", False):
+            log(f"session {sid} stepd keep={keep} nver={nver} a={a} mode={mode}->{mode_used} L={L} reason={reason} "
+                f"app={n_app if append else 0} box={box_s * 1e3:.2f}ms drafter={info['drafter_ms']:.2f}ms "
+                f"total={(time.perf_counter() - t0) * 1e3:.2f}ms")
+
+    def step_taps(self, conn, sid, keep, ids, taps):
+        """SPEC V2.2: STEP(keep, ids) of a granted session with the committed rows' taps [keep - n, keep) after the ids:
+        exactly the plain STEP (STPR reply, same rows) plus the ring append a STEPD would do, so a Mac-side fallback to
+        plain STEP leaves no ring gap. As a STEP: no accept check; keep follows the STEP rules."""
+        ds = self.dsp[sid]
+        n = len(taps) // WIRE.TAP_ROW_BYTES
+        L = len(ids)
+        base = ds.pending[0] if ds.pending is not None else ds.length
+        if not base <= keep <= ds.length or n > keep:
+            raise WIRE.WireError("bad_keep", f"STEP+taps keep {keep} outside [{base}, {ds.length}] or {n} taps rows")
+        if keep + L > self.max_pos:
+            raise WIRE.WireError("context_exceeded", f"context length {self.max_pos} exceeded at {keep + L}")
+        append = self._dspark_enabled() and ds.ring_ok and ds.ring_offset == keep - n
+        if not append and ds.ring_ok:
+            ds.ring_ok, ds.ring_reason = False, WIRE.REASON["ring_not_ok"]
+        cmd = ("stepd", sid, ds.slot, keep, ids[0], keep - n, n if append else 0, bytes(taps) if append else b"", False,
+               WIRE.WIDTH, 0, None, ids[1:], None)
+        self.last_step[sid] = time.monotonic()
+        job = self.run_now(cmd) if flag("inline", True) else self.submit_async(cmd)
+        step, box_s, info = job.wait()
+        out = step["payload"]
+        if step["L"] != L or len(out) != L * STEP_ROW_BYTES:
+            raise RuntimeError(f"step payload {len(out)} bytes for L={L}")
+        conn.sendall(FRAME.pack(b"STPR", STPR_HDR.size, len(out)) + STPR_HDR.pack(sid, keep + L, L, len(out), box_s) + out)
+        ds.pending, ds.length = (keep, ids), keep + L
+        if append:
+            ds.ring_offset = keep
+        self.dsp_stats["step_taps"] = self.dsp_stats.get("step_taps", 0) + 1
+
+    def dspark_summary(self):
+        D = self.engine.dspark
+        ms = sorted(self.dsp_stats["drafter_ms"])
+        pct = (lambda q: ms[min(len(ms) - 1, int(q * len(ms)))] if ms else None)
+        return {"loaded": D is not None, "flag": bool(flag("dspark", True)), "sessions": len(self.dsp),
+                "free_slots": len(self.dsp_free), **({"drafter": D.summary(), "load": getattr(D, "load_info", None)} if D else {}),
+                **{k: v for k, v in self.dsp_stats.items() if k != "drafter_ms"},
+                "drafter_ms_p50": pct(0.5), "drafter_ms_p90": pct(0.9)}
 
 
 def install_signals(front):

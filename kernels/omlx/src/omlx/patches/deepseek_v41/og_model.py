@@ -53,7 +53,7 @@ STATS = dict(opened=0, open_failed=0, open_retries=0, closed=0, steps=0, box_s=0
              payload_s=0.0, single_calls=0, multi_calls=0, present_hits=0, presend_errors=0, box_lost=0,
              box_resumed=0, box_resumed_tokens=0, delta_opens=0, delta_rows=0, delta_retries=0,
              import_failed=0, import_fallbacks=0, kickoff_sent=0, kickoff_errors=0, fused_calls=0, fused_steps=0, draft_batches=0)
-spec_probe.bind(STATS)  # stats-only copy-lock pre-send probe (DS41_OG_SPEC_PROBE): spec_probe_* keys
+spec_probe.bind(STATS)  # retired copy-lock pre-send probe (DS41_OG_SPEC_PROBE=1 to re-enable): spec_probe_* keys
 BOX_CACHE = os.environ.get('DS41_OG_BOX_CACHE', '1') == '1'
 STATE = os.environ.get('DS41_OG_STATE', 'lean')
 STREAM = os.environ.get('DS41_OG_STREAM', '1') == '1'
@@ -467,6 +467,9 @@ def load(path, **kwargs):
 
     language_model = load_decoder(path, cls=OgLanguageModel)
     woa_compact.install(language_model)
+    from . import dspark
+    dspark.bind(STATS)  # draft_head_* keys in /og/stats
+    dspark.install_draft_head(language_model)  # DS41_DRAFT_HEAD=mxfp8: quantize the draft head now
     tokenizer = PreTrainedTokenizerFast.from_pretrained(path)
     tokenizer.has_tool_calling = True
     tokenizer.tool_call_start = tool_call_start

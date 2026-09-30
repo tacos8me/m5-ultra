@@ -3851,6 +3851,40 @@ index 00000000..de0157d7
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/benchmarks/og/c4ab_trace.sh b/benchmarks/og/c4ab_trace.sh
+new file mode 100755
+index 00000000..e1c7c7c4
+--- /dev/null
++++ b/benchmarks/og/c4ab_trace.sh
+@@ -0,0 +1,28 @@
++#!/bin/bash
++# Metal System Trace of the served og worker during a c4ab run at c2 or c4 (engine-loop-pipeline go/no-go).
++# WINDOW ONLY (observation; sends c4ab traffic to :8080). Usage: benchmarks/og/c4ab_trace.sh LABEL C [SECONDS]
++# Waits for the discarded warm-up group and measured group 0, then records SECONDS (default 4) inside group 1,
++# i.e. in steady cN decode. Output in ~/llm/ds41/next4: LABEL.trace, LABEL.c4ab.log, og/stats before/after,
++# and the xt_rounds.py split (GO if within_step_a_ms >= 1.5).
++set -uo pipefail
++LABEL=$1; C=$2; SECS=${3:-4}
++TREE=$(cd "$(dirname "$0")/../.." && pwd)
++OUT=$HOME/llm/ds41/next4; mkdir -p "$OUT"
++PY=$HOME/llm/.venv-ds41-omlx-tiles/bin/python
++H=$(curl -s --max-time 3 localhost:10001/health)
++PID=$(printf '%s' "$H" | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["pid"] if d.get("status")=="ok" and d.get("inflight")==0 else "")')
++[[ -n $PID ]] || { echo "og worker not ready/idle: $H"; exit 1; }
++lsof -p "$PID" 2>/dev/null | grep -q "$TREE/omlx/custom_kernels" || { echo "worker $PID does not map $TREE kernels (omlx-server renames its command)"; exit 1; }
++curl -s localhost:12147/og/stats > "$OUT/$LABEL.stats0.json"
++"$PY" -u "$TREE/benchmarks/og/c4ab.py" run "$LABEL" --c "$C" --groups 4 --url http://127.0.0.1:8080 --out "$OUT" \
++    > "$OUT/$LABEL.c4ab.log" 2>&1 &
++BP=$!
++for _ in $(seq 1 1500); do grep -q '"group": 0' "$OUT/$LABEL.c4ab.log" 2>/dev/null && break; sleep 0.2; done
++sleep 1.0  # group 1 admission (box OPENs + Mac import) before steady decode
++rm -rf "$OUT/$LABEL.trace"
++xcrun xctrace record --template "Metal System Trace" --attach "$PID" --time-limit "${SECS}s" \
++    --output "$OUT/$LABEL.trace" > "$OUT/$LABEL.xctrace.log" 2>&1
++wait $BP
++curl -s localhost:12147/og/stats > "$OUT/$LABEL.stats1.json"
++tail -1 "$OUT/$LABEL.c4ab.log"
++"$PY" "$TREE/benchmarks/og/xt_rounds.py" "$OUT/$LABEL.trace" --c "$C" --skip-ms 0 | tee "$OUT/$LABEL.rounds.txt"
 diff --git a/benchmarks/og/cache_gate.py b/benchmarks/og/cache_gate.py
 new file mode 100644
 index 00000000..2a411f11
@@ -5849,6 +5883,208 @@ index 00000000..be45fa00
 +
 +
 +main()
+diff --git a/benchmarks/og/head_mxfp8_bench.py b/benchmarks/og/head_mxfp8_bench.py
+new file mode 100644
+index 00000000..f488d0ac
+--- /dev/null
++++ b/benchmarks/og/head_mxfp8_bench.py
+@@ -0,0 +1,196 @@
++"""MXFP8 draft head (DS41_DRAFT_HEAD=mxfp8): bitwise + timing gate on the real 129280x5120 head. GPU, WINDOW ONLY.
++
++Loads only language_model.head.weight (BF16, 1.32 GB) from the og checkpoint, quantizes it to MXFP8 exactly
++as dspark.install_draft_head does (+0.68 GB), and for M = 1..8 query rows checks:
++  bitwise    og_fused._rows (fast_qmv rows kernel = the draft-head path) == mx.quantized_matmul(mode='mxfp8')
++             at M = 2..5 (required: MLX's qmv_wide, same lanes/order). M = 1 is reported only: MLX's M=1 path
++             is qmv_fast (fast_qmv._fast_kernel is its replica, also reported); cost-policy drafts are 4 rows
++             single and 8 rows per fused pair, never 1.
++  invariant  the rows kernel's row q is bitwise the same at every M > q and for a 4+4 split (single draft
++             M=4 == its half of a batched pair draft M=8). Required.
++  e2e        dspark.draft_logits / dspark.batch_logits with DS41_DRAFT_HEAD=mxfp8: cost policy -> the rows
++             kernel, no cost policy -> the BF16 head, batched (mixed policies) == single. Required.
++  f32        the same rows kernel with FP32 in/out (unrounded logits) rounds to the BF16 result (informational).
++  timing     GPU ms per dependent launch at M = 1..8: BF16 head (project_logits single path, _head_rows
++             batched path), MXFP8 rows, the full MXFP8 draft path, MXFP8 rows FP32 in/out, MLX qmm mxfp8.
++             Watch M=8 against M=4 (register-spill risk at the pair shape).
++
++Needs gpu.lock (refuses otherwise; HB_NO_LOCK=1 = idle_guard mode alongside an idle production worker):
++  cd ~/src/wt/ds41-next4 && GPU_LOCK_WAIT=120 ~/llm/bin/gpu-exec \
++      ~/llm/.venv-ds41-omlx-tiles/bin/python -u benchmarks/og/head_mxfp8_bench.py
++Output: JSON lines on stdout and in ~/llm/ds41/next4/head_mxfp8_bench.jsonl; exit 1 if a required check fails.
++"""
++import json
++import os
++from pathlib import Path
++import statistics
++import subprocess
++import sys
++import time
++from types import SimpleNamespace
++
++ROOT = Path(__file__).resolve().parents[2]
++sys.path.insert(0, str(ROOT))
++os.environ['DS41_TREE'] = str(ROOT)
++os.environ.setdefault('MLX_ENABLE_TF32', '0')
++os.environ['DS41_DRAFT_HEAD'] = 'mxfp8'  # dspark reads it at import
++HOME = Path.home()
++LOCK = HOME/'llm/locks/gpu.lock'
++MODEL = Path(os.environ.get('HB_MODEL', str(HOME/'llm/ds41/og/models/ds41-og')))
++OUT = Path(os.environ.get('HB_OUT', str(HOME/'llm/ds41/next4/head_mxfp8_bench.jsonl')))
++CALLS, REPS, WARM = 10, 15, 3
++FAIL = []
++
++
++def emit(**record):
++    line = json.dumps(record)
++    print(line, flush=True)
++    OUT.parent.mkdir(parents=True, exist_ok=True)
++    with OUT.open('a') as out:
++        out.write(line + '\n')
++
++
++def holds_lock():
++    if os.environ.get('HB_NO_LOCK') == '1':
++        return True
++    holders = subprocess.run(['lsof', '-t', str(LOCK)], capture_output=True, text=True).stdout.split()
++    return str(os.getpid()) in holders or str(os.getppid()) in holders
++
++
++if not holds_lock():
++    sys.exit(f'head_mxfp8_bench: run under ~/llm/bin/gpu-exec (this process must hold {LOCK})')
++
++import mlx.core as mx  # noqa: E402
++import numpy as np  # noqa: E402
++
++mx.set_memory_limit(24 << 30)
++mx.set_cache_limit(1 << 30)
++from omlx.patches.deepseek_v41 import dspark, fast_qmv, head, og_fused  # noqa: E402
++
++
++def mismatches(a, b):
++    """Differing elements, compared as raw bits."""
++    if a.shape != b.shape or a.dtype != b.dtype:
++        return -1
++    view = {mx.bfloat16: mx.uint16, mx.float16: mx.uint16, mx.float32: mx.uint32}.get(a.dtype)
++    a, b = mx.contiguous(a), mx.contiguous(b)
++    if view is not None:
++        a, b = a.view(view), b.view(view)
++    return int((np.array(a) != np.array(b)).sum())
++
++
++def require(name, bad, **extra):
++    ok = bad == 0
++    if not ok:
++        FAIL.append(name)
++    emit(check=name, ok=ok, mismatches=bad, **extra)
++
++
++def load_head():
++    index = json.loads((MODEL/'model.safetensors.index.json').read_text())['weight_map']
++    key = next(k for k in index if k.endswith('head.weight') and '.mtp.' not in k and 'markov' not in k)
++    weight = mx.load(str(MODEL/index[key]))[key]  # lazy: only this tensor is read
++    mx.eval(weight)
++    return key, weight
++
++
++def gpu_ms(step, x):
++    """Median GPU ms per launch: CALLS dependent launches minus one, per extra launch."""
++    def run(n):
++        times = []
++        for rep in range(REPS + WARM):
++            y, outs = x, []
++            mx.synchronize()
++            t = time.perf_counter()
++            for _ in range(n):
++                o = step(y)
++                outs.append(o)
++                y = x + (o[..., :1, :1] * 0).astype(x.dtype)  # the next launch waits for this one
++            mx.eval(outs)
++            if rep >= WARM:
++                times.append(time.perf_counter() - t)
++        return statistics.median(times)
++    return round((run(CALLS) - run(1)) / (CALLS - 1) * 1e3, 4)
++
++
++def main():
++    assert mx.default_device() == mx.gpu, 'needs the GPU'
++    t = time.perf_counter()
++    key, weight = load_head()
++    n, k = weight.shape
++    emit(event='loaded', key=key, shape=[n, k], dtype=str(weight.dtype), s=round(time.perf_counter() - t, 2))
++    if (n, k) != (129280, 5120) or weight.dtype != mx.bfloat16:
++        FAIL.append('head_shape')
++    model = SimpleNamespace(head=SimpleNamespace(weight=weight))
++    summary = dspark.install_draft_head(model)  # prints the same draft_head line the og worker logs
++    emit(event='quantized', **{k: v for k, v in (summary or {}).items() if k != 'event'})
++    q = dspark._draft_head(model)
++    rng = [mx.random.normal((1, 8, k), key=mx.random.key(seed)).astype(mx.bfloat16) * scale
++           for seed, scale in ((1, 1.0), (2, 4.0), (3, 0.25))]
++    mx.eval(rng)
++
++    # bitwise vs MLX (M <= 5), M-invariance (M = 1..8), 4+4 split
++    for s, x8 in enumerate(rng):
++        full = og_fused._rows(q, x8)
++        for m in range(1, 9):
++            xm = x8[:, :m]
++            rows = og_fused._rows(q, xm)
++            require(f'invariant_M{m}_set{s}', mismatches(rows, full[:, :m]), M=m)
++            f32 = og_fused._rows(q, xm.astype(mx.float32))
++            emit(check=f'f32_rounds_to_rows_M{m}_set{s}', info=True,
++                 mismatches=mismatches(f32.astype(mx.bfloat16), rows))
++            if m <= 5:
++                ref = mx.quantized_matmul(xm, q.weight, q.scales, transpose=True, group_size=32, bits=8, mode='mxfp8')
++                bad = mismatches(rows, ref)
++                if m == 1:
++                    emit(check=f'vs_mlx_M1_set{s}', info=True, rows_kernel_mismatches=bad,
++                         fast_m1_kernel_mismatches=mismatches(fast_qmv.mxfp8_qmv(xm, q.weight, q.scales), ref))
++                else:
++                    require(f'vs_mlx_M{m}_set{s}', bad, M=m)
++        split = mx.concatenate([og_fused._rows(q, x8[:, :4]), og_fused._rows(q, x8[:, 4:])], 1)
++        require(f'split_4+4_set{s}', mismatches(split, full))
++
++    # the draft path itself (single, batched, mixed policies)
++    x8 = rng[0]
++    a, b = x8[:, :4], x8[:, 4:]
++    require('draft_mxfp8_is_rows', mismatches(dspark.draft_logits(model, a, True),
++                                              og_fused._rows(q, a).astype(mx.float32)))
++    require('draft_bf16_is_head', mismatches(dspark.draft_logits(model, a, False), og_fused._head_rows(weight, a)))
++    for policy in ([True, True], [True, False], [False, True], [False, False]):
++        batched = dspark.batch_logits(model, [a, b], 4, policy)
++        single = [dspark.draft_logits(model, x, p) for x, p in zip((a, b), policy)]
++        require(f'batched_is_single_{policy}', sum(mismatches(u, v) for u, v in zip(batched, single)))
++
++    # timing
++    wbytes = {'bf16': n * k * 2, 'mxfp8': n * k + n * k // 32}
++    variants = {
++        'bf16_project': (lambda y: head.project_logits(y, model.head), 'bf16', 5),  # single path (M<=5 kernels)
++        'bf16_head_rows': (lambda y: og_fused._head_rows(weight, y), 'bf16', 8),  # batched path
++        'mxfp8_rows': (lambda y: og_fused._rows(q, y), 'mxfp8', 8),
++        'mxfp8_draft': (lambda y: dspark.draft_logits(model, y, True), 'mxfp8', 8),  # rows + FP32 cast
++        'mxfp8_rows_f32io': (lambda y: og_fused._rows(q, y.astype(mx.float32)), 'mxfp8', 8),
++        'mlx_qmm_mxfp8': (lambda y: mx.quantized_matmul(y, q.weight, q.scales, transpose=True, group_size=32,
++                                                        bits=8, mode='mxfp8'), 'mxfp8', 8),
++    }
++    table = {}
++    for m in range(1, 9):
++        x = rng[0][:, :m]
++        for name, (step, kind, max_m) in variants.items():
++            if m > max_m:
++                continue
++            ms = gpu_ms(step, x)
++            table.setdefault(name, {})[m] = ms
++            emit(timing=name, M=m, ms=ms, gb_s=round(wbytes[kind] / ms / 1e6, 1) if ms > 0 else None)
++    t = table
++    emit(summary='timing',
++         single_M4_saved_ms=round(t['bf16_project'][4] - t['mxfp8_draft'][4], 4),
++         pair_M8_saved_ms=round(t['bf16_head_rows'][8] - t['mxfp8_draft'][8], 4),
++         mxfp8_M8_over_M4=round(t['mxfp8_rows'][8] / t['mxfp8_rows'][4], 3),
++         bf16_M8_over_M4=round(t['bf16_head_rows'][8] / t['bf16_head_rows'][4], 3),
++         expected='verdict: BF16 head ~1.18 ms at M=4, MXFP8 ~0.78 ms (-0.40); pair M=8 -0.55 ms')
++    emit(summary='gates', ok=not FAIL, failed=FAIL)
++    return 0 if not FAIL else 1
++
++
++if __name__ == '__main__':
++    sys.exit(main())
 diff --git a/benchmarks/og/host_ab.sh b/benchmarks/og/host_ab.sh
 new file mode 100755
 index 00000000..622744ac
@@ -10167,6 +10403,152 @@ index 00000000..dfb64592
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/benchmarks/og/xt_rounds.py b/benchmarks/og/xt_rounds.py
+new file mode 100644
+index 00000000..18dcf6b9
+--- /dev/null
++++ b/benchmarks/og/xt_rounds.py
+@@ -0,0 +1,140 @@
++"""Per-round GPU idle split from a Metal System Trace of the og worker (engine-loop-pipeline go/no-go).
++
++  python benchmarks/og/xt_rounds.py TRACE --c {1,2,4} [--proc python] [--merge-us 150] [--fwd-ms 8] [--skip-ms 300]
++
++Reads the metal-gpu-intervals table (xcrun xctrace export; CPU only), takes the worker's depth-0 GPU
++intervals, merges them into busy runs, and joins runs separated by idle gaps < --merge-us into blocks.
++Blocks of at least --fwd-ms are verify forwards (c4 fused pair ~22 ms, c2 one request ~15 ms, c1 ~21 ms);
++the shorter blocks after a forward are its draft phase (DSpark stages + head + Markov, ~4-6 ms). Gaps:
++  fwd_to_draft  forward end -> next block (accept, rollback, DSpark build): THREADS verdict class (c)
++  in_draft      between draft-phase blocks (stage async_evals, draft finish sync)
++  handoff       draft phase end -> next forward start: within-step (a) or cross-step (b)
++c2 and c4 run two verify passes per scheduler step (A then B, or pair 1 then pair 2), so handoffs alternate
++a, b. The GPU alone cannot tell which is which: both alternating series are reported, the smaller median is
++taken as within-step (a) and the larger as cross-step (b), which also pays replace_rows + emit + the
++scheduler gap. At c1 the handoff is the box round trip (one series).
++Decision (THREADS 2a / verify:engine-loop-pipeline): GO if median(a) >= 1.5 ms per round. Check the printed
++block sequence first: a forward split by an internal gap >= --merge-us shows up as two long blocks in a row.
++"""
++import argparse
++import json
++import statistics
++import subprocess
++import sys
++import xml.etree.ElementTree as ET
++
++
++def intervals(trace, proc):
++    xml = subprocess.run(['xcrun', 'xctrace', 'export', '--input', trace, '--xpath',
++                          '/trace-toc/run[@number="1"]/data/table[@schema="metal-gpu-intervals"]'],
++                         capture_output=True, text=True, check=True).stdout
++    root = ET.fromstring(xml)
++    ids = {}
++
++    def val(el):
++        if el is None:
++            return None
++        if 'ref' in el.attrib:
++            return ids.get(el.attrib['ref'])
++        v = (el.text, el.attrib.get('fmt', el.text))
++        if 'id' in el.attrib:
++            ids[el.attrib['id']] = v
++        return v
++
++    schema = [c.find('mnemonic').text for c in root.iter('col')]
++    out = []
++    for row in root.iter('row'):
++        rec = {}
++        for name, el in zip(schema, list(row)):
++            rec[name] = val(el)
++            for sub in el.iter():
++                if 'id' in sub.attrib and sub.attrib['id'] not in ids:
++                    ids[sub.attrib['id']] = (sub.text, sub.attrib.get('fmt', sub.text))
++        p = rec.get('process')
++        if proc not in ((p or ('', ''))[1] or ''):
++            continue
++        depth = rec.get('event-depth')
++        if depth and depth[1] not in (None, '0'):
++            continue
++        start = int(rec['start'][0])
++        out.append((start, start + int(rec['duration'][0])))
++    return sorted(out)
++
++
++def blocks_of(ivs, merge_ns):
++    runs = []
++    for s, e in ivs:
++        if runs and s <= runs[-1][1]:
++            runs[-1][1] = max(runs[-1][1], e)
++        else:
++            runs.append([s, e])
++    blocks = []
++    for s, e in runs:
++        if blocks and s - blocks[-1][1] < merge_ns:
++            blocks[-1][1] = max(blocks[-1][1], e)
++        else:
++            blocks.append([s, e])
++    return runs, blocks
++
++
++def med(xs):
++    return round(statistics.median(xs), 3) if xs else None
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    ap.add_argument('trace')
++    ap.add_argument('--c', type=int, required=True, choices=(1, 2, 4), help='concurrency the trace was taken at')
++    ap.add_argument('--proc', default='python')
++    ap.add_argument('--merge-us', type=float, default=150)
++    ap.add_argument('--fwd-ms', type=float, default=8)
++    ap.add_argument('--skip-ms', type=float, default=300, help='drop the first ms of the trace (attach transient)')
++    ap.add_argument('--show', type=int, default=24, help='print the first N blocks')
++    a = ap.parse_args()
++    ivs = intervals(a.trace, a.proc)
++    if not ivs:
++        print(json.dumps(dict(error='no GPU intervals for process', proc=a.proc)))
++        return 1
++    t0 = ivs[0][0] + a.skip_ms * 1e6
++    ivs = [(s, e) for s, e in ivs if s >= t0]
++    runs, blocks = blocks_of(ivs, a.merge_us * 1e3)
++    span = blocks[-1][1] - blocks[0][0]
++    busy = sum(e - s for s, e in runs)
++    kind = ['F' if (e - s) >= a.fwd_ms * 1e6 else 'd' for s, e in blocks]
++    gaps = {'fwd_to_draft': [], 'in_draft': [], 'handoff': []}
++    handoffs = []
++    for i in range(1, len(blocks)):
++        g = (blocks[i][0] - blocks[i - 1][1]) / 1e6
++        if kind[i - 1] == 'F':
++            gaps['fwd_to_draft'].append(g)
++        elif kind[i] == 'F':
++            gaps['handoff'].append(g)
++            handoffs.append(g)
++        else:
++            gaps['in_draft'].append(g)
++    small_ms = sum(e - s for s, e in blocks) / 1e6 - busy / 1e6  # idle hidden inside blocks (< merge-us gaps)
++    forwards = kind.count('F')
++    even, odd = handoffs[0::2], handoffs[1::2]
++    a_series, b_series = sorted((even, odd), key=lambda s: med(s) if s else 1e9)
++    per_pass = {k: dict(n=len(v), median_ms=med(v), total_ms_per_pass=round(sum(v) / max(1, forwards), 3))
++                for k, v in gaps.items()}
++    print(json.dumps(dict(trace=a.trace, proc=a.proc, span_ms=round(span / 1e6, 1), busy_pct=round(100 * busy / span, 1),
++                          blocks=len(blocks), forwards=forwards,
++                          forward_ms_median=med([(e - s) / 1e6 for (s, e), k in zip(blocks, kind) if k == 'F']),
++                          draft_phase_block_ms_median=med([(e - s) / 1e6 for (s, e), k in zip(blocks, kind) if k == 'd']),
++                          sub_merge_idle_ms_per_pass=round(small_ms / max(1, forwards), 3), gaps=per_pass)))
++    print(json.dumps(dict(handoff_even=dict(n=len(even), median_ms=med(even)), handoff_odd=dict(n=len(odd), median_ms=med(odd)),
++                          within_step_a_ms=med(a_series) if a.c > 1 else None,
++                          cross_step_b_ms=med(b_series) if a.c > 1 else None,
++                          go_engine_loop_pipeline=(med(a_series) or 0) >= 1.5 if a.c > 1 else None,
++                          note='a = smaller alternating handoff series (2 passes per scheduler step at c2/c4)')))
++    seq = []
++    for i, ((s, e), k) in enumerate(zip(blocks[:a.show], kind[:a.show])):
++        gap = round((s - blocks[i - 1][1]) / 1e6, 3) if i else None
++        seq.append(f'{"" if gap is None else f"[{gap}] "}{k}{round((e - s) / 1e6, 2)}')
++    print('sequence (ms, [idle gap] Forward/draft block):', ' '.join(seq))
++    return 0
++
++
++if __name__ == '__main__':
++    sys.exit(main())
 diff --git a/benchmarks/ogs/calib.py b/benchmarks/ogs/calib.py
 new file mode 100644
 index 00000000..6b9572db
@@ -14469,10 +14851,10 @@ index 00000000..fa3ae885
 +Raw data: `~/llm/ds41/moe/dev*.jsonl`. The union and NAX sources are in the session scratchpad and can be provided on request. They are not committed (YAGNI).
 diff --git a/og_serve/PROBE-MERGE-READY.md b/og_serve/PROBE-MERGE-READY.md
 new file mode 100644
-index 00000000..ed2fa4e3
+index 00000000..c50cae70
 --- /dev/null
 +++ b/og_serve/PROBE-MERGE-READY.md
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,139 @@
 +# ds41-probe: stats-only copy-lock pre-send probe (MERGE-READY, not deployed)
 +
 +This is step 1 of `/home/ian/mac/PRESEND-FEASIBILITY.md` (Linux), variant (b), copy-lock pre-send, approved by the owner. The probe predicts, at every c1 cycle, the STEP that a copy-lock pre-send would send next, and later checks it against the STEP that is really sent. It **sends nothing extra, changes no outputs and does no GPU work**.
@@ -14497,6 +14879,7 @@ index 00000000..ed2fa4e3
 +  - `note_recv` records the box wait of hit steps.
 +- **`close_request`: one `ds41-og spec-probe <request_id>: ...` line per request.**
 +- **Flag `DS41_OG_SPEC_PROBE`:** default `1` on this branch. `0` disables every call and leaves the ds41-woa behaviour.
++  **Retired in ds41-next4:** default `0` (NO-GO: 0.55% hits on live traffic against the 15% bar); `1` re-enables it.
 +- **Test fix:** `og_serve/test_import_fallback.py` now loads `spec_probe` and stubs `woa_compact`. It already failed on ds41-woa because `woa_compact` was missing from its stub package.
 +
 +## What it counts
@@ -14966,6 +15349,264 @@ index 00000000..cba9ed77
 +Logs: `~/llm/ds41/woa/{scan,forward,layers}.jsonl`, real inputs `~/llm/ds41/woa/real-inputs.safetensors`.
 +Limits: this was a partial model (3 real layers aliased, full head + DSpark), with at most 2 box sessions and no
 +full-model or served run. The saving is measured Mac forward time. It is not measured served tok/s.
+diff --git a/og_serve/accept_classes.py b/og_serve/accept_classes.py
+new file mode 100644
+index 00000000..4b0a1e28
+--- /dev/null
++++ b/og_serve/accept_classes.py
+@@ -0,0 +1,252 @@
++"""Per-class DSpark acceptance through the served ds41 (temperature 0, c1, prompts >= 1024 tokens).
++
++Gate for the MXFP8 draft head (THREADS-2026-09-30 4.2): run once with DS41_DRAFT_HEAD unset and once with
++DS41_DRAFT_HEAD=mxfp8 on the same tree, then compare; stop if tok/cycle drops by more than 1% in any class.
++
++  python og_serve/accept_classes.py run LABEL [--base http://127.0.0.1:8080] [--model ds41] [--max-tokens 384]
++  python og_serve/accept_classes.py compare BASE_LABEL VARIANT_LABEL [--max-drop 0.01]
++  python og_serve/accept_classes.py prompts      # freeze the prompt set, print token counts (no requests)
++
++Classes, 4 prompts each (built once from this machine's stdlib and this tree's docs, frozen into
++~/llm/ds41/next4/accept-prompts.json; its sha256 is recorded and compared):
++  code   a stdlib module + an explanation question
++  prose  an English doc of this tree (code, tables, links stripped) + a flowing-prose essay/story request
++  sum8k  ~8K tokens of English docs + a five-bullet summary request
++  tool   a stdlib module + write_file/run_tests tools; the answer is a tool call with a long argument
++  cjk    README.zh/ja/ko of this tree + a request to answer in Chinese / Japanese / Korean
++Requests are non-streaming and sequential. Each one's og worker summary line (MTP[..] tokens, cycles, accept,
++copy) is read from og-child.log: the lines appended while it ran must hold exactly one MTP line, else the
++request is retried once (other traffic), then marked contaminated and left out of the sums.
++Per class: tok/cycle = sum(tokens) / sum(cycles); dspark accept = sum(accepted) / sum(proposed).
++compare: every prompt's output (content + tool calls) must be byte-identical and every prompt >= 1024
++tokens; exit 1 if a class's tok/cycle ratio VARIANT/BASE < 1 - max_drop or identity fails.
++"""
++import argparse
++import hashlib
++import json
++import os
++from pathlib import Path
++import re
++import sys
++import time
++import urllib.request
++
++HERE = Path(__file__).resolve().parent
++TREE = HERE.parent
++OUT = Path(os.environ.get('ACCEPT_OUT', str(Path.home()/'llm/ds41/next4')))
++PROMPTS = OUT/'accept-prompts.json'
++CHILD_LOG = Path(os.environ.get('DS41_OG_LOGS', str(Path.home()/'llm/ds41/og/logs')))/'og-child.log'
++MTP = re.compile(r'MTP\[\d+\] finish=(\S+) tokens=(\d+) cycles=(\d+) tok/cycle=[\d.]+ accept=(\d+)/(\d+)')
++COPY = re.compile(r'copy\[cycles=(\d+) accept=(\d+)/(\d+)\]')
++TOOLS = [
++    {'type': 'function', 'function': {
++        'name': 'write_file', 'description': 'Create or overwrite a file in the repository.',
++        'parameters': {'type': 'object', 'required': ['path', 'content'], 'properties': {
++            'path': {'type': 'string', 'description': 'Repository-relative path.'},
++            'content': {'type': 'string', 'description': 'The complete file content.'}}}}},
++    {'type': 'function', 'function': {
++        'name': 'run_tests', 'description': 'Run pytest on one test file and return the report.',
++        'parameters': {'type': 'object', 'required': ['path'], 'properties': {'path': {'type': 'string'}}}}},
++]
++CODE_Q = ['Explain in detail how this module works: its purpose, the main functions and how they interact.',
++          'Walk through the most important function in this module step by step and explain its edge cases.',
++          'Describe the data structures this module relies on and why they were chosen.',
++          'Review this module: what could go wrong in production use, and how would you harden it?']
++PROSE_Q = ['Write a reflective essay in flowing prose (no lists, no code, no headings) about the ideas in the text above.',
++           'Retell the text above as a short story told by an engineer on a night shift. Prose only, no lists or code.',
++           'Write a letter to a colleague explaining, in plain flowing prose, why the design above matters. No lists.',
++           'Write a thoughtful magazine-style column about the text above, in continuous prose without lists.']
++CJK_Q = [('README.zh.md', '请用中文详细介绍上面文档描述的项目：它解决什么问题、主要功能有哪些、以及如何开始使用。'),
++         ('README.ja.md', '上の文書が説明しているプロジェクトについて、目的、主な機能、使い方を日本語で詳しく説明してください。'),
++         ('README.ko.md', '위 문서가 설명하는 프로젝트의 목적, 주요 기능, 사용 방법을 한국어로 자세히 설명해 주세요.'),
++         ('README.zh.md', '请用中文写一篇关于上述项目设计理念的评论文章，使用连贯的段落，不要使用列表。')]
++CODE_FILES = ['heapq.py', 'json/decoder.py', 'contextlib.py', 'fnmatch.py']
++TOOL_FILES = ['calendar.py', 'base64.py', 'glob.py', 'textwrap.py']
++DOCS = ['docs/MoE_Expert_Offload.md', 'docs/heterogeneous-cluster.md', 'docs/TESTING.md', 'docs/distributed-cluster.md',
++        'README.md', 'docs/oQ_Quantization.md', 'docs/usage-analytics.md', 'docs/rdma-links.md']
++
++
++def prose_of(markdown):
++    """Markdown without code fences, tables, images, links' targets and HTML."""
++    text = re.sub(r'```.*?```', '', markdown, flags=re.S)
++    text = re.sub(r'<[^>]+>', '', text)
++    text = re.sub(r'!\[[^\]]*\]\([^)]*\)', '', text)
++    text = re.sub(r'\[([^\]]*)\]\([^)]*\)', r'\1', text)
++    lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith('|')]
++    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip()
++
++
++def build():
++    import textwrap  # the stdlib directory of this interpreter
++    lib = Path(textwrap.__file__).parent
++    items = []
++    for i, name in enumerate(CODE_FILES):
++        src = (lib/name).read_text()[:16000]
++        items.append(dict(cls='code', name=name, messages=[{'role': 'user', 'content':
++                     f'File: {name}\n```python\n{src}\n```\n\n{CODE_Q[i]}'}]))
++    for i, doc in enumerate(DOCS[:4]):
++        items.append(dict(cls='prose', name=doc, messages=[{'role': 'user', 'content':
++                     prose_of((TREE/doc).read_text())[:14000] + '\n\n' + PROSE_Q[i]}]))
++    docs = [prose_of((TREE/d).read_text()) for d in DOCS]
++    for i in range(4):
++        order = docs[i:] + docs[:i]
++        items.append(dict(cls='sum8k', name=f'docs@{i}', messages=[{'role': 'user', 'content':
++                     '\n\n---\n\n'.join(order)[:32000] + '\n\nSummarize the documents above in five bullet points.'}]))
++    for name in TOOL_FILES:
++        src = (lib/name).read_text()[:14000]
++        items.append(dict(cls='tool', name=name, tools=TOOLS, messages=[{'role': 'user', 'content':
++                     f'File: {name}\n```python\n{src}\n```\n\nWrite a thorough pytest module for the code above and '
++                     f'save it with the write_file tool as tests/test_{Path(name).stem}.py.'}]))
++    for i, (doc, question) in enumerate(CJK_Q):
++        items.append(dict(cls='cjk', name=f'{doc}#{i}', messages=[{'role': 'user', 'content':
++                     prose_of((TREE/doc).read_text())[:9000] + '\n\n' + question}]))
++    return items
++
++
++def prompts():
++    if not PROMPTS.exists():
++        OUT.mkdir(parents=True, exist_ok=True)
++        PROMPTS.write_text(json.dumps(build(), ensure_ascii=False))
++    return json.loads(PROMPTS.read_text()), hashlib.sha256(PROMPTS.read_bytes()).hexdigest()[:16]
++
++
++def chat(base, model, item, max_tokens):
++    body = dict(model=model, messages=item['messages'], max_tokens=max_tokens, temperature=0)
++    if item.get('tools'):
++        body['tools'] = item['tools']
++    req = urllib.request.Request(base + '/v1/chat/completions', json.dumps(body).encode(),
++                                 {'Content-Type': 'application/json'})
++    with urllib.request.urlopen(req, timeout=1800) as r:
++        d = json.load(r)
++    msg = d['choices'][0]['message']
++    text = (msg.get('reasoning_content') or '') + '\x00' + (msg.get('content') or '') + '\x00' + json.dumps(
++        msg.get('tool_calls') or [], sort_keys=True, ensure_ascii=False)
++    return text, d.get('usage') or {}
++
++
++def mtp_lines(offset):
++    """MTP summary lines appended to og-child.log after byte offset."""
++    with CHILD_LOG.open('rb') as f:
++        f.seek(offset)
++        lines = [line.decode(errors='replace') for line in f]
++    return [line for line in lines if MTP.search(line)]
++
++
++def measured(base, model, item, max_tokens):
++    for attempt in range(2):
++        offset = CHILD_LOG.stat().st_size
++        t = time.perf_counter()
++        text, usage = chat(base, model, item, max_tokens)
++        wall = time.perf_counter() - t
++        deadline = time.monotonic() + 5
++        lines = mtp_lines(offset)
++        while len(lines) < 1 and time.monotonic() < deadline:
++            time.sleep(0.2)
++            lines = mtp_lines(offset)
++        time.sleep(0.3)  # a concurrent request's line would land now
++        lines = mtp_lines(offset)
++        if len(lines) == 1:
++            m = MTP.search(lines[0])
++            c = COPY.search(lines[0])
++            return dict(cls=item['cls'], name=item['name'], sha=hashlib.sha256(text.encode()).hexdigest()[:16],
++                        prompt_tokens=usage.get('prompt_tokens'), completion_tokens=usage.get('completion_tokens'),
++                        finish=m.group(1), tokens=int(m.group(2)), cycles=int(m.group(3)),
++                        accepted=int(m.group(4)), proposed=int(m.group(5)),
++                        copy_cycles=int(c.group(1)) if c else 0, wall_s=round(wall, 3), text=text)
++    return dict(cls=item['cls'], name=item['name'], contaminated=len(lines),
++                sha=hashlib.sha256(text.encode()).hexdigest()[:16], prompt_tokens=usage.get('prompt_tokens'), text=text)
++
++
++def summarize(records):
++    out = {}
++    for cls in dict.fromkeys(r['cls'] for r in records):
++        rs = [r for r in records if r['cls'] == cls and 'cycles' in r]
++        tokens, cycles = sum(r['tokens'] for r in rs), sum(r['cycles'] for r in rs)
++        acc, prop = sum(r['accepted'] for r in rs), sum(r['proposed'] for r in rs)
++        out[cls] = dict(n=len(rs), tokens=tokens, cycles=cycles, tok_per_cycle=round(tokens / cycles, 4) if cycles else None,
++                        accept=round(acc / prop, 4) if prop else None, copy_cycles=sum(r['copy_cycles'] for r in rs),
++                        min_prompt_tokens=min((r['prompt_tokens'] or 0) for r in records if r['cls'] == cls))
++    return out
++
++
++def show(args):
++    items, sha = prompts()
++    try:
++        from tokenizers import Tokenizer
++        tok = Tokenizer.from_file(args.tokenizer)
++    except Exception as exc:  # noqa: BLE001 -- counts are optional
++        tok = None
++        print(json.dumps(dict(tokenizer_unavailable=repr(exc)[:200])))
++    for item in items:
++        text = '\n'.join(m['content'] for m in item['messages'])
++        n = len(tok.encode(text).ids) if tok else None
++        print(json.dumps(dict(cls=item['cls'], name=item['name'], chars=len(text), tokens=n,
++                              ok=None if n is None else n >= 1100), ensure_ascii=False))
++    names = [(i['cls'], i['name']) for i in items]
++    assert len(set(names)) == len(names), 'prompt names must be unique per class'
++    print(json.dumps(dict(file=str(PROMPTS), prompts_sha=sha, n=len(items))))
++    return 0
++
++
++def run(args):
++    items, sha = prompts()
++    base = args.base.rstrip('/')
++    print(json.dumps(dict(event='start', label=args.label, prompts_sha=sha, n=len(items), log=str(CHILD_LOG))), flush=True)
++    chat(base, args.model, dict(messages=[{'role': 'user', 'content': 'Say ready.'}]), 8)  # warm-up
++    records = []
++    for item in items:
++        r = measured(base, args.model, item, args.max_tokens)
++        records.append(r)
++        print(json.dumps({k: v for k, v in r.items() if k != 'text'}, ensure_ascii=False), flush=True)
++    res = dict(label=args.label, prompts_sha=sha, max_tokens=args.max_tokens, time=time.time(), records=records,
++               summary=summarize(records))
++    OUT.mkdir(parents=True, exist_ok=True)
++    path = OUT/f'accept-{args.label}.json'
++    path.write_text(json.dumps(res, ensure_ascii=False, indent=1))
++    print(json.dumps(dict(event='done', file=str(path), summary=res['summary'])), flush=True)
++    return 0
++
++
++def compare(args):
++    base, var = (json.loads((OUT/f'accept-{label}.json').read_text()) for label in (args.base, args.variant))
++    ok = base['prompts_sha'] == var['prompts_sha'] and base['max_tokens'] == var['max_tokens']
++    if not ok:
++        print(json.dumps(dict(error='different prompts or max_tokens')))
++    by = {(r['cls'], r['name']): r for r in base['records']}
++    diff = [f"{r['cls']}/{r['name']}" for r in var['records'] if by.get((r['cls'], r['name']), {}).get('sha') != r['sha']]
++    short = [f"{r['cls']}/{r['name']}" for r in base['records'] + var['records'] if (r.get('prompt_tokens') or 0) < 1024]
++    dirty = [f"{r['cls']}/{r['name']}" for r in base['records'] + var['records'] if 'cycles' not in r]
++    print(json.dumps(dict(identical=not diff, differing=diff, under_1024=short, contaminated=dirty)))
++    ok &= not diff and not short
++    for cls, b in base['summary'].items():
++        v = var['summary'].get(cls) or {}
++        ratio = (v['tok_per_cycle'] / b['tok_per_cycle']) if b.get('tok_per_cycle') and v.get('tok_per_cycle') else None
++        passed = ratio is not None and ratio >= 1 - args.max_drop
++        ok &= passed
++        print(json.dumps(dict(cls=cls, base=b['tok_per_cycle'], variant=v.get('tok_per_cycle'),
++                              ratio=round(ratio, 4) if ratio else None, accept_base=b['accept'],
++                              accept_variant=v.get('accept'), cycles=[b['cycles'], v.get('cycles')], pass_=passed)))
++    print(json.dumps(dict(accept_gate_ok=ok, max_drop=args.max_drop)))
++    return 0 if ok else 1
++
++
++def main():
++    ap = argparse.ArgumentParser()
++    sub = ap.add_subparsers(dest='cmd', required=True)
++    r = sub.add_parser('run')
++    r.add_argument('label')
++    r.add_argument('--base', default='http://127.0.0.1:8080')
++    r.add_argument('--model', default='ds41')
++    r.add_argument('--max-tokens', type=int, default=384)
++    c = sub.add_parser('compare')
++    c.add_argument('base')
++    c.add_argument('variant')
++    c.add_argument('--max-drop', type=float, default=0.01)
++    p = sub.add_parser('prompts', help='freeze the prompt set (no requests) and print its token counts')
++    p.add_argument('--tokenizer', default=str(Path.home()/'llm/ds41/og/models/ds41-og/tokenizer.json'))
++    a = ap.parse_args()
++    sys.exit(dict(run=run, compare=compare, prompts=show)[a.cmd](a))
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/og_serve/api_bench.py b/og_serve/api_bench.py
 new file mode 100644
 index 00000000..c850f97c
@@ -15391,10 +16032,10 @@ index 00000000..75a21756
 +  --no-hf-cache --no-cache --max-concurrent-requests 1 "$@"
 diff --git a/og_serve/ds41_og.py b/og_serve/ds41_og.py
 new file mode 100644
-index 00000000..53f1accd
+index 00000000..f7e6cf7c
 --- /dev/null
 +++ b/og_serve/ds41_og.py
-@@ -0,0 +1,1079 @@
+@@ -0,0 +1,1114 @@
 +"""ds41-og: OpenAI-compatible supervisor for the original-weight split pipeline.
 +
 +DS41_OG_Q3=off (default): og only. No q3 child is ever started. A box engine
@@ -15434,7 +16075,13 @@ index 00000000..53f1accd
 +          {"error": {"code": "backend_unavailable", ...}} + [DONE], or HTTP 503
 +          with Retry-After for non-streaming requests.
 +A child that dies mid-response (no marker) ends that response with the same
-+clean error. Other paths (/v1/messages, /v1/responses, ...) are proxied as is.
++clean error. /v1/messages and /v1/responses are proxied as is.
++
++Only an allow-list reaches the child (ALLOWED: the four inference POSTs, GET /v1/models, GET /og/stats;
++DS41_OG_EXTRA_PATHS adds exact 'METHOD /path' pairs). The child binds loopback, so omlx skips its API-key
++checks for everything it serves; without the list, LAN clients reached its admin router, /v1/mcp/execute,
++/v1/websearch/fetch and model load/unload through llama-swap (/upstream/ds41/...). Anything else is a 404
++with an OpenAI-shaped error body, counted in /health (refused).
 +
 +Images (chat image_url parts, /v1/messages image blocks, /v1/responses input_image):
 +DS41_OG_VISION=og (default) serves them on the og worker like text. The box runs
@@ -15494,6 +16141,23 @@ index 00000000..53f1accd
 +LOGS = Path(os.environ.get('DS41_OG_LOGS', str(HOME/'llm/ds41/og/logs')))
 +INFERENCE = ('/v1/chat/completions', '/v1/completions', '/v1/responses', '/v1/messages')
 +RESUMABLE = ('/v1/chat/completions', '/v1/completions')
++
++
++def allowed_paths(extra=''):
++    """(method, path) pairs proxied to the child. Evidence (2026-09-30): every ds41 request in the
++    llama-swap log is one of the INFERENCE POSTs (Hermes, pi, benches); llama-swap answers /v1/models itself
++    and health-checks /health (served here); the og_serve harnesses read GET /v1/models and GET /og/stats
++    through this port (api_bench, cache_bench, fault_soak)."""
++    pairs = {('POST', path) for path in INFERENCE} | {('GET', '/v1/models'), ('GET', '/og/stats')}
++    for item in filter(None, (x.strip() for x in extra.split(','))):
++        method, _, path = item.partition(' ')
++        if not path.strip().startswith('/'):
++            raise SystemExit(f'DS41_OG_EXTRA_PATHS: expected "METHOD /path", got {item!r}')
++        pairs.add((method.upper(), path.strip()))
++    return frozenset(pairs)
++
++
++ALLOWED = allowed_paths(os.environ.get('DS41_OG_EXTRA_PATHS', ''))
 +DROP = {'host', 'content-length', 'transfer-encoding', 'connection', 'keep-alive', 'accept-encoding',
 +        'content-encoding'}
 +MARK = 'ds41-og-resume:'
@@ -15851,7 +16515,7 @@ index 00000000..53f1accd
 +        self.vision_at = None
 +        self.vision_waiting = 0
 +        self.stats = dict(og=0, q3=0, failovers=0, switches=0, box_lost=0, resumed=0, resume_failed=0,
-+                          vision=0, vision_rejected=0,
++                          vision=0, vision_rejected=0, refused=0,
 +                          broken=0, divergent=0, worker_exits=0, worker_restarts=0, client_gone=0)
 +        self.exit_code = None
 +        self.restarting = None
@@ -16449,8 +17113,20 @@ index 00000000..53f1accd
 +                                 box_restarting=sup.box_restarting(), q3_enabled=Q3, **sup.stats),
 +                            status_code=200 if ok or degraded else 503)
 +
++    refused = set()  # (method path) already logged once
++
 +    @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 +    async def proxy(path: str, request: Request):
++        if (request.method, request.url.path) not in ALLOWED:
++            sup.stats['refused'] += 1
++            key = f'{request.method} {request.url.path[:120]}'
++            if key not in refused and len(refused) < 256:
++                refused.add(key)
++                LOG.warning('refused (not on the allow-list): %s', key)
++            return JSONResponse(dict(error=dict(
++                message=f'ds41-og: {request.method} {request.url.path[:200]} is not served here; '
++                        'use POST /v1/chat/completions, /v1/completions, /v1/messages or /v1/responses',
++                type='invalid_request_error', code='not_found')), status_code=404)
 +        if TRACE and request.url.path in INFERENCE:
 +            _trace.set(dict(path=request.url.path, recv=time.time()))
 +        body = await request.body()
@@ -16646,10 +17322,10 @@ index 00000000..3156d59f
 +            conn.close()
 diff --git a/og_serve/fakechild.py b/og_serve/fakechild.py
 new file mode 100644
-index 00000000..534f780b
+index 00000000..9698af53
 --- /dev/null
 +++ b/og_serve/fakechild.py
-@@ -0,0 +1,163 @@
+@@ -0,0 +1,185 @@
 +"""A fake omlx child for CPU-only supervisor tests (mimics the SSE shapes of omlx chat/text completions).
 +
 +The "model" emits a fixed token sequence 0..N-1 (N = max_tokens, default 40); token t reads
@@ -16683,7 +17359,8 @@ index 00000000..534f780b
 +if args.mode == 'q3' and os.environ.get('FAKE_Q3_START_DELAY'):
 +    time.sleep(float(os.environ['FAKE_Q3_START_DELAY']))  # a slow model load: the supervisor sends keepalives
 +app = FastAPI()
-+STATS = dict(requests=0, resumed=0, cancelled=0, pid=os.getpid())
++HITS = {}  # 'METHOD /path' -> count, for paths only the catch-all below answers
++STATS = dict(requests=0, resumed=0, cancelled=0, pid=os.getpid(), hits=HITS)
 +
 +
 +@app.get('/health')
@@ -16812,13 +17489,34 @@ index 00000000..534f780b
 +    return StreamingResponse(events(), media_type='text/event-stream')
 +
 +
++@app.get('/og/stats')
++async def og_stats():
++    return {'steps': STATS['requests']}
++
++
++@app.post('/v1/responses')
++async def responses(request: Request):
++    body = await request.json()
++    return {'id': 'resp_fake', 'object': 'response', 'model': body.get('model'), 'status': 'completed',
++            'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'saw it'}]}]}
++
++
++# Stand-in for the rest of the omlx surface (admin router, MCP, web fetch, model load/unload, ...): answers
++# anything, so a test can see whether the supervisor forwarded a request it must refuse.
++@app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
++async def anything(path: str, request: Request):
++    key = f'{request.method} {request.url.path}'
++    HITS[key] = HITS.get(key, 0) + 1
++    return {'fake': 'catch-all', 'path': request.url.path}
++
++
 +uvicorn.run(app, host='127.0.0.1', port=args.port, log_level='warning')
 diff --git a/og_serve/fault_soak.py b/og_serve/fault_soak.py
 new file mode 100644
-index 00000000..dee8125d
+index 00000000..dbf66e96
 --- /dev/null
 +++ b/og_serve/fault_soak.py
-@@ -0,0 +1,392 @@
+@@ -0,0 +1,405 @@
 +"""ds41 fault-injection soak for a maintenance window (<= 30 min). DESIGNED, NOT RUN. Mac-side driver.
 +
 +Run ONLY in an owner-approved window, on the Mac (the box admin endpoints accept 10.10.10.2 / localhost only):
@@ -16833,7 +17531,9 @@ index 00000000..dee8125d
 +  A      0-3     none: reference run of every fixed prompt     texts recorded (temperature 0)
 +  B      3-5     client cancel mid-prefill (512K, at 5 s);     box sessions back to baseline <= 10 s after the cancel;
 +                 streaming + non-streaming disconnect mid-      Mac og/stats open_cancelled +1 (robust branch), opened ==
-+                 decode                                         closed; supervisor inflight 0, client_gone +1 (robust)
++                 decode (non-streaming hangs up at 2 s, before  closed; supervisor inflight 0, client_gone +1 (robust;
++                 its ~400-token answer can finish)              counts only NON-streaming disconnects -- a streaming
++                                                                disconnect cancels the splice generator, not counted)
 +  C      5-10    box engine crash (POST /admin/crash) with 4   all 4 streams finish, text == phase A reference
 +                 streams mid-decode                             (bit-identical continuation), within 240 s of the crash;
 +                                                                og/stats recoveries +4, box_lost 0, broken 0
@@ -17058,18 +17758,29 @@ index 00000000..dee8125d
 +    time.sleep(3)
 +    s.cancel()
 +    s.wait(10)
-+    # non-streaming client that hangs up after 5 s
++    # Non-streaming client that hangs up mid-decode. At 5 s it raced the answer: the 8K "five bullet points" reply is
++    # ~400 tokens and finished in ~4.7 s (soak-20260929T1353: 395 tokens, finish=stop), so nothing was cancelled and
++    # client_gone stayed 0. At 2 s (0.6 s to first step at 8K) it is ~130 tokens in.
++    gone0 = get(SUP + '/health').get('client_gone')
 +    body = json.dumps(dict(model=MODEL, max_tokens=2000, temperature=0,
 +                           messages=[{'role': 'user', 'content': prompt_text(8000, random.random())}])).encode()
 +    c = socket.create_connection(('127.0.0.1', 8080))
 +    c.sendall(b'POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\n'
 +              + f'Content-Length: {len(body)}\r\n\r\n'.encode() + body)
-+    time.sleep(5)
++    c.settimeout(2)
++    try:
++        answered_first = bool(c.recv(1))  # any byte = the reply arrived before the hang-up (test invalid)
++    except (TimeoutError, socket.timeout):
++        answered_first = False
 +    c.close()
 +    ok &= wait_box_sessions(base['box'].get('sessions', 0), 20)
++    time.sleep(1.5)  # the supervisor polls is_disconnected() once a second
 +    sup = get(SUP + '/health')
-+    note('B after', sup_inflight=sup.get('inflight'), client_gone=sup.get('client_gone'))
-+    return ok and sup.get('inflight') == 0
++    gone = sup.get('client_gone')
++    note('B after', sup_inflight=sup.get('inflight'), client_gone=gone, client_gone_before=gone0,
++         answered_before_hangup=answered_first)
++    robust_ok = gone0 is None or (gone is not None and gone - gone0 == 1)  # counter exists only on the robust branch
++    return ok and sup.get('inflight') == 0 and not answered_first and robust_ok
 +
 +
 +def phase_restart(ref, kind):
@@ -20302,6 +21013,167 @@ index 00000000..67106f83
 +
 +if __name__ == '__main__':
 +    main()
+diff --git a/og_serve/test_proxy_allowlist.py b/og_serve/test_proxy_allowlist.py
+new file mode 100644
+index 00000000..d23e87a1
+--- /dev/null
++++ b/og_serve/test_proxy_allowlist.py
+@@ -0,0 +1,155 @@
++"""CPU-only tests: the ds41-og supervisor forwards only its allow-list to the child (fake children, no MLX/GPU/box).
++
++The child binds loopback, so omlx skips API-key checks for everything it serves; the supervisor is what LAN
++clients reach through llama-swap (/v1/... and /upstream/ds41/...). Allowed: POST /v1/chat/completions,
++/v1/completions, /v1/messages, /v1/responses; GET /v1/models, /og/stats; DS41_OG_EXTRA_PATHS pairs.
++Everything else: 404 + an OpenAI-shaped error body, and the child never sees the request.
++
++Run: SUP_TEST_PORT=12630 python og_serve/test_proxy_allowlist.py   (uses SUP_TEST_PORT .. +5)
++"""
++import http.client
++import json
++import os
++from pathlib import Path
++import sys
++
++HERE = Path(__file__).resolve().parent
++sys.path.insert(0, str(HERE))
++os.environ.setdefault('SUP_TEST_PORT', '12630')
++from test_supervisor_failover import EXPECTED, BoxPort, Sup, check, stream  # noqa: E402
++
++BASE = int(os.environ['SUP_TEST_PORT'])
++
++REFUSED = [
++    ('GET', '/'),
++    ('GET', '/admin'),
++    ('GET', '/admin/api/settings'),
++    ('POST', '/admin/api/settings'),
++    ('POST', '/admin/api/models/ds41-og/unload'),
++    ('POST', '/v1/mcp/execute'),
++    ('GET', '/v1/mcp/tools'),
++    ('POST', '/v1/websearch/fetch'),
++    ('POST', '/v1/models/ds41-og/unload'),
++    ('POST', '/v1/models/ds41-og/load'),
++    ('GET', '/v1/models/status'),
++    ('GET', '/v1/models/ds41'),
++    ('GET', '/api/status'),
++    ('POST', '/v1/embeddings'),
++    ('POST', '/v1/rerank'),
++    ('POST', '/v1/messages/count_tokens'),
++    ('GET', '/v1/responses/resp_fake'),
++    ('DELETE', '/v1/responses/resp_fake'),
++    ('GET', '/v1/chat/completions'),      # right path, wrong method
++    ('PUT', '/og/stats'),
++    ('POST', '/og/fe'),                   # trace-mode runtime switches of the og worker
++    ('POST', '/v1/chat/completions/'),    # trailing slash is another path
++    ('POST', '/v1/chat/completions/../../admin/api/settings'),  # raw dot segments, not normalized away
++    ('POST', '/v1%2Fmcp/execute'),        # percent-encoded separator decodes to a refused path
++    ('GET', '/%61dmin/api/settings'),
++    ('OPTIONS', '/v1/chat/completions'),
++    ('HEAD', '/v1/models'),
++]
++
++
++def call(port, method, path, body=None):
++    """One raw request (http.client keeps the path exactly as given); returns (status, parsed body or bytes)."""
++    conn = http.client.HTTPConnection('127.0.0.1', port, timeout=30)
++    data = json.dumps(body).encode() if body is not None else None
++    conn.request(method, path, body=data, headers={'Content-Type': 'application/json'} if data else {})
++    r = conn.getresponse()
++    raw = r.read()
++    conn.close()
++    try:
++        return r.status, json.loads(raw)
++    except ValueError:
++        return r.status, raw
++
++
++def child_hits(port):
++    return call(port, 'GET', '/fake/stats')[1]['hits']
++
++
++def main():
++    box = BoxPort(BASE)
++    results = []
++    sup = Sup(BASE + 1, BASE, DS41_OG_RESTART_WAIT_S='1')  # child on BASE + 2
++    child = BASE + 2
++    try:
++        # the fake child answers every refused path itself (so a forwarded request would be visible)
++        st, body = call(child, 'POST', '/v1/mcp/execute', {})
++        results.append(check('fake child exposes the omlx-only surface', st == 200 and body.get('fake') == 'catch-all', body))
++        before = dict(child_hits(child))
++
++        # allowed
++        r = stream(sup.base, {})
++        results.append(check('POST /v1/chat/completions (stream) forwarded', r['content'] == EXPECTED and r['done']
++                             and not r['errors'], r))
++        st, d = call(sup.port, 'POST', '/v1/chat/completions', dict(model='ds41', messages=[]))
++        results.append(check('POST /v1/chat/completions forwarded', st == 200
++                             and d['choices'][0]['message']['content'] == EXPECTED, (st, d)))
++        r = stream(sup.base, {'prompt': 'x'}, path='/v1/completions')
++        results.append(check('POST /v1/completions forwarded', r['text'] == EXPECTED and not r['errors'], r))
++        st, d = call(sup.port, 'POST', '/v1/messages', dict(model='ds41', max_tokens=8, messages=[]))
++        results.append(check('POST /v1/messages forwarded', st == 200 and d['content'][0]['text'] == 'saw it', (st, d)))
++        st, d = call(sup.port, 'POST', '/v1/responses', dict(model='ds41', input='hi'))
++        results.append(check('POST /v1/responses forwarded', st == 200 and d.get('object') == 'response', (st, d)))
++        st, d = call(sup.port, 'GET', '/v1/models')
++        results.append(check('GET /v1/models forwarded', st == 200 and d['data'][0]['id'] == 'ds41-og', (st, d)))
++        st, d = call(sup.port, 'GET', '/og/stats')
++        results.append(check('GET /og/stats forwarded', st == 200 and 'steps' in d, (st, d)))
++        st, d = call(sup.port, 'GET', '/v1/models?x=1')
++        st2, _ = call(sup.port, 'POST', '/v1/mcp/execute?x=/v1/models', {})
++        results.append(check('query strings do not change the decision', st == 200 and st2 == 404, (st, st2, d)))
++        st, d = call(sup.port, 'GET', '/health')
++        results.append(check('supervisor /health still served', st == 200 and d.get('status') == 'ok', (st, d)))
++
++        # refused
++        bad, handled = [], 1  # the query-string probe above was refused too
++        for method, path in REFUSED:
++            st, d = call(sup.port, method, path, {} if method in ('POST', 'PUT', 'DELETE') else None)
++            if method == 'HEAD':  # no body; Starlette may answer 405 before the handler: never forwarded either way
++                handled += st == 404
++                if st not in (404, 405):
++                    bad.append((method, path, st, d))
++                continue
++            handled += 1
++            shaped = (isinstance(d, dict) and d.get('error', {}).get('code') == 'not_found'
++                      and d['error'].get('type') == 'invalid_request_error'
++                      and 'not served here' in d['error'].get('message', ''))
++            if st != 404 or not shaped:
++                bad.append((method, path, st, d))
++        results.append(check(f'{len(REFUSED)} other method/path pairs -> 404 with an OpenAI error body', not bad, bad))
++        after = child_hits(child)
++        leaked = {k: v - before.get(k, 0) for k, v in after.items() if v != before.get(k, 0)}
++        results.append(check('no refused request reached the child', not leaked, leaked))
++        h = sup.health()
++        results.append(check('/health counts refused requests', h.get('refused') == handled, (handled, h)))
++    finally:
++        sup.stop()
++
++    # DS41_OG_EXTRA_PATHS: exact extra pairs without a code change
++    sup = Sup(BASE + 3, BASE, DS41_OG_RESTART_WAIT_S='1',
++              DS41_OG_EXTRA_PATHS='post /v1/messages/count_tokens, GET /v1/models/status')
++    child = BASE + 4
++    try:
++        st, d = call(sup.port, 'POST', '/v1/messages/count_tokens', dict(model='ds41', messages=[]))
++        st2, _ = call(sup.port, 'GET', '/v1/models/status')
++        st3, _ = call(sup.port, 'GET', '/v1/messages/count_tokens')
++        hits = child_hits(child)
++        results.append(check('DS41_OG_EXTRA_PATHS pairs forwarded (method case-insensitive), others still 404',
++                             st == 200 and st2 == 200 and st3 == 404
++                             and hits.get('POST /v1/messages/count_tokens') == 1
++                             and hits.get('GET /v1/models/status') == 1
++                             and 'GET /v1/messages/count_tokens' not in hits, (st, st2, st3, hits)))
++        r = stream(sup.base, {})
++        results.append(check('inference unchanged with extras', r['content'] == EXPECTED and not r['errors'], r))
++    finally:
++        sup.stop()
++    box.down()
++    ok = all(results)
++    print('ALL PASS' if ok else 'SOME FAILED', f'({sum(results)}/{len(results)})')
++    sys.exit(0 if ok else 1)
++
++
++if __name__ == '__main__':
++    main()
 diff --git a/og_serve/test_robust.py b/og_serve/test_robust.py
 new file mode 100644
 index 00000000..84538ff7
@@ -22848,14 +23720,17 @@ index 00000000..1b568ac0
 +        host._ds41_draft_bank = bank
 +    return Tracker(tokenizer, schemas, bank, int(copy._buf[copy.n - 1]), MODE)
 diff --git a/omlx/patches/deepseek_v41/dspark.py b/omlx/patches/deepseek_v41/dspark.py
-index 4929a515..e1f457d7 100644
+index 4929a515..57782292 100644
 --- a/omlx/patches/deepseek_v41/dspark.py
 +++ b/omlx/patches/deepseek_v41/dspark.py
-@@ -6,16 +6,38 @@ never enter that ring. Server acceptance/rollback is a separate integration.
+@@ -6,16 +6,122 @@ never enter that ring. Server acceptance/rollback is a separate integration.
  """
  
  from dataclasses import replace
++import json
 +import os
++import time
++from types import SimpleNamespace
  
  import mlx.core as mx
  import mlx.nn as nn
@@ -22868,29 +23743,110 @@ index 4929a515..e1f457d7 100644
  
  
 +DRAFT_ASYNC = os.environ.get("DS41_DRAFT_ASYNC", "1") == "1"
-+# Opt-in: draft logits from an MXFP8 copy of the BF16 vocabulary head (half
-+# the bytes). Drafts only steer speculation; verified tokens never change.
++# DS41_DRAFT_HEAD=mxfp8 (opt-in; default bf16, any other value = bf16): draft
++# logits of cost-policy blocks (the caller's hist_offset >= 1024) come from an
++# MXFP8 copy of the BF16 vocabulary head (half the bytes), quantized once at
++# load (install_draft_head), through og_fused's fast_qmv rows kernel in both
++# proposal_forward and proposal_forward_batch. That kernel's per-row arithmetic
++# does not depend on the row count, so a request's drafts are bitwise the same
++# alone or batched. Blocks below 1024 tokens keep the BF16 head: there the draft
++# pattern reaches T=0 text (acceptance-only depth, width-dependent index layout).
++# Drafts only steer speculation; verified tokens never change.
 +DRAFT_HEAD = os.environ.get("DS41_DRAFT_HEAD", "bf16")
++_MAX_BATCH_ROWS = 8  # the short-row mHC / MoE / combine paths a width<=4 block already takes
++STATS = {}  # draft_head_* counters; og_model.load binds them into og_model.STATS (/og/stats)
 +
 +
-+def draft_logits(model, x):
-+    if DRAFT_HEAD != "mxfp8" or x.ndim != 3 or not 1 <= x.shape[1] <= 8:
-+        return project_logits(x, model.head)
++def bind(stats):
++    global STATS
++    STATS = stats
++    for key in ("draft_head_mxfp8", "draft_head_mxfp8_rows", "draft_head_bf16_rows"):
++        stats.setdefault(key, 0)
++
++
++def _count(kind, rows):
++    key = f"draft_head_{kind}_rows"
++    STATS[key] = STATS.get(key, 0) + rows
++
++
++def _head_ok(model):
++    head = model.head
++    w = getattr(head, "weight", None)
++    return (
++        w is not None
++        and not hasattr(head, "bits")
++        and w.dtype == mx.bfloat16
++        and w.ndim == 2
++        and w.shape[1] % 32 == 0
++        and w.shape[1] not in (64, 128)
++    )
++
++
++def use_mxfp8(model, cost_policy):
++    """Whether the MXFP8 head serves a block (one answer for single and batched drafting)."""
++    return (
++        DRAFT_HEAD == "mxfp8"
++        and bool(cost_policy)
++        and mx.default_device() == mx.gpu
++        and _head_ok(model)
++    )
++
++
++def _draft_head(model):
++    """The MXFP8 copy of model.head (weight, scales); built once, normally at load."""
 +    cached = model.__dict__.get("_ds41_draft_head")
-+    if cached is None or cached[0] is not model.head.weight:
++    if cached is None or cached.source is not model.head.weight:
 +        w, scales = mx.quantize(model.head.weight, group_size=32, bits=8, mode="mxfp8")
 +        mx.eval(w, scales)
-+        cached = model.__dict__["_ds41_draft_head"] = (model.head.weight, w, scales)
-+    _, w, scales = cached
-+    return mx.quantized_matmul(
-+        x, w, scales, transpose=True, group_size=32, bits=8, mode="mxfp8"
-+    ).astype(mx.float32)
++        cached = model.__dict__["_ds41_draft_head"] = SimpleNamespace(
++            weight=w, scales=scales, source=model.head.weight
++        )
++    return cached
++
++
++def install_draft_head(model):
++    """og_model.load: quantize the MXFP8 draft head at load, not inside the first draft."""
++    if DRAFT_HEAD != "mxfp8":
++        return None
++    if mx.default_device() != mx.gpu or not _head_ok(model):
++        summary = dict(event="draft_head", mode="bf16", reason="head or device unsupported")
++    else:
++        begin = time.perf_counter()
++        head = _draft_head(model)
++        STATS["draft_head_mxfp8"] = 1
++        summary = dict(
++            event="draft_head",
++            mode="mxfp8",
++            shape=list(model.head.weight.shape),
++            gib=round((head.weight.nbytes + head.scales.nbytes) / 2**30, 3),
++            seconds=round(time.perf_counter() - begin, 3),
++        )
++    print(json.dumps(summary), flush=True)
++    return summary
++
++
++def _mxfp8_logits(model, x):
++    """og_fused._rows (fast_qmv rows kernel) on the MXFP8 head: FP32 logits, M-invariant."""
++    from . import og_fused
++
++    batch, width, dim = x.shape
++    rows = x.reshape(1, batch * width, dim).astype(mx.bfloat16)
++    return og_fused._rows(_draft_head(model), rows).reshape(batch, width, -1).astype(mx.float32)
++
++
++def draft_logits(model, x, cost_policy=False):
++    rows = x.size // x.shape[-1]
++    if x.ndim == 3 and rows <= _MAX_BATCH_ROWS and use_mxfp8(model, cost_policy):
++        _count("mxfp8", rows)
++        return _mxfp8_logits(model, x)
++    _count("bf16", rows)
++    return project_logits(x, model.head)
 +
 +
  class DSparkAttention(Attention):
      def append_context(self, main_x, cache, *, start_offset=None):
          c = self._config
-@@ -30,8 +52,10 @@ class DSparkAttention(Attention):
+@@ -30,8 +136,10 @@ class DSparkAttention(Attention):
          c = self._config
          batch, length, _ = x.shape
          positions = mx.arange(cache.offset, cache.offset + length)
@@ -22902,7 +23858,7 @@ index 4929a515..e1f457d7 100644
                  batch, length, c.n_heads, c.head_dim
              ),
              positions,
-@@ -39,7 +63,7 @@ class DSparkAttention(Attention):
+@@ -39,7 +147,7 @@ class DSparkAttention(Attention):
              False,
          )
          draft_kv = quantize_activation(
@@ -22911,7 +23867,7 @@ index 4929a515..e1f457d7 100644
          )
          kv = mx.concatenate([cache.keys[:, 0], draft_kv], axis=1)
          # V4.1 does not apply V4's per-head query RMS normalization.
-@@ -60,7 +84,15 @@ class DSparkAttention(Attention):
+@@ -60,7 +168,15 @@ class DSparkAttention(Attention):
          out = rope(out, positions, c, False, inverse=True)
          grouped = out.reshape(batch, length, c.o_groups, -1)
          weight = self.wo_a.weight.reshape(c.o_groups, c.o_lora_rank, -1)
@@ -22928,7 +23884,22 @@ index 4929a515..e1f457d7 100644
  
  
  class MarkovHead(nn.Module):
-@@ -205,9 +237,131 @@ def proposal_forward(model, input_ids, cache, draft_length=None):
+@@ -187,8 +303,12 @@ def forward_spec(model, input_ids, main_hidden, cache, *, temperature=0.0):
+     )
+ 
+ 
+-def proposal_forward(model, input_ids, cache, draft_length=None):
+-    """Compute parallel draft logits; the shared loop applies Markov biases."""
++def proposal_forward(model, input_ids, cache, draft_length=None, cost_policy=False):
++    """Compute parallel draft logits; the shared loop applies Markov biases.
++
++    cost_policy: the caller drafts this block on the cost-policy path (hist_offset >= 1024),
++    where DS41_DRAFT_HEAD=mxfp8 may serve the head (draft_logits).
++    """
+     c = model._config
+     width = max(1, min(draft_length or c.dspark_block_size, c.dspark_block_size))
+     input_ids = input_ids.reshape(input_ids.shape[0], -1)[:, -1:]
+@@ -205,9 +325,154 @@ def proposal_forward(model, input_ids, cache, draft_length=None):
      )
      h = mx.repeat(model.embed(ids)[..., None, :], c.hc_mult, -2)
      pre = mx.broadcast_to((mx.arange(c.hc_mult) == 0).astype(mx.float32), h.shape[:-1])
@@ -22941,14 +23912,13 @@ index 4929a515..e1f457d7 100644
      final = model.mtp[-1]
      h = hc_pre(h, pre)
 -    logits = project_logits(final.norm(h), model.head)
-+    logits = draft_logits(model, final.norm(h))
++    logits = draft_logits(model, final.norm(h), cost_policy)
      return logits, h
 +
 +
 +# Batched drafting for og_fused pairs: one DSpark decoder pass over several requests' blocks
 +# (DS41_OG_DRAFT_BATCH=0 = one pass per request). Every request gets its own pass's bits.
 +DRAFT_BATCH = os.environ.get("DS41_OG_DRAFT_BATCH", "1") == "1"
-+_MAX_BATCH_ROWS = 8  # the short-row mHC / MoE / combine paths a width<=4 block already takes
 +
 +
 +def _stages_ok(model):
@@ -22972,10 +23942,9 @@ index 4929a515..e1f457d7 100644
 +
 +
 +def batch_supported(model, widths):
-+    """Several blocks of one width 2..4 (<= 8 rows), BF16 draft head, the og_fused kernels on."""
++    """Several blocks of one width 2..4 (<= 8 rows), the og_fused kernels on (either draft head)."""
 +    return (
 +        DRAFT_BATCH
-+        and DRAFT_HEAD != "mxfp8"
 +        and len(widths) > 1
 +        and len(set(widths)) == 1
 +        and 2 <= widths[0]
@@ -23037,8 +24006,14 @@ index 4929a515..e1f457d7 100644
 +    return hs, [fp for fp, _, _ in ffn]
 +
 +
-+def proposal_forward_batch(model, anchors, caches, width):
-+    """proposal_forward for several requests of one width; returns each request's draft logits."""
++def proposal_forward_batch(model, anchors, caches, width, cost_policy=None):
++    """proposal_forward for several requests of one width; returns each request's draft logits.
++
++    cost_policy: per request, as proposal_forward's (see batch_logits).
++    """
++    cost_policy = [False] * len(anchors) if cost_policy is None else list(cost_policy)
++    if len(cost_policy) != len(anchors):
++        raise ValueError("cost_policy needs one entry per request")
 +    c = model._config
 +    hs, pres, bounds = [], [], []
 +    for k, anchor in enumerate(anchors):
@@ -23058,10 +24033,29 @@ index 4929a515..e1f457d7 100644
 +        if DRAFT_ASYNC and index + 1 < len(model.mtp):
 +            mx.async_eval(hs, pres)
 +    final = model.mtp[-1]
++    return batch_logits(model, [final.norm(hc_pre(h, pre)) for h, pre in zip(hs, pres)], width, cost_policy)
++
++
++def batch_logits(model, xs, width, cost_policy):
++    """proposal_forward_batch's head: each request's (1, width, dim) normed rows -> its draft logits.
++
++    The MXFP8 and BF16 heads each run once over their requests' rows (request order kept);
++    both head kernels are M-invariant, so every request gets draft_logits' bits.
++    """
 +    from .og_fused import _head_rows
-+    logits = _head_rows(model.head.weight, mx.concatenate(
-+        [final.norm(hc_pre(h, pre)) for h, pre in zip(hs, pres)], 1))
-+    return [logits[:, b:e] for b, e in bounds]
++
++    quantized = [use_mxfp8(model, policy) for policy in cost_policy]
++    out = [None] * len(xs)
++    for mxfp8 in (False, True):
++        group = [k for k, q in enumerate(quantized) if q == mxfp8]
++        if not group:
++            continue
++        x = mx.concatenate([xs[k] for k in group], 1)
++        _count("mxfp8" if mxfp8 else "bf16", x.shape[1])
++        logits = _mxfp8_logits(model, x) if mxfp8 else _head_rows(model.head.weight, x)
++        for j, k in enumerate(group):
++            out[k] = logits[:, j * width:(j + 1) * width]
++    return out
 diff --git a/omlx/patches/deepseek_v41/encoder_replay.py b/omlx/patches/deepseek_v41/encoder_replay.py
 new file mode 100644
 index 00000000..6816bbe7
@@ -26996,7 +27990,7 @@ index 00000000..e48fe117
 +        output_dtypes=[shared.dtype],
 +    )[0]
 diff --git a/omlx/patches/deepseek_v41/mtp.py b/omlx/patches/deepseek_v41/mtp.py
-index 61f9f61d..99a868b3 100644
+index 61f9f61d..632e68cc 100644
 --- a/omlx/patches/deepseek_v41/mtp.py
 +++ b/omlx/patches/deepseek_v41/mtp.py
 @@ -1,8 +1,12 @@
@@ -27057,14 +28051,34 @@ index 61f9f61d..99a868b3 100644
      def should_exit(self):
          # Timing-based handoff would also change the subsequent numeric path.
          return False
-@@ -72,6 +107,19 @@ class DSparkMixin:
-         self.dspark_append_context(main_hidden, cache)
-         return proposal_forward(self, anchor_ids, cache, draft_length)
+@@ -33,6 +68,9 @@ class DSparkMixin:
+     _omlx_mtp_multi_request = True
+     _omlx_dspark_cache_owned = True
+     _omlx_mtp_preserve_requests = True
++    # dspark_forward / dspark_forward_batch take cost_policy (DS41_DRAFT_HEAD picks the head from it);
++    # the shared batch generator passes it only to hosts that set this.
++    _omlx_dspark_cost_head = True
  
-+    def dspark_forward_batch(self, main_hiddens, anchors, caches, widths):
+     def _omlx_prefill(self, input_ids, cache=None, **kwargs):
+         """Scheduler cache-only entry; normal forward retains full logits."""
+@@ -65,12 +103,26 @@ class DSparkMixin:
+         for stage, item in zip(self.mtp, cache):
+             stage.attn.append_context(projected, item, start_offset=start_offset)
+ 
+-    def dspark_forward(self, main_hidden, anchor_ids, cache=None, *, draft_length=None):
++    def dspark_forward(self, main_hidden, anchor_ids, cache=None, *, draft_length=None, cost_policy=False):
+         from .dspark import proposal_forward
+ 
+         cache = self.make_mtp_cache() if cache is None else cache
+         self.dspark_append_context(main_hidden, cache)
+-        return proposal_forward(self, anchor_ids, cache, draft_length)
++        return proposal_forward(self, anchor_ids, cache, draft_length, cost_policy=cost_policy)
++
++    def dspark_forward_batch(self, main_hiddens, anchors, caches, widths, cost_policy=None):
 +        """dspark_forward for several requests in one decoder pass (dspark.proposal_forward_batch).
 +
 +        Returns each request's draft logits, or None (nothing done) when the blocks cannot share a pass.
++        cost_policy: per request, as dspark_forward's.
 +        """
 +        from .dspark import batch_supported, proposal_forward_batch
 +
@@ -27072,12 +28086,11 @@ index 61f9f61d..99a868b3 100644
 +            return None
 +        for hidden, cache in zip(main_hiddens, caches):
 +            self.dspark_append_context(hidden, cache)
-+        return proposal_forward_batch(self, anchors, caches, widths[0])
-+
++        return proposal_forward_batch(self, anchors, caches, widths[0], cost_policy)
+ 
      def dspark_markov(self, token_ids):
          return self.mtp[-1].markov_head(token_ids)
- 
-@@ -135,8 +183,8 @@ class DSparkMixin:
+@@ -135,8 +187,8 @@ class DSparkMixin:
              ]
              ratio = item.compress_ratio
              if ratio:
@@ -27771,10 +28784,10 @@ index 00000000..009eeb7f
 +REGISTRY = Registry()
 diff --git a/omlx/patches/deepseek_v41/og_model.py b/omlx/patches/deepseek_v41/og_model.py
 new file mode 100644
-index 00000000..0703b7f6
+index 00000000..0fa18a5e
 --- /dev/null
 +++ b/omlx/patches/deepseek_v41/og_model.py
-@@ -0,0 +1,1040 @@
+@@ -0,0 +1,1043 @@
 +# SPDX-License-Identifier: MIT
 +"""ds41-og: the original-weight split pipeline behind omlx's unchanged scheduler.
 +
@@ -27830,7 +28843,7 @@ index 00000000..0703b7f6
 +             payload_s=0.0, single_calls=0, multi_calls=0, present_hits=0, presend_errors=0, box_lost=0,
 +             box_resumed=0, box_resumed_tokens=0, delta_opens=0, delta_rows=0, delta_retries=0,
 +             import_failed=0, import_fallbacks=0, kickoff_sent=0, kickoff_errors=0, fused_calls=0, fused_steps=0, draft_batches=0)
-+spec_probe.bind(STATS)  # stats-only copy-lock pre-send probe (DS41_OG_SPEC_PROBE): spec_probe_* keys
++spec_probe.bind(STATS)  # retired copy-lock pre-send probe (DS41_OG_SPEC_PROBE=1 to re-enable): spec_probe_* keys
 +BOX_CACHE = os.environ.get('DS41_OG_BOX_CACHE', '1') == '1'
 +STATE = os.environ.get('DS41_OG_STATE', 'lean')
 +STREAM = os.environ.get('DS41_OG_STREAM', '1') == '1'
@@ -28244,6 +29257,9 @@ index 00000000..0703b7f6
 +
 +    language_model = load_decoder(path, cls=OgLanguageModel)
 +    woa_compact.install(language_model)
++    from . import dspark
++    dspark.bind(STATS)  # draft_head_* keys in /og/stats
++    dspark.install_draft_head(language_model)  # DS41_DRAFT_HEAD=mxfp8: quantize the draft head now
 +    tokenizer = PreTrainedTokenizerFast.from_pretrained(path)
 +    tokenizer.has_tool_calling = True
 +    tokenizer.tool_call_start = tool_call_start
@@ -29182,7 +30198,7 @@ index 00000000..00f206f4
 +    return model.language_model
 diff --git a/omlx/patches/deepseek_v41/pipe_session.py b/omlx/patches/deepseek_v41/pipe_session.py
 new file mode 100644
-index 00000000..2569d24f
+index 00000000..58a64dcf
 --- /dev/null
 +++ b/omlx/patches/deepseek_v41/pipe_session.py
 @@ -0,0 +1,271 @@
@@ -29349,7 +30365,7 @@ index 00000000..2569d24f
 +        cost = self.controller.cost_policy and self.mtp_cache[0].offset >= 1024
 +        width = self.controller.max_depth if cost else self.controller.cur
 +        logits,_ = self.model.dspark_forward(hidden,mx.array([[committed[-1]]],mx.uint32),
-+                                             self.mtp_cache,draft_length=width)
++                                             self.mtp_cache,draft_length=width,cost_policy=cost)
 +        previous = mx.array([committed[-1]],mx.uint32)
 +        tokens, probs = [], []
 +        for i in range(width):
@@ -30336,10 +31352,10 @@ index f67ecd79..ef25c8da 100644
      """Gather only requested affine rows; never dequantize the whole vocabulary."""
 diff --git a/omlx/patches/deepseek_v41/spec_probe.py b/omlx/patches/deepseek_v41/spec_probe.py
 new file mode 100644
-index 00000000..f52c15a2
+index 00000000..c811f687
 --- /dev/null
 +++ b/omlx/patches/deepseek_v41/spec_probe.py
-@@ -0,0 +1,166 @@
+@@ -0,0 +1,169 @@
 +# SPDX-License-Identifier: MIT
 +"""Stats-only probe for copy-lock pre-send (PRESEND-FEASIBILITY.md, variant b). Sends nothing.
 +
@@ -30350,7 +31366,10 @@ index 00000000..f52c15a2
 +
 +Host work per cycle: a tuple compare before the send and one CopyIndex.speculate (one 5-token append
 ++ propose on a <=17 x 64 window) after it, i.e. while the box computes. No MLX sync, no box traffic.
-+DS41_OG_SPEC_PROBE=0 disables every call.
++
++Retired (default off since ds41-next4): the go/no-go was hits/c1_cycles >= 15%; live traffic gave 0.55%
++(THREADS-2026-09-30 6c). DS41_OG_SPEC_PROBE=1 re-enables it; off, og_model makes no probe call and
++/og/stats shows spec_probe_enabled 0 with the counters at 0.
 +"""
 +
 +import logging
@@ -30358,7 +31377,7 @@ index 00000000..f52c15a2
 +import time
 +
 +logger = logging.getLogger(__name__)
-+ENABLED = os.environ.get('DS41_OG_SPEC_PROBE', '1') == '1'
++ENABLED = os.environ.get('DS41_OG_SPEC_PROBE', '0') == '1'
 +MAX_ROWS = 5
 +REASONS = ('partial', 'ended', 'dspark', 'copy_diff', 'concurrency', 'other')
 +COUNTS = ('c1_cycles', 'copy_cycles', 'would', 'hits', 'no_pred', 'unresolved', 'errors') + tuple(
@@ -30901,7 +31920,7 @@ index 00000000..bc431eba
 +        grid=(32, (n + 3) // 4 * 4, groups), threadgroup=(32, 4, 1),
 +        output_shapes=[(1, length, groups, n)], output_dtypes=[grouped.dtype])[0]
 diff --git a/omlx/patches/mlx_lm_mtp/batch_generator.py b/omlx/patches/mlx_lm_mtp/batch_generator.py
-index 75f265ca..6ea8a32c 100644
+index 75f265ca..b957891b 100644
 --- a/omlx/patches/mlx_lm_mtp/batch_generator.py
 +++ b/omlx/patches/mlx_lm_mtp/batch_generator.py
 @@ -24,6 +24,7 @@ from typing import Any, Deque, Dict, List, Optional, Tuple
@@ -31051,7 +32070,7 @@ index 75f265ca..6ea8a32c 100644
      """
      import mlx.core as mx
  
-@@ -2359,23 +2395,71 @@ def _dspark_next_drafts(
+@@ -2359,23 +2395,78 @@ def _dspark_next_drafts(
      depth = state.controller.cur if state.controller is not None else state.depth
      depth = min(int(depth), int(getattr(host.args, "dspark_block_size", depth)))
      n = int(committed.shape[0])
@@ -31116,6 +32135,13 @@ index 75f265ca..6ea8a32c 100644
 +    width = state.controller.max_depth if cost_policy else depth
 +    return host, width, committed[-1:].reshape(1, 1), cost_policy
 +
+ 
++def _dspark_head_kwargs(host: Any, cost_policy: Any) -> dict:
++    """``cost_policy`` for hosts whose draft head depends on it (V4.1 DS41_DRAFT_HEAD); others keep their signature."""
++    if getattr(host, "_omlx_dspark_cost_head", False):
++        return {"cost_policy": cost_policy}
++    return {}
++
 +
 +def _dspark_finish(
 +    gen_batch: Any,
@@ -31126,12 +32152,12 @@ index 75f265ca..6ea8a32c 100644
 +) -> None:
 +    """Everything of _dspark_next_drafts after the DSpark decoder forward (Markov sampling)."""
 +    import mlx.core as mx
- 
++
 +    host, width, anchor, cost_policy = plan
      sampler = _resolve_sampler(gen_batch)
      procs = _proc_list(gen_batch)
      draft_toks: List[Any] = []
-@@ -2389,7 +2473,7 @@ def _dspark_next_drafts(
+@@ -2389,7 +2480,7 @@ def _dspark_next_drafts(
      # before the loop and rewind after.
      snap = _snap_snapshotable(procs)
  
@@ -31140,7 +32166,7 @@ index 75f265ca..6ea8a32c 100644
          bias, _ = host.dspark_markov(previous)
          logits_2d = logits[:, idx, :] + bias
          if procs is not None and prev_buf is not None:
-@@ -2407,12 +2491,113 @@ def _dspark_next_drafts(
+@@ -2407,12 +2498,116 @@ def _dspark_next_drafts(
  
      _restore_snapshotable(procs, snap)
  
@@ -31183,12 +32209,13 @@ index 75f265ca..6ea8a32c 100644
 +    plan = _dspark_prepare(gen_batch, state, hidden_rows, committed)
 +    if plan is None:
 +        return
-+    host, width, anchor, _ = plan
++    host, width, anchor, cost_policy = plan
 +    logits, _ = host.dspark_forward(
 +        hidden_rows,
 +        anchor,
 +        state.mtp_cache,
 +        draft_length=width,
++        **_dspark_head_kwargs(host, bool(cost_policy)),
 +    )
 +    state.hist_offset += int(committed.shape[0])
 +    _dspark_finish(gen_batch, state, plan, logits, prev_buf)
@@ -31230,6 +32257,7 @@ index 75f265ca..6ea8a32c 100644
 +            [plans[i][2] for i in forward],
 +            [jobs[i][1].mtp_cache for i in forward],
 +            [plans[i][1] for i in forward],
++            **_dspark_head_kwargs(host, [bool(plans[i][3]) for i in forward]),
 +        )
 +        if len(forward) > 1 and batch is not None
 +        else None
@@ -31238,7 +32266,8 @@ index 75f265ca..6ea8a32c 100644
 +    if logits is None:
 +        logits = [
 +            host.dspark_forward(
-+                jobs[i][2], plans[i][2], jobs[i][1].mtp_cache, draft_length=plans[i][1]
++                jobs[i][2], plans[i][2], jobs[i][1].mtp_cache, draft_length=plans[i][1],
++                **_dspark_head_kwargs(host, bool(plans[i][3])),
 +            )[0]
 +            for i in forward
 +        ]
@@ -31255,7 +32284,7 @@ index 75f265ca..6ea8a32c 100644
  def _chain_next_drafts(
      gen_batch: Any,
      state: _MtpState,
-@@ -2554,7 +2739,67 @@ def _chain_next_drafts(
+@@ -2554,7 +2749,67 @@ def _chain_next_drafts(
  # ---------------------------------------------------------------------------
  
  
@@ -31324,7 +32353,7 @@ index 75f265ca..6ea8a32c 100644
      """Bridge from standard ``__init__``'s ``_step()`` into PR 990's cycle 1.
  
      State on entry (after standard ``__init__``):
-@@ -2646,10 +2891,27 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
+@@ -2646,10 +2901,27 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
          else:
              state.mtp_cache = gen_batch.model.make_mtp_cache()
          state.next_main = _ensure_uint32(next_main_tok)
@@ -31353,7 +32382,7 @@ index 75f265ca..6ea8a32c 100644
          _chain_next_drafts(
              gen_batch,
              state,
-@@ -2697,7 +2959,10 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
+@@ -2697,7 +2969,10 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
      state.draft_lp = draft_lp_2d.squeeze(0)
      state.draft_accept_lp = draft_accept_lp_2d.squeeze(0)
      state.draft_id = int(draft_tok.tolist()[0])
@@ -31365,7 +32394,7 @@ index 75f265ca..6ea8a32c 100644
      state.queue.append(
          (int(next_main_tok.tolist()[0]), next_main_lp.squeeze(0), "init")
      )
-@@ -2705,6 +2970,17 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
+@@ -2705,6 +2980,17 @@ def _post_init_mtp(gen_batch: Any, *, verify_result=None, priming_offset=None) -
      gen_batch._omlx_mtp_state = state
  
  
@@ -31383,7 +32412,7 @@ index 75f265ca..6ea8a32c 100644
  # ---------------------------------------------------------------------------
  # Shared target verification and request-local emission.
  # ---------------------------------------------------------------------------
-@@ -2849,6 +3125,9 @@ def _emit_ragged_responses(
+@@ -2849,6 +3135,9 @@ def _emit_ragged_responses(
                      )
                  )
                  if state is not None:
@@ -31393,7 +32422,7 @@ index 75f265ca..6ea8a32c 100644
                      _log_mtp_stats(uid, state.stats, finish_reason)
                  finished_uids.append(uid)
                  row_finished = True
-@@ -3087,6 +3366,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
+@@ -3087,6 +3376,11 @@ def _log_mtp_stats(uid: Any, stats: "_MtpStats", finish_reason: str) -> None:
          depth_str = ""
      if stats.zero_cycles:
          depth_str += f" d0={stats.zero_cycles}"
@@ -31405,7 +32434,7 @@ index 75f265ca..6ea8a32c 100644
      tpc = total_emits / stats.cycles if stats.cycles else 0.0
      logger.info(
          "MTP[%s] finish=%s tokens=%d cycles=%d tok/cycle=%.2f accept=%d/%d (%s)%s "
-@@ -3365,8 +3649,8 @@ def _run_verify_cycle_chain(
+@@ -3365,8 +3659,8 @@ def _run_verify_cycle_chain(
  
      # --- stats ---
      state.stats.cycles += 1
@@ -31416,7 +32445,7 @@ index 75f265ca..6ea8a32c 100644
          state.stats.depth_drafted.extend([0] * pad)
          state.stats.depth_accepted.extend([0] * pad)
      for j in range(k):
-@@ -3378,6 +3662,12 @@ def _run_verify_cycle_chain(
+@@ -3378,6 +3672,12 @@ def _run_verify_cycle_chain(
      state.stats.accepts += m
      if m < k:
          state.stats.rejects += 1
@@ -31429,7 +32458,7 @@ index 75f265ca..6ea8a32c 100644
      state.stats.sample_ms += (time.perf_counter() - t0) * 1000
  
      accept_ms = (time.perf_counter() - cycle_t0) * 1000
-@@ -3387,7 +3677,10 @@ def _run_verify_cycle_chain(
+@@ -3387,7 +3687,10 @@ def _run_verify_cycle_chain(
          # --- commit: queue emits + cache rollback ---
          t0 = time.perf_counter()
          for j in range(m):
@@ -31441,7 +32470,7 @@ index 75f265ca..6ea8a32c 100644
          state.queue.append(
              (int(emit_last_id), emit_last_lp, "bonus" if m == k else "verify")
          )
-@@ -3412,7 +3705,8 @@ def _run_verify_cycle_chain(
+@@ -3412,7 +3715,8 @@ def _run_verify_cycle_chain(
          committed = mx.array(
              [int(d) for d in draft_ids[:m]] + [int(emit_last_id)], dtype=mx.uint32
          )
@@ -31451,7 +32480,7 @@ index 75f265ca..6ea8a32c 100644
          hidden_rows = hidden[:, : m + 1]
          prev_buf = None
          if procs is not None:
-@@ -3838,6 +4132,10 @@ def _emit_response(
+@@ -3838,6 +4142,10 @@ def _emit_response(
          finish_reason = "stop"
  
      if finish_reason is not None:
@@ -32260,6 +33289,175 @@ index 00000000..ff2821dc
 +        np.testing.assert_array_equal(
 +            np.array(decode_topk.selection(scores, 512)), np.array(_tile_selection(scores, 512)), err_msg=name
 +        )
+diff --git a/tests/test_deepseek_v41_draft_head.py b/tests/test_deepseek_v41_draft_head.py
+new file mode 100644
+index 00000000..9625276b
+--- /dev/null
++++ b/tests/test_deepseek_v41_draft_head.py
+@@ -0,0 +1,163 @@
++# SPDX-License-Identifier: MIT
++"""DS41_DRAFT_HEAD routing (CPU, fake head kernels): which head serves which draft block.
++
++The real kernels' bitwise properties (fast_qmv rows == mx.quantized_matmul mxfp8 at M<=5, M-invariance
++at M=1..8 on the 129280x5120 head) are checked on the GPU by benchmarks/og/head_mxfp8_bench.py.
++"""
++from types import SimpleNamespace
++
++import numpy as np
++import pytest
++
++mx = pytest.importorskip("mlx.core")
++
++from omlx.patches.deepseek_v41 import dspark, og_fused  # noqa: E402
++from omlx.patches.mlx_lm_mtp import batch_generator as bg  # noqa: E402
++
++N, K = 16, 96
++
++
++@pytest.fixture(autouse=True)
++def cpu():
++    # Tiny fake arrays only: run them on the CPU whatever the suite's default device is.
++    previous = mx.default_device()
++    mx.set_default_device(mx.cpu)
++    yield
++    mx.set_default_device(previous)
++
++
++def _per_row(x, n, offset):
++    """Per-row fake head: row q -> sum(x[q]) * (j + offset) for vocab j (independent of the row count)."""
++    s = x.astype(mx.float32).sum(-1, keepdims=True)
++    return s * (mx.arange(n, dtype=mx.float32) + offset)
++
++
++@pytest.fixture
++def fake(monkeypatch):
++    calls = []
++
++    def rows(p, x):  # og_fused._rows: (1, m, K) -> (1, m, N) in x.dtype
++        assert x.ndim == 3 and x.shape[0] == 1 and x.dtype == mx.bfloat16
++        calls.append(("mxfp8", x.shape[1]))
++        return _per_row(x, p.weight.shape[0], 1).astype(x.dtype)
++
++    def head_rows(weight, x):  # og_fused._head_rows (BF16 rows kernel)
++        calls.append(("bf16_rows", x.shape[1]))
++        return _per_row(x, weight.shape[0], 3)
++
++    def project(x, head):  # head.project_logits (BF16 single path)
++        calls.append(("bf16", x.size // x.shape[-1]))
++        return _per_row(x, head.weight.shape[0], 3)
++
++    q = SimpleNamespace(weight=mx.zeros((N, K // 4), mx.uint32), scales=mx.zeros((N, K // 32), mx.uint8))
++    monkeypatch.setattr(og_fused, "_rows", rows)
++    monkeypatch.setattr(og_fused, "_head_rows", head_rows)
++    monkeypatch.setattr(dspark, "project_logits", project)
++    monkeypatch.setattr(dspark, "_draft_head", lambda model: q)
++    monkeypatch.setattr(dspark.mx, "default_device", lambda: dspark.mx.gpu)  # the head kernels need the GPU
++    monkeypatch.setattr(dspark, "DRAFT_HEAD", "mxfp8")
++    stats = {}
++    dspark.bind(stats)
++    model = SimpleNamespace(head=SimpleNamespace(weight=mx.zeros((N, K), mx.bfloat16)))
++    return model, calls, stats
++
++
++def _x(seed, width):
++    return mx.random.normal((1, width, K), key=mx.random.key(seed)).astype(mx.bfloat16)
++
++
++def test_default_is_bf16_even_on_the_cost_policy_path(fake, monkeypatch):
++    model, calls, stats = fake
++    monkeypatch.setattr(dspark, "DRAFT_HEAD", "bf16")
++    out = dspark.draft_logits(model, _x(0, 4), cost_policy=True)
++    assert calls == [("bf16", 4)] and out.dtype == mx.float32
++    assert stats["draft_head_bf16_rows"] == 4 and stats["draft_head_mxfp8_rows"] == 0
++    assert dspark.install_draft_head(model) is None
++
++
++def test_mxfp8_only_on_the_cost_policy_path(fake):
++    model, calls, stats = fake
++    dspark.draft_logits(model, _x(0, 3), cost_policy=False)  # below 1024: acceptance-only, BF16
++    out = dspark.draft_logits(model, _x(1, 4), cost_policy=True)
++    assert calls == [("bf16", 3), ("mxfp8", 4)]
++    assert out.shape == (1, 4, N) and out.dtype == mx.float32
++    assert stats["draft_head_bf16_rows"] == 3 and stats["draft_head_mxfp8_rows"] == 4
++
++
++def test_mxfp8_needs_a_bf16_head_and_the_gpu(fake, monkeypatch):
++    model, calls, _ = fake
++    quantized = SimpleNamespace(weight=model.head.weight, bits=4)
++    assert not dspark.use_mxfp8(SimpleNamespace(head=quantized), True)
++    monkeypatch.setattr(dspark.mx, "default_device", lambda: dspark.mx.cpu)
++    assert not dspark.use_mxfp8(model, True)
++
++
++@pytest.mark.parametrize("policy", [[True, True], [False, False], [True, False], [False, True]])
++def test_batched_head_is_each_requests_single_head(fake, policy):
++    """proposal_forward_batch's head gives every request exactly its proposal_forward logits."""
++    model, calls, _ = fake
++    xs = [_x(10 + k, 4) for k in range(len(policy))]
++    batched = dspark.batch_logits(model, xs, 4, policy)
++    launches = list(calls)
++    calls.clear()
++    single = [dspark.draft_logits(model, x, p) for x, p in zip(xs, policy)]
++    for b, s in zip(batched, single):
++        assert b.dtype == s.dtype == mx.float32
++        assert np.array_equal(np.array(b), np.array(s))
++    # one launch per head over all its requests' rows
++    assert sorted(launches) == sorted(
++        [("mxfp8", 4 * sum(policy))] * any(policy) + [("bf16_rows", 4 * (len(policy) - sum(policy)))] * (not all(policy)))
++
++
++def test_batch_supported_no_longer_rejects_mxfp8(monkeypatch):
++    monkeypatch.setattr(dspark, "DRAFT_HEAD", "mxfp8")
++    monkeypatch.setattr(dspark, "DRAFT_BATCH", True)
++    monkeypatch.setattr(dspark, "_stages_ok", lambda model: True)
++    monkeypatch.setattr(dspark.mx, "default_device", lambda: dspark.mx.gpu)
++    assert dspark.batch_supported(None, [4, 4])
++    assert not dspark.batch_supported(None, [4, 4, 4])  # 12 rows > 8
++
++
++def test_generator_passes_cost_policy_only_to_hosts_that_take_it(monkeypatch):
++    class Host:
++        _omlx_dspark_cost_head = True
++
++        def __init__(self):
++            self.seen = []
++
++        def dspark_forward_batch(self, hiddens, anchors, caches, widths, cost_policy=None):
++            self.seen.append(("batch", list(widths), cost_policy))
++            return [mx.zeros((1, w, N)) for w in widths]
++
++        def dspark_forward(self, hidden, anchor, cache, *, draft_length=None, cost_policy=False):
++            self.seen.append(("single", draft_length, cost_policy))
++            return mx.zeros((1, draft_length, N)), None
++
++    class Legacy(Host):  # e.g. the V4 host: no cost_policy keyword
++        _omlx_dspark_cost_head = False
++
++        def dspark_forward_batch(self, hiddens, anchors, caches, widths):
++            self.seen.append(("batch", list(widths)))
++            return None
++
++        def dspark_forward(self, hidden, anchor, cache, *, draft_length=None):
++            self.seen.append(("single", draft_length))
++            return mx.zeros((1, draft_length, N)), None
++
++    def state():
++        return SimpleNamespace(head_clone=True, controller=None, stats=SimpleNamespace(mtp_head_ms=0.0),
++                               mtp_cache=[], hist_offset=0)
++
++    for cls in (Host, Legacy):
++        host = cls()
++        policies = [True, False]
++        plans = iter([(host, 4, mx.zeros((1, 1)), p) for p in policies])
++        monkeypatch.setattr(bg, "_dspark_prepare", lambda *a: next(plans))
++        monkeypatch.setattr(bg, "_dspark_finish", lambda *a: None)
++        jobs = [(None, state(), None, mx.zeros((2,)), None) for _ in policies]
++        bg.dspark_draft_jobs(jobs, [None, None])
++        if cls is Host:
++            assert host.seen == [("batch", [4, 4], [True, False])]
++        else:  # batch refused -> one call per request, no unknown keyword
++            assert host.seen == [("batch", [4, 4]), ("single", 4), ("single", 4)]
++    assert bg._dspark_head_kwargs(object(), True) == {}
 diff --git a/tests/test_deepseek_v41_draft_sources.py b/tests/test_deepseek_v41_draft_sources.py
 new file mode 100644
 index 00000000..849c2fc8

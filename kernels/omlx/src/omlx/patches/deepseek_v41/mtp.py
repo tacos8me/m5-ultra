@@ -68,6 +68,9 @@ class DSparkMixin:
     _omlx_mtp_multi_request = True
     _omlx_dspark_cache_owned = True
     _omlx_mtp_preserve_requests = True
+    # dspark_forward / dspark_forward_batch take cost_policy (DS41_DRAFT_HEAD picks the head from it);
+    # the shared batch generator passes it only to hosts that set this.
+    _omlx_dspark_cost_head = True
 
     def _omlx_prefill(self, input_ids, cache=None, **kwargs):
         """Scheduler cache-only entry; normal forward retains full logits."""
@@ -100,17 +103,18 @@ class DSparkMixin:
         for stage, item in zip(self.mtp, cache):
             stage.attn.append_context(projected, item, start_offset=start_offset)
 
-    def dspark_forward(self, main_hidden, anchor_ids, cache=None, *, draft_length=None):
+    def dspark_forward(self, main_hidden, anchor_ids, cache=None, *, draft_length=None, cost_policy=False):
         from .dspark import proposal_forward
 
         cache = self.make_mtp_cache() if cache is None else cache
         self.dspark_append_context(main_hidden, cache)
-        return proposal_forward(self, anchor_ids, cache, draft_length)
+        return proposal_forward(self, anchor_ids, cache, draft_length, cost_policy=cost_policy)
 
-    def dspark_forward_batch(self, main_hiddens, anchors, caches, widths):
+    def dspark_forward_batch(self, main_hiddens, anchors, caches, widths, cost_policy=None):
         """dspark_forward for several requests in one decoder pass (dspark.proposal_forward_batch).
 
         Returns each request's draft logits, or None (nothing done) when the blocks cannot share a pass.
+        cost_policy: per request, as dspark_forward's.
         """
         from .dspark import batch_supported, proposal_forward_batch
 
@@ -118,7 +122,7 @@ class DSparkMixin:
             return None
         for hidden, cache in zip(main_hiddens, caches):
             self.dspark_append_context(hidden, cache)
-        return proposal_forward_batch(self, anchors, caches, widths[0])
+        return proposal_forward_batch(self, anchors, caches, widths[0], cost_policy)
 
     def dspark_markov(self, token_ids):
         return self.mtp[-1].markov_head(token_ids)

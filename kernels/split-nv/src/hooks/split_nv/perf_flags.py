@@ -1,6 +1,7 @@
 """Runtime switches for the box-perf step/prefill changes, read from SPLIT_NV_DIR/box-perf-flags.json (re-read at
 most once a second; a missing or invalid file means the defaults). Lets one maintenance window A/B them without a
-restart. Keys: inline, spin_s, r1_spin_s, early_d2h, step_log, engram_prefetch."""
+restart. Keys: inline, spin_s, r1_spin_s, early_d2h, step_log, engram_prefetch; read on rank 0 only and sent in
+the command (collective decisions): pf_overlap, preempt, share_chunk, idx_rowsplit."""
 import json
 import os
 import time

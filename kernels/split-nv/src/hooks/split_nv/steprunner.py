@@ -112,6 +112,16 @@ class StepRunner:
             hasher.commit_after_verify(ids_2d, torch.tensor([sess.req.kv.req_pool_idx], dtype=torch.int64, device=self.dev),
                                        torch.tensor([a], dtype=torch.int64, device=self.dev))
 
+    def prepare(self, sess, keep, upto):
+        """The bookkeeping run() starts with (commit the pending rows, roll back to keep, SWA eviction, KV for rows
+        < upto), done early: a STEPD runs it on the host while its drafter graph runs on the GPU. run() then finds it
+        done (nothing pending, length == keep, window already evicted, slots allocated): the step's bytes are those of
+        run() alone; only the KV slot addresses of never-written rows beyond keep + L can differ."""
+        self.commit_pending(sess, keep)
+        sess.length = keep
+        self.evict_swa(sess, keep)
+        self.ensure_alloc(sess, min(upto, self.mr.req_to_token_pool.req_to_token.shape[1]))
+
     # ---- forward -----------------------------------------------------------------------------------------------
     def _load(self, slot, N, ids, locs, row):
         W, L = slot.W, len(ids)

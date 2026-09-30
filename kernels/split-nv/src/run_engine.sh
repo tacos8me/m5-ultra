@@ -38,18 +38,46 @@ if [ -n "$PYCACHE" ]; then
 else
   PYC=(-e PYTHONDONTWRITEBYTECODE=1)
 fi
+# OOM priority of every process in the container (docker sets it as root; no extra privilege). Each rank's RSS
+# (~200 GB) counts the ~189 GiB of kept Engram SysV segments that its death does not free, so with adj 0 the kernel
+# picks a rank (oom_score ~920) before any other process except traefik/coredns (adj 1000), frees a few GB and takes
+# production down. -500 (oom_score ~590) puts them after every adj >= 0 process (user services ~800, containers
+# >= ~667) but before dockerd (-500, small RSS; killing it would stop the engine anyway). 0 = kernel default.
+OOM_ADJ=${SPLIT_NV_OOM_SCORE_ADJ:--500}
+# Profiling windows only (default off): SPLIT_NV_NSYS=<host dir> starts the engine under `nsys launch` (session "prof",
+# CUDA + NVTX + OS runtime) through tools/box_perf/prof_entry.py (NVTX command/layer ranges, no numerical change), with
+# every flag of this script. Collect: docker exec split-nv-encoder nsys start --session=prof -o /traces/<name>
+# --force-overwrite=true; ...; docker exec split-nv-encoder nsys stop --session=prof  -> <host dir>/<name>.nsys-rep
+PYPATH=/home/ian/split-nv/hooks; ENTRY=(python3 -m split_nv.engine); NSYS=()
+if [ -n "${SPLIT_NV_NSYS:-}" ]; then
+  mkdir -p "$SPLIT_NV_NSYS"
+  PYPATH=$PYPATH:/home/ian/split-nv/tools/box_perf
+  NSYS=(--cap-add SYS_ADMIN -v "$SPLIT_NV_NSYS":/traces)
+  ENTRY=(nsys launch --session-new=prof --trace=cuda,nvtx,osrt --cuda-graph-trace=node:nvtx-precapture python3 -m prof_entry)
+fi
+# DSpark drafter on the box (STEPD-SPEC.md; default off = today's engine, nothing below is passed): SPLIT_NV_DSPARK=1
+# loads the 3 stages (~3.9 GiB/GPU) from the original checkpoint (mounted below) and advertises the capability.
+# og_moe3 builds into /root/.cache/sglang/og_moe3 (persistent JIT dir); the fused Markov kernels' Triton cache too.
+DSPARK_ENV=()
+if [ "${SPLIT_NV_DSPARK:-0}" = 1 ]; then
+  DSPARK_ENV=(-e SPLIT_NV_DSPARK=1 -e SPLIT_NV_DSPARK_HEAD="${SPLIT_NV_DSPARK_HEAD-fp8}"
+    -e SPLIT_NV_DSPARK_MARKOV="${SPLIT_NV_DSPARK_MARKOV-fused}" -e SPLIT_NV_DSPARK_MOE="${SPLIT_NV_DSPARK_MOE-og3}"
+    -e SPLIT_NV_DSPARK_SLOTS="${SPLIT_NV_DSPARK_SLOTS-8}" -e SPLIT_NV_DSPARK_WIDTHS="${SPLIT_NV_DSPARK_WIDTHS-4}"
+    -e SPLIT_NV_DSPARK_FREE_BF16_HEAD="${SPLIT_NV_DSPARK_FREE_BF16_HEAD-1}"
+    -e SPLIT_NV_DSPARK_CKPT=/home/ian/models/DeepSeek-V4.1-Flash-original -e TRITON_CACHE_DIR=/root/.cache/sglang/triton-dspark)
+fi
 # Warm the page cache with the checkpoint tensors the ranks will load while the container starts (NVMe idle then).
 if [ "${SPLIT_NV_PREFETCH-1}" = 1 ] && [ -f "$ROOT/$MODEL/model.safetensors.index.json" ]; then
   python3 "$ROOT"/tools/prefetch_weights.py "$ROOT/$MODEL" --threads "${SPLIT_NV_PREFETCH_THREADS:-12}" &
 fi
-exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime nvidia --ipc=host --network host \
+exec docker run --name "$NAME" --init --rm --ulimit core=0 --oom-score-adj "$OOM_ADJ" --gpus all --runtime nvidia --ipc=host --network host \
   --stop-timeout 60 --shm-size 64g --ulimit memlock=-1 --ulimit stack=67108864 \
   -e CUDA_VISIBLE_DEVICES=0,1 -e CUDA_DEVICE_ORDER=PCI_BUS_ID -e HF_HUB_OFFLINE=1 \
   -e SGLANG_SM120_FLASHMLA_BACKEND=flashinfer -e SGLANG_FLASHINFER_MOE_FUSED_FINALIZE=0 \
   -e SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE=1 -e SGLANG_DSV41_ENGRAM_HOST_TABLE_DIR=/engram \
   -e SGLANG_DSV41_ENGRAM_PINNED="$ENGRAM_PINNED" -e SGLANG_DSV41_ENGRAM_PREWARM=1 \
   -e SGLANG_DSV41_INDEXER_LOGITS_BUDGET_MB="${SPLIT_NV_IDX_BUDGET_MB:-1024}" -e SGLANG_OPT_USE_TOPK_V2=1 \
-  "${PYC[@]}" -e PYTHONPATH=/home/ian/split-nv/hooks \
+  "${PYC[@]}" -e PYTHONPATH="$PYPATH" \
   -e SPLIT_NV_HOOKS=1 -e SPLIT_NV_CONFIG=/home/ian/split-nv/$MODEL/config.json \
   -e SPLIT_NV_DIR=/dev/shm/split-nv -e SPLIT_NV_MAX_TOKENS=1056768 -e SPLIT_NV_STEP_LOG="${SPLIT_NV_STEP_LOG:-}" \
   -e SPLIT_NV_VERSION="$VERSION" -e SPLIT_NV_SGLANG_VERSION="$SGLANG_VERSION" -e SPLIT_NV_CACHE_GB="${SPLIT_NV_CACHE_GB:-96}" -e SPLIT_NV_DRAIN_S="${SPLIT_NV_DRAIN_S:-30}" \
@@ -62,16 +90,18 @@ exec docker run --name "$NAME" --init --rm --ulimit core=0 --gpus all --runtime 
   -e SPLIT_NV_PREEMPT="${SPLIT_NV_PREEMPT-0}" -e SPLIT_NV_PREEMPT_LAG="${SPLIT_NV_PREEMPT_LAG-2}" -e SPLIT_NV_PREEMPT_SHARE="${SPLIT_NV_PREEMPT_SHARE-0.5}" \
   -e SPLIT_NV_BYPASS_TOKENS="${SPLIT_NV_BYPASS_TOKENS-0}" -e SPLIT_NV_BYPASS_SHARE="${SPLIT_NV_BYPASS_SHARE-0.5}" \
   -e SPLIT_NV_SHARE_CHUNK="${SPLIT_NV_SHARE_CHUNK-2048}" -e SPLIT_NV_TRIM_MIN_TOKENS="${SPLIT_NV_TRIM_MIN_TOKENS-0}" \
-  -e SPLIT_NV_IDX_LOWMEM="${SPLIT_NV_IDX_LOWMEM-0}" -e SPLIT_NV_MEMLOG="${SPLIT_NV_MEMLOG:-}" -e SPLIT_NV_MEMHIST="${SPLIT_NV_MEMHIST:-}" \
+  -e SPLIT_NV_IDX_LOWMEM="${SPLIT_NV_IDX_LOWMEM-0}" -e SPLIT_NV_IDX_ROWSPLIT="${SPLIT_NV_IDX_ROWSPLIT-0}" -e SPLIT_NV_MEMLOG="${SPLIT_NV_MEMLOG:-}" -e SPLIT_NV_MEMHIST="${SPLIT_NV_MEMHIST:-}" \
+  -e SPLIT_NV_IDX_FIXED_TILES="${SPLIT_NV_IDX_FIXED_TILES-0}" -e SPLIT_NV_IDX_TILE_MARGIN="${SPLIT_NV_IDX_TILE_MARGIN-0.125}" \
+  -e SPLIT_NV_IDX_TILE_MIN_MB="${SPLIT_NV_IDX_TILE_MIN_MB-64}" "${DSPARK_ENV[@]}" \
   -e SPLIT_NV_STALLWATCH="${SPLIT_NV_STALLWATCH-0}" -e SPLIT_NV_GC_FREEZE="${SPLIT_NV_GC_FREEZE-0}" -e SPLIT_NV_PARK_LOG_MS="${SPLIT_NV_PARK_LOG_MS-150}" \
   -e SPLIT_NV_MEM_FRACTION="${SPLIT_NV_MEM_FRACTION:-}" "${ALLOC_CONF[@]}" \
   -e SPLIT_NV_ENGRAM_KEEP="${SPLIT_NV_ENGRAM_KEEP-0}" -e SPLIT_NV_ENGRAM_ASYNC_REGISTER="${SPLIT_NV_ENGRAM_ASYNC_REGISTER-1}" \
   -v "$ROOT":/home/ian/split-nv:ro \
   -v /home/ian/models/DeepSeek-V4.1-Flash-original:/home/ian/models/DeepSeek-V4.1-Flash-original:ro \
-  "${SGLANG_MOUNT[@]}" \
+  "${SGLANG_MOUNT[@]}" "${NSYS[@]}" \
   -v /home/ian/models/dsv41-engram:/engram \
   -v /mnt/nvme-1/dsv41-fi-cache:/root/.cache/flashinfer -v /mnt/nvme-1/dsv41-sglang-jit:/root/.cache/sglang \
-  "$IMAGE" python3 -m split_nv.engine \
+  "$IMAGE" "${ENTRY[@]}" \
   --model-path /home/ian/split-nv/$MODEL --trust-remote-code --served-model-name split-nv-encoder \
   --tp 2 --host 127.0.0.1 --port 10050 --mem-fraction-static "$MEMFRAC" \
   --context-length 1048576 --max-total-tokens "$MAX_TOTAL" --max-running-requests "$MAX_REQS" \

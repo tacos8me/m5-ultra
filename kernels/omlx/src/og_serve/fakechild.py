@@ -31,7 +31,8 @@ if args.mode == 'og' and os.environ.get('FAKE_OG_START_DELAY'):
 if args.mode == 'q3' and os.environ.get('FAKE_Q3_START_DELAY'):
     time.sleep(float(os.environ['FAKE_Q3_START_DELAY']))  # a slow model load: the supervisor sends keepalives
 app = FastAPI()
-STATS = dict(requests=0, resumed=0, cancelled=0, pid=os.getpid())
+HITS = {}  # 'METHOD /path' -> count, for paths only the catch-all below answers
+STATS = dict(requests=0, resumed=0, cancelled=0, pid=os.getpid(), hits=HITS)
 
 
 @app.get('/health')
@@ -158,6 +159,27 @@ async def complete(request: Request):
             yield f'data: {json.dumps(dict(id=rid, object="chat.completion.chunk", model=model, choices=[], usage=usage))}\n\n'
         yield 'data: [DONE]\n\n'
     return StreamingResponse(events(), media_type='text/event-stream')
+
+
+@app.get('/og/stats')
+async def og_stats():
+    return {'steps': STATS['requests']}
+
+
+@app.post('/v1/responses')
+async def responses(request: Request):
+    body = await request.json()
+    return {'id': 'resp_fake', 'object': 'response', 'model': body.get('model'), 'status': 'completed',
+            'output': [{'type': 'message', 'content': [{'type': 'output_text', 'text': 'saw it'}]}]}
+
+
+# Stand-in for the rest of the omlx surface (admin router, MCP, web fetch, model load/unload, ...): answers
+# anything, so a test can see whether the supervisor forwarded a request it must refuse.
+@app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD'])
+async def anything(path: str, request: Request):
+    key = f'{request.method} {request.url.path}'
+    HITS[key] = HITS.get(key, 0) + 1
+    return {'fake': 'catch-all', 'path': request.url.path}
 
 
 uvicorn.run(app, host='127.0.0.1', port=args.port, log_level='warning')
